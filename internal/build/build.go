@@ -671,6 +671,18 @@ func isWasmTarget(goos string) bool {
 	return slices.Contains([]string{"wasi", "js", "wasip1"}, goos)
 }
 
+func needStart(conf *Config) bool {
+	if conf.Target == "" {
+		return !isWasmTarget(conf.Goos)
+	}
+	switch conf.Target {
+	case "wasip2":
+		return false
+	default:
+		return true
+	}
+}
+
 func genMainModuleFile(ctx *context, rtPkgPath string, pkg *packages.Package, needRuntime, needPyInit bool) (path string, err error) {
 	var (
 		pyInitDecl string
@@ -725,12 +737,19 @@ define weak void @_start() {
 }
 `
 	mainDefine := "define i32 @main(i32 noundef %0, ptr nocapture noundef readnone %1) local_unnamed_addr"
-	if isWasmTarget(ctx.buildConf.Goos) {
+	if !needStart(ctx.buildConf) && isWasmTarget(ctx.buildConf.Goos) {
 		mainDefine = "define hidden noundef i32 @__main_argc_argv(i32 noundef %0, ptr nocapture noundef readnone %1) local_unnamed_addr"
+	}
+	if !needStart(ctx.buildConf) {
 		startDefine = ""
 	}
 	mainCode := fmt.Sprintf(`; ModuleID = 'main'
 source_filename = "main"
+
+@_stack_size = global i32 4096, align 8
+@_stack_top = global i32 0, align 8
+@_bootloader_size = global i32 0, align 8
+
 %s
 @__llgo_argc = global i32 0, align 4
 @__llgo_argv = global ptr null, align 8
