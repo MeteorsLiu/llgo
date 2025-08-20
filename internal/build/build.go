@@ -592,7 +592,6 @@ func linkMainPkg(ctx *context, pkg *packages.Package, pkgs []*aPackage, global l
 	}
 
 	err = linkObjFiles(ctx, app, objFiles, linkArgs, verbose)
-	err = linkObjFiles(ctx, app, objFiles, linkArgs, verbose)
 	check(err)
 
 	switch mode {
@@ -657,6 +656,9 @@ func linkObjFiles(ctx *context, app string, objFiles, linkArgs []string, verbose
 	if IsDbgSymsEnabled() {
 		buildArgs = append(buildArgs, "-gdwarf-4")
 	}
+	buildArgs = append(buildArgs, "--nostdlib")
+	buildArgs = append(buildArgs, "--cref")
+	buildArgs = append(buildArgs, "--Map=t.map")
 
 	buildArgs = append(buildArgs, ctx.crossCompile.LDFLAGS...)
 	buildArgs = append(buildArgs, ctx.crossCompile.EXTRAFLAGS...)
@@ -745,10 +747,6 @@ define weak void @_start() {
 	}
 	mainCode := fmt.Sprintf(`; ModuleID = 'main'
 source_filename = "main"
-
-@_stack_size = global i32 4096, align 8
-@_stack_top = global i32 0, align 8
-@_bootloader_size = global i32 0, align 8
 
 %s
 @__llgo_argc = global i32 0, align 4
