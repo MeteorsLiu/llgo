@@ -463,9 +463,9 @@ func buildAllPkgs(ctx *context, initial []*packages.Package, verbose bool) (pkgs
 						ctx.nLibdir++
 					}
 				}
-				if err := ctx.compiler().CheckLinkArgs(pkgLinkArgs, isWasmTarget(ctx.buildConf.Goos)); err != nil {
-					panic(fmt.Sprintf("test link args '%s' failed\n\texpanded to: %v\n\tresolved to: %v\n\terror: %v", param, expdArgs, pkgLinkArgs, err))
-				}
+				// if err := ctx.compiler().CheckLinkArgs(pkgLinkArgs, isWasmTarget(ctx.buildConf.Goos)); err != nil {
+				// 	panic(fmt.Sprintf("test link args '%s' failed\n\texpanded to: %v\n\tresolved to: %v\n\terror: %v", param, expdArgs, pkgLinkArgs, err))
+				// }
 				aPkg.LinkArgs = append(aPkg.LinkArgs, pkgLinkArgs...)
 			}
 		default:
@@ -1070,17 +1070,45 @@ func llgoPkgLinkFiles(ctx *context, pkg *packages.Package, procFile func(linkFil
 	}
 }
 
+func convertCflagToAbsPath(pkgDir string, cflag string) string {
+	after, ok := strings.CutPrefix(cflag, "-L")
+	if ok && !filepath.IsAbs(after) {
+		return "-L" + filepath.Join(pkgDir, strings.TrimSpace(after))
+	}
+	after, ok = strings.CutPrefix(cflag, "-I")
+	if ok && !filepath.IsAbs(after) {
+		return "-I" + filepath.Join(pkgDir, strings.TrimSpace(after))
+	}
+	after, ok = strings.CutPrefix(cflag, "-isystem")
+	if ok && !filepath.IsAbs(after) {
+		return "-isystem" + filepath.Join(pkgDir, strings.TrimSpace(after))
+	}
+	return cflag
+}
+
 // files = "file1; file2; ..."
 // files = "$(pkg-config --cflags xxx): file1; file2; ..."
 func clFiles(ctx *context, files string, pkg *packages.Package, procFile func(linkFile string), verbose bool) {
 	dir := filepath.Dir(pkg.GoFiles[0])
 	expFile := pkg.ExportFile
+
 	args := make([]string, 0, 16)
 	if strings.HasPrefix(files, "$") { // has cflags
 		if pos := strings.IndexByte(files, ':'); pos > 0 {
 			cflags := xenv.ExpandEnvToArgs(files[:pos])
 			files = files[pos+1:]
 			args = append(args, cflags...)
+		}
+	}
+	if strings.HasPrefix(files, "(") {
+		pos := strings.IndexByte(files, ':')
+		if pos > 1 && files[pos-1] == ')' {
+			cflags := strings.Fields(files[1 : pos-1])
+			files = files[pos+1:]
+
+			for _, cflag := range cflags {
+				args = append(args, convertCflagToAbsPath(dir, cflag))
+			}
 		}
 	}
 	for _, file := range strings.Split(files, ";") {

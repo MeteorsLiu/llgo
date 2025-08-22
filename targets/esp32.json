@@ -14,7 +14,7 @@
 	"default-stack-size": 2048,
 	"rtlib": "compiler-rt",
 	"libc": "picolibc",
-	"linkerscript": "targets/esp32.ld",
+	"linkerscript": "targets/ld/esp/esp32/esp32.ld",
 	"extra-files": [
 		"src/device/esp/esp32.S",
 		"src/internal/task/task_stack_esp32.S"
