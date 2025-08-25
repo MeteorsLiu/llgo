@@ -16,33 +16,132 @@ import (
 )
 
 type Export struct {
-	CC         string // Compiler to use
-	CCFLAGS    []string
-	CFLAGS     []string
-	LDFLAGS    []string
-	EXTRAFLAGS []string
+	CC      string // Compiler to use
+	CCFLAGS []string
+	CFLAGS  []string
+	LDFLAGS []string
 
 	// Additional fields from target configuration
-	LLVMTarget   string
-	CPU          string
-	Features     string
 	BuildTags    []string
 	GOOS         string
 	GOARCH       string
-	Linker       string // Linker to use (e.g., "ld.lld", "avr-ld")
-	ClangRoot    string // Root directory of custom clang installation
-	ClangBinPath string // Path to clang binary directory
+	Linker       string   // Linker to use (e.g., "ld.lld", "avr-ld")
+	ExtraFiles   []string // Extra files to compile and link (e.g., .s, .c files)
+	ClangRoot    string   // Root directory of custom clang installation
+	ClangBinPath string   // Path to clang binary directory
+
+	BinaryFormat string // Binary format (e.g., "elf", "esp", "uf2")
+	FormatDetail string // For uf2, it's uf2FamilyID
 }
 
-const wasiSdkUrl = "https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-25/wasi-sdk-25.0-x86_64-macos.tar.gz"
-
-const (
-	espClangBaseUrl = "https://github.com/goplus/espressif-llvm-project-prebuilt/releases/download/19.1.2_20250805"
-	espClangVersion = "19.1.2_20250805"
+// URLs and configuration that can be overridden for testing
+var (
+	wasiSdkUrl      = "https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-25/wasi-sdk-25.0-x86_64-macos.tar.gz"
+	wasiMacosSubdir = "wasi-sdk-25.0-x86_64-macos"
 )
 
+var (
+	espClangBaseUrl = "https://github.com/goplus/espressif-llvm-project-prebuilt/releases/download/19.1.2_20250820"
+	espClangVersion = "19.1.2_20250820"
+)
+
+// cacheRoot can be overridden for testing
+var cacheRoot = env.LLGoCacheDir
+
 func cacheDir() string {
-	return filepath.Join(env.LLGoCacheDir(), "crosscompile")
+	return filepath.Join(cacheRoot(), "crosscompile")
+}
+
+// expandEnv expands template variables in a string
+// Supports variables like {port}, {hex}, {bin}, {root}, {tmpDir}, etc.
+// Special case: {} expands to the first available file variable (hex, bin, img, zip)
+func expandEnv(template string, envs map[string]string) string {
+	return expandEnvWithDefault(template, envs)
+}
+
+// expandEnvWithDefault expands template variables with optional default for {}
+func expandEnvWithDefault(template string, envs map[string]string, defaultValue ...string) string {
+	if template == "" {
+		return ""
+	}
+
+	result := template
+
+	// Handle special case of {} - use provided default or first available file variable
+	if strings.Contains(result, "{}") {
+		defaultVal := ""
+		if len(defaultValue) > 0 && defaultValue[0] != "" {
+			defaultVal = defaultValue[0]
+		} else {
+			// Priority order: hex, bin, img, zip
+			for _, key := range []string{"hex", "bin", "img", "zip"} {
+				if value, exists := envs[key]; exists && value != "" {
+					defaultVal = value
+					break
+				}
+			}
+		}
+		result = strings.ReplaceAll(result, "{}", defaultVal)
+	}
+
+	// Replace named variables
+	for key, value := range envs {
+		if key != "" { // Skip empty key used for {} default
+			result = strings.ReplaceAll(result, "{"+key+"}", value)
+		}
+	}
+	return result
+}
+
+// expandEnvSlice expands template variables in a slice of strings
+func expandEnvSlice(templates []string, envs map[string]string) []string {
+	return expandEnvSliceWithDefault(templates, envs)
+}
+
+// expandEnvSliceWithDefault expands template variables in a slice with optional default for {}
+func expandEnvSliceWithDefault(templates []string, envs map[string]string, defaultValue ...string) []string {
+	if len(templates) == 0 {
+		return templates
+	}
+
+	result := make([]string, len(templates))
+	for i, template := range templates {
+		result[i] = expandEnvWithDefault(template, envs, defaultValue...)
+	}
+	return result
+}
+
+// buildEnvMap creates a map of template variables for the current context
+func buildEnvMap(llgoRoot string) map[string]string {
+	envs := make(map[string]string)
+
+	// Basic paths
+	envs["root"] = llgoRoot
+	envs["tmpDir"] = os.TempDir()
+
+	// These will typically be set by calling code when actual values are known
+	// envs["port"] = ""     // Serial port (e.g., "/dev/ttyUSB0", "COM3")
+	// envs["hex"] = ""      // Path to hex file
+	// envs["bin"] = ""      // Path to binary file
+	// envs["img"] = ""      // Path to image file
+	// envs["zip"] = ""      // Path to zip file
+
+	return envs
+}
+
+// getCanonicalArchName returns the canonical architecture name for a target triple
+func getCanonicalArchName(triple string) string {
+	arch := strings.Split(triple, "-")[0]
+	if arch == "arm64" {
+		return "aarch64"
+	}
+	if strings.HasPrefix(arch, "arm") || strings.HasPrefix(arch, "thumb") {
+		return "arm"
+	}
+	if arch == "mipsel" {
+		return "mips"
+	}
+	return arch
 }
 
 // getMacOSSysroot returns the macOS SDK path using xcrun
@@ -70,12 +169,13 @@ func getESPClangRoot() (clangRoot string, err error) {
 	// Try to download ESP Clang if platform is supported
 	platformSuffix := getESPClangPlatform(runtime.GOOS, runtime.GOARCH)
 	if platformSuffix != "" {
-		cacheClangDir := filepath.Join(env.LLGoCacheDir(), "crosscompile", "esp-clang-"+espClangVersion)
+		cacheClangDir := filepath.Join(cacheRoot(), "crosscompile", "esp-clang-"+espClangVersion)
 		if _, err = os.Stat(cacheClangDir); err != nil {
 			if !errors.Is(err, fs.ErrNotExist) {
 				return
 			}
-			if err = downloadAndExtractESPClang(platformSuffix, cacheClangDir); err != nil {
+			fmt.Fprintln(os.Stderr, "ESP Clang not found in LLGO_ROOT or cache, will download.")
+			if err = checkDownloadAndExtractESPClang(platformSuffix, cacheClangDir); err != nil {
 				return
 			}
 		}
@@ -130,13 +230,35 @@ func use(goos, goarch string, wasiThreads bool) (export Export, err error) {
 	export.CC = filepath.Join(clangRoot, "bin", "clang++")
 
 	if runtime.GOOS == goos && runtime.GOARCH == goarch {
+		clangLib := filepath.Join(clangRoot, "lib")
+		clangInc := filepath.Join(clangRoot, "include")
 		// not cross compile
 		// Set up basic flags for non-cross-compile
 		export.LDFLAGS = []string{
+			"-L" + clangLib,
 			"-target", targetTriple,
-			"-Wno-override-module",
+			"-Qunused-arguments",
+			"-Wno-unused-command-line-argument",
 			"-Wl,--error-limit=0",
 			"-fuse-ld=lld",
+		}
+		export.CFLAGS = append(export.CFLAGS, "-I"+clangInc)
+		export.CCFLAGS = []string{
+			"-Qunused-arguments",
+			"-Wno-unused-command-line-argument",
+		}
+
+		// Add platform-specific rpath flags
+		switch goos {
+		case "darwin":
+			export.LDFLAGS = append(export.LDFLAGS, "-Wl,-rpath,"+clangLib)
+		case "linux":
+			export.LDFLAGS = append(export.LDFLAGS, "-Wl,-rpath,"+clangLib)
+		case "windows":
+			// Windows doesn't support rpath, DLLs should be in PATH or same directory
+		default:
+			// For other Unix-like systems, try the generic rpath
+			export.LDFLAGS = append(export.LDFLAGS, "-Wl,-rpath,"+clangLib)
 		}
 
 		// Add sysroot for macOS only
@@ -146,7 +268,8 @@ func use(goos, goarch string, wasiThreads bool) (export Export, err error) {
 				err = fmt.Errorf("failed to get macOS SDK path: %w", sysrootErr)
 				return
 			}
-			export.LDFLAGS = append([]string{"--sysroot=" + sysrootPath}, export.LDFLAGS...)
+			export.CCFLAGS = append(export.CCFLAGS, []string{"--sysroot=" + sysrootPath}...)
+			export.LDFLAGS = append(export.LDFLAGS, []string{"--sysroot=" + sysrootPath}...)
 		}
 
 		// Add OS-specific flags
@@ -190,7 +313,7 @@ func use(goos, goarch string, wasiThreads bool) (export Export, err error) {
 		// If not exists in LLGoROOT, download and use cached wasiSdkRoot
 		if _, err = os.Stat(wasiSdkRoot); err != nil {
 			sdkDir := filepath.Join(cacheDir(), llvm.GetTargetTriple(goos, goarch))
-			if wasiSdkRoot, err = checkDownloadAndExtract(wasiSdkUrl, sdkDir); err != nil {
+			if wasiSdkRoot, err = checkDownloadAndExtractWasiSDK(sdkDir); err != nil {
 				return
 			}
 		}
@@ -217,6 +340,8 @@ func use(goos, goarch string, wasiThreads bool) (export Export, err error) {
 		}
 		export.CFLAGS = []string{
 			"-I" + includeDir,
+			"-Qunused-arguments",
+			"-Wno-unused-command-line-argument",
 		}
 		// Add WebAssembly linker flags
 		export.LDFLAGS = append(export.LDFLAGS, export.CCFLAGS...)
@@ -267,6 +392,8 @@ func use(goos, goarch string, wasiThreads bool) (export Export, err error) {
 		// Add compiler flags
 		export.CCFLAGS = []string{
 			"-target", targetTriple,
+			"-Qunused-arguments",
+			"-Wno-unused-command-line-argument",
 		}
 		export.CFLAGS = []string{}
 		// Add WebAssembly linker flags for Emscripten
@@ -284,7 +411,7 @@ func use(goos, goarch string, wasiThreads bool) (export Export, err error) {
 			// "-z", "stack-size=10485760", // 10MB
 			// "-Wl,--export=malloc", "-Wl,--export=free",
 		}
-		export.EXTRAFLAGS = []string{
+		export.LDFLAGS = append(export.LDFLAGS, []string{
 			"-sENVIRONMENT=web,worker",
 			"-DPLATFORM_WEB",
 			"-sEXPORT_KEEPALIVE=1",
@@ -296,7 +423,7 @@ func use(goos, goarch string, wasiThreads bool) (export Export, err error) {
 			"-sEXPORT_ALL=1",
 			"-sASYNCIFY=1",
 			"-sSTACK_SIZE=5242880", // 50MB
-		}
+		}...)
 
 	default:
 		err = errors.New("unsupported GOOS for WebAssembly: " + goos)
@@ -314,6 +441,16 @@ func useTarget(targetName string) (export Export, err error) {
 		return export, fmt.Errorf("failed to resolve target %s: %w", targetName, err)
 	}
 
+	target := config.LLVMTarget
+	if target == "" {
+		return export, fmt.Errorf("target '%s' does not have a valid LLVM target triple", targetName)
+	}
+
+	cpu := config.CPU
+	if cpu == "" {
+		return export, fmt.Errorf("target '%s' does not have a valid CPU configuration", targetName)
+	}
+
 	// Check for ESP Clang support for target-based builds
 	clangRoot, err := getESPClangRoot()
 	if err != nil {
@@ -328,21 +465,31 @@ func useTarget(targetName string) (export Export, err error) {
 	export.BuildTags = config.BuildTags
 	export.GOOS = config.GOOS
 	export.GOARCH = config.GOARCH
+	export.ExtraFiles = config.ExtraFiles
+	export.BinaryFormat = config.BinaryFormat
+	export.FormatDetail = config.FormatDetail()
+
+	// Build environment map for template variable expansion
+	envs := buildEnvMap(env.LLGoROOT())
 
 	// Convert LLVMTarget, CPU, Features to CCFLAGS/LDFLAGS
 	var ccflags []string
 	var ldflags []string
 
-	target := config.LLVMTarget
-	if target == "" {
-		target = llvm.GetTargetTriple(config.GOOS, config.GOARCH)
+	cflags := []string{"-Wno-override-module", "-Qunused-arguments", "-Wno-unused-command-line-argument"}
+	if config.LLVMTarget != "" {
+		cflags = append(cflags, "--target="+config.LLVMTarget)
+		ccflags = append(ccflags, "--target="+config.LLVMTarget)
 	}
+	// Expand template variables in cflags
+	expandedCFlags := expandEnvSlice(config.CFlags, envs)
+	cflags = append(cflags, expandedCFlags...)
 
-	ccflags = append(ccflags, "-Wno-override-module", "--target="+config.LLVMTarget)
-
-	// Inspired by tinygo
-	cpu := config.CPU
+	// The following parameters are inspired by tinygo/builder/library.go
+	// Handle CPU configuration
 	if cpu != "" {
+		// X86 has deprecated the -mcpu flag, so we need to use -march instead.
+		// However, ARM has not done this.
 		if strings.HasPrefix(target, "i386") || strings.HasPrefix(target, "x86_64") {
 			ccflags = append(ccflags, "-march="+cpu)
 		} else if strings.HasPrefix(target, "avr") {
@@ -350,9 +497,47 @@ func useTarget(targetName string) (export Export, err error) {
 		} else {
 			ccflags = append(ccflags, "-mcpu="+cpu)
 		}
-		// Only add -mllvm flags for non-WebAssembly linkers
+
+		// For ld.lld linker, also add CPU info to linker flags
 		if config.Linker == "ld.lld" {
 			ldflags = append(ldflags, "-mllvm", "-mcpu="+cpu)
+		}
+	}
+
+	// Handle architecture-specific flags
+	canonicalArch := getCanonicalArchName(target)
+	switch canonicalArch {
+	case "arm":
+		if strings.Split(target, "-")[2] == "linux" {
+			ccflags = append(ccflags, "-fno-unwind-tables", "-fno-asynchronous-unwind-tables")
+		} else {
+			ccflags = append(ccflags, "-fshort-enums", "-fomit-frame-pointer", "-mfloat-abi=soft", "-fno-unwind-tables", "-fno-asynchronous-unwind-tables")
+		}
+	case "avr":
+		// AVR defaults to C float and double both being 32-bit. This deviates
+		// from what most code (and certainly compiler-rt) expects. So we need
+		// to force the compiler to use 64-bit floating point numbers for
+		// double.
+		ccflags = append(ccflags, "-mdouble=64")
+	case "riscv32":
+		ccflags = append(ccflags, "-march=rv32imac", "-fforce-enable-int128")
+	case "riscv64":
+		ccflags = append(ccflags, "-march=rv64gc")
+	case "mips":
+		ccflags = append(ccflags, "-fno-pic")
+	}
+
+	// Handle soft float
+	if strings.Contains(config.Features, "soft-float") || strings.Contains(strings.Join(config.CFlags, " "), "soft-float") {
+		// Use softfloat instead of floating point instructions. This is
+		// supported on many architectures.
+		ccflags = append(ccflags, "-msoft-float")
+	} else {
+		if strings.HasPrefix(target, "armv5") {
+			// On ARMv5 we need to explicitly enable hardware floating point
+			// instructions: Clang appears to assume the hardware doesn't have a
+			// FPU otherwise.
+			ccflags = append(ccflags, "-mfpu=vfpv2")
 		}
 	}
 
@@ -361,6 +546,22 @@ func useTarget(targetName string) (export Export, err error) {
 		// Only add -mllvm flags for non-WebAssembly linkers
 		if config.Linker == "ld.lld" {
 			ldflags = append(ldflags, "-mllvm", "-mattr="+config.Features)
+		}
+	}
+
+	// Handle code generation configuration
+	if config.CodeModel != "" {
+		ccflags = append(ccflags, "-mcmodel="+config.CodeModel)
+	}
+	if config.TargetABI != "" {
+		ccflags = append(ccflags, "-mabi="+config.TargetABI)
+	}
+	if config.RelocationModel != "" {
+		switch config.RelocationModel {
+		case "pic":
+			ccflags = append(ccflags, "-fPIC")
+		case "static":
+			ccflags = append(ccflags, "-fno-pic")
 		}
 	}
 
@@ -373,11 +574,11 @@ func useTarget(targetName string) (export Export, err error) {
 	}
 	ldflags = append(ldflags, "-L", env.LLGoROOT()) // search targets/*.ld
 
-	// Combine with config flags
-	export.CFLAGS = config.CFlags
+	// Combine with config flags and expand template variables
+	export.CFLAGS = cflags
 	export.CCFLAGS = ccflags
-	export.LDFLAGS = append(ldflags, config.LDFlags...)
-	export.EXTRAFLAGS = []string{}
+	expandedLDFlags := expandEnvSlice(config.LDFlags, envs)
+	export.LDFLAGS = append(ldflags, expandedLDFlags...)
 
 	return export, nil
 }
@@ -389,45 +590,4 @@ func Use(goos, goarch string, wasiThreads bool, targetName string) (export Expor
 		return useTarget(targetName)
 	}
 	return use(goos, goarch, wasiThreads)
-}
-
-// filterCompatibleLDFlags filters out linker flags that are incompatible with clang/lld
-func filterCompatibleLDFlags(ldflags []string) []string {
-	if len(ldflags) == 0 {
-		return ldflags
-	}
-
-	var filtered []string
-
-	incompatiblePrefixes := []string{
-		"--defsym=", // Use -Wl,--defsym= instead
-		"-T",        // Linker script, needs special handling
-	}
-
-	i := 0
-	for i < len(ldflags) {
-		flag := ldflags[i]
-
-		// Check incompatible prefixes
-		skip := false
-		for _, prefix := range incompatiblePrefixes {
-			if strings.HasPrefix(flag, prefix) {
-				skip = true
-				break
-			}
-		}
-		if skip {
-			// Skip -T and its argument if separate
-			if flag == "-T" && i+1 < len(ldflags) {
-				i += 2 // Skip both -T and the script path
-			} else {
-				i++
-			}
-			continue
-		}
-		filtered = append(filtered, flag)
-		i++
-	}
-
-	return filtered
 }

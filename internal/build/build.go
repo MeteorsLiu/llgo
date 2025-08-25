@@ -38,13 +38,15 @@ import (
 	"golang.org/x/tools/go/ssa"
 
 	"github.com/goplus/llgo/cl"
+	"github.com/goplus/llgo/internal/cabi"
+	"github.com/goplus/llgo/internal/clang"
 	"github.com/goplus/llgo/internal/crosscompile"
 	"github.com/goplus/llgo/internal/env"
+	"github.com/goplus/llgo/internal/firmware"
 	"github.com/goplus/llgo/internal/mockable"
 	"github.com/goplus/llgo/internal/packages"
 	"github.com/goplus/llgo/internal/typepatch"
 	"github.com/goplus/llgo/ssa/abi"
-	"github.com/goplus/llgo/xtool/clang"
 	xenv "github.com/goplus/llgo/xtool/env"
 	"github.com/goplus/llgo/xtool/env/llvm"
 
@@ -63,6 +65,8 @@ const (
 	ModeGen
 )
 
+type AbiMode = cabi.Mode
+
 const (
 	debugBuild = packages.DebugPackagesLoad
 )
@@ -76,6 +80,7 @@ type Config struct {
 	OutFile     string   // only valid for ModeBuild when len(pkgs) == 1
 	RunArgs     []string // only valid for ModeRun
 	Mode        Mode
+	AbiMode     AbiMode
 	GenExpect   bool // only valid for ModeCmpTest
 	Verbose     bool
 	GenLL       bool // generate pkg .ll files
@@ -108,6 +113,7 @@ func NewDefaultConf(mode Mode) *Config {
 		Goarch:  goarch,
 		BinPath: bin,
 		Mode:    mode,
+		AbiMode: cabi.ModeAllFunc,
 		AppExt:  DefaultAppExt(goos),
 	}
 	return conf
@@ -169,6 +175,9 @@ func Do(args []string, conf *Config) ([]Package, error) {
 	tags := "llgo"
 	if conf.Tags != "" {
 		tags += "," + conf.Tags
+	}
+	if len(export.BuildTags) > 0 {
+		tags += "," + strings.Join(export.BuildTags, ",")
 	}
 	cfg := &packages.Config{
 		Mode:       loadSyntax | packages.NeedDeps | packages.NeedModule | packages.NeedExportFile,
@@ -269,12 +278,14 @@ func Do(args []string, conf *Config) ([]Package, error) {
 	output := conf.OutFile != ""
 	ctx := &context{env: env, conf: cfg, progSSA: progSSA, prog: prog, dedup: dedup,
 		patches: patches, built: make(map[string]none), initial: initial, mode: mode,
-		output:        output,
-		needRt:        make(map[*packages.Package]bool),
-		needPyInit:    make(map[*packages.Package]bool),
-		buildConf:     conf,
-		crossCompile:  export,
-		isCheckEnable: IsCheckEnable(),
+		output:                 output,
+		needRt:                 make(map[*packages.Package]bool),
+		needPyInit:             make(map[*packages.Package]bool),
+		buildConf:              conf,
+		crossCompile:           export,
+		isCheckEnabled:         IsCheckEnabled(),
+		isCheckLinkArgsEnabled: IsCheckLinkArgsEnabled(),
+		cTransformer:           cabi.NewTransformer(prog, conf.AbiMode),
 	}
 	pkgs, err := buildAllPkgs(ctx, initial, verbose)
 	check(err)
@@ -364,7 +375,8 @@ type context struct {
 	nLibdir int
 	output  bool
 
-	isCheckEnable bool
+	isCheckEnabled         bool
+	isCheckLinkArgsEnabled bool
 
 	needRt     map[*packages.Package]bool
 	needPyInit map[*packages.Package]bool
@@ -372,23 +384,33 @@ type context struct {
 	buildConf    *Config
 	crossCompile crosscompile.Export
 
+	cTransformer *cabi.Transformer
+
 	testFail bool
 }
 
 func (c *context) compiler() *clang.Cmd {
-	cmd := c.env.Clang()
-	if c.crossCompile.CC != "" {
-		cmd = clang.New(c.crossCompile.CC)
-	}
+	config := clang.NewConfig(
+		c.crossCompile.CC,
+		c.crossCompile.CCFLAGS,
+		c.crossCompile.CFLAGS,
+		c.crossCompile.LDFLAGS,
+		c.crossCompile.Linker,
+	)
+	cmd := clang.NewCompiler(config)
 	cmd.Verbose = c.buildConf.Verbose
 	return cmd
 }
 
 func (c *context) linker() *clang.Cmd {
-	cmd := c.compiler()
-	if c.crossCompile.Linker != "" {
-		cmd = clang.New(c.crossCompile.Linker)
-	}
+	config := clang.NewConfig(
+		c.crossCompile.CC,
+		c.crossCompile.CCFLAGS,
+		c.crossCompile.CFLAGS,
+		c.crossCompile.LDFLAGS,
+		c.crossCompile.Linker,
+	)
+	cmd := clang.NewLinker(config)
 	cmd.Verbose = c.buildConf.Verbose
 	return cmd
 }
@@ -463,9 +485,11 @@ func buildAllPkgs(ctx *context, initial []*packages.Package, verbose bool) (pkgs
 						ctx.nLibdir++
 					}
 				}
-				// if err := ctx.compiler().CheckLinkArgs(pkgLinkArgs, isWasmTarget(ctx.buildConf.Goos)); err != nil {
-				// 	panic(fmt.Sprintf("test link args '%s' failed\n\texpanded to: %v\n\tresolved to: %v\n\terror: %v", param, expdArgs, pkgLinkArgs, err))
-				// }
+				if ctx.isCheckLinkArgsEnabled {
+					if err := ctx.compiler().CheckLinkArgs(pkgLinkArgs, isWasmTarget(ctx.buildConf.Goos)); err != nil {
+						panic(fmt.Sprintf("test link args '%s' failed\n\texpanded to: %v\n\tresolved to: %v\n\terror: %v", param, expdArgs, pkgLinkArgs, err))
+					}
+				}
 				aPkg.LinkArgs = append(aPkg.LinkArgs, pkgLinkArgs...)
 			}
 		default:
@@ -537,23 +561,145 @@ func createGlobals(ctx *context, prog llssa.Program, pkgs []*aPackage) (llssa.Pa
 	return global, nil
 }
 
-func linkMainPkg(ctx *context, pkg *packages.Package, pkgs []*aPackage, global llssa.Package, conf *Config, mode Mode, verbose bool) {
-	pkgPath := pkg.PkgPath
-	name := path.Base(pkgPath)
-	app := conf.OutFile
-	if app == "" {
-		if mode == ModeBuild && len(ctx.initial) > 1 {
+// compileExtraFiles compiles extra files (.s/.c) from target configuration and returns object files
+func compileExtraFiles(ctx *context, verbose bool) ([]string, error) {
+	if len(ctx.crossCompile.ExtraFiles) == 0 {
+		return nil, nil
+	}
+
+	var objFiles []string
+	llgoRoot := env.LLGoROOT()
+
+	for _, extraFile := range ctx.crossCompile.ExtraFiles {
+		// Resolve the file path relative to llgo root
+		srcFile := filepath.Join(llgoRoot, extraFile)
+
+		// Check if file exists
+		if _, err := os.Stat(srcFile); os.IsNotExist(err) {
+			return nil, fmt.Errorf("extra file not found: %s", srcFile)
+		}
+
+		// Generate output file name
+		objFile, err := os.CreateTemp("", "extra-*"+filepath.Base(extraFile))
+		if err != nil {
+			return nil, fmt.Errorf("failed to create temp file for %s: %w", extraFile, err)
+		}
+		objFile.Close()
+
+		var outputFile string
+		ext := filepath.Ext(srcFile)
+
+		if ctx.buildConf.GenLL {
+			outputFile = objFile.Name() + ".ll"
+		} else {
+			outputFile = objFile.Name() + ".o"
+		}
+
+		// Prepare compilation arguments
+		var args []string
+
+		// Handle different file types
+		switch ext {
+		case ".c":
+			args = append(args, "-x", "c")
+		case ".S", ".s":
+			args = append(args, "-x", "assembler-with-cpp")
+		}
+
+		// Add output flags
+		if ctx.buildConf.GenLL {
+			args = append(args, "-emit-llvm", "-S", "-o", outputFile, "-c", srcFile)
+		} else {
+			args = append(args, "-o", outputFile, "-c", srcFile)
+		}
+
+		if verbose {
+			fmt.Fprintf(os.Stderr, "Compiling extra file: clang %s\n", strings.Join(args, " "))
+		}
+
+		// Compile the file
+		cmd := ctx.compiler()
+		if err := cmd.Compile(args...); err != nil {
+			return nil, fmt.Errorf("failed to compile extra file %s: %w", srcFile, err)
+		}
+
+		objFiles = append(objFiles, outputFile)
+		os.Remove(objFile.Name()) // Remove the temp file we created for naming
+	}
+
+	return objFiles, nil
+}
+
+// generateOutputFilenames generates the final output filename (app) and intermediate filename (orgApp)
+// based on configuration and build context.
+func generateOutputFilenames(outFile, binPath, appExt, binExt, pkgName string, mode Mode, isMultiplePkgs bool) (app, orgApp string, err error) {
+	if outFile == "" {
+		if mode == ModeBuild && isMultiplePkgs {
 			// For multiple packages in ModeBuild mode, use temporary file
-			tmpFile, err := os.CreateTemp("", name+"*"+conf.AppExt)
-			check(err)
+			name := pkgName
+			if binExt != "" {
+				name += "*" + binExt
+			} else {
+				name += "*" + appExt
+			}
+			tmpFile, err := os.CreateTemp("", name)
+			if err != nil {
+				return "", "", err
+			}
 			app = tmpFile.Name()
 			tmpFile.Close()
 		} else {
-			app = filepath.Join(conf.BinPath, name+conf.AppExt)
+			app = filepath.Join(binPath, pkgName+appExt)
 		}
-	} else if filepath.Ext(app) == "" {
-		app += conf.AppExt
+		orgApp = app
+	} else {
+		// outFile is not empty, use it as base part
+		base := outFile
+		if binExt != "" {
+			// If binExt has value, use temporary file as orgApp for firmware conversion
+			tmpFile, err := os.CreateTemp("", "llgo-*"+appExt)
+			if err != nil {
+				return "", "", err
+			}
+			orgApp = tmpFile.Name()
+			tmpFile.Close()
+			// Check if base already ends with binExt, if so, don't add it again
+			if strings.HasSuffix(base, binExt) {
+				app = base
+			} else {
+				app = base + binExt
+			}
+		} else {
+			// No binExt, use base + AppExt directly
+			if filepath.Ext(base) == "" {
+				app = base + appExt
+			} else {
+				app = base
+			}
+			orgApp = app
+		}
 	}
+	return app, orgApp, nil
+}
+
+func linkMainPkg(ctx *context, pkg *packages.Package, pkgs []*aPackage, global llssa.Package, conf *Config, mode Mode, verbose bool) {
+	pkgPath := pkg.PkgPath
+	name := path.Base(pkgPath)
+	binFmt := ctx.crossCompile.BinaryFormat
+	binExt := firmware.BinaryExt(binFmt)
+
+	// app: converted firmware output file or executable file
+	// orgApp: before converted output file
+	app, orgApp, err := generateOutputFilenames(
+		conf.OutFile,
+		conf.BinPath,
+		conf.AppExt,
+		binExt,
+		name,
+		mode,
+		len(ctx.initial) > 1,
+	)
+	check(err)
 
 	needRuntime := false
 	needPyInit := false
@@ -585,14 +731,38 @@ func linkMainPkg(ctx *context, pkg *packages.Package, pkgs []*aPackage, global l
 	// defer os.Remove(entryLLFile)
 	objFiles = append(objFiles, entryObjFile)
 
+	// Compile extra files from target configuration
+	extraObjFiles, err := compileExtraFiles(ctx, verbose)
+	check(err)
+	objFiles = append(objFiles, extraObjFiles...)
+
 	if global != nil {
 		export, err := exportObject(ctx, pkg.PkgPath+".global", pkg.ExportFile+"-global", []byte(global.String()))
 		check(err)
 		objFiles = append(objFiles, export)
 	}
 
-	err = linkObjFiles(ctx, app, objFiles, linkArgs, verbose)
+	if IsFullRpathEnabled() {
+		exargs := make([]string, 0, ctx.nLibdir<<1)
+		// Treat every link-time library search path, specified by the -L parameter, as a runtime search path as well.
+		// This is to ensure the final executable can locate libraries with a relocatable install_name
+		// (e.g., "@rpath/libfoo.dylib") at runtime.
+		for _, arg := range linkArgs {
+			if strings.HasPrefix(arg, "-L") {
+				exargs = append(exargs, "-rpath", arg[2:])
+			}
+		}
+		linkArgs = append(linkArgs, exargs...)
+	}
+
+	err = linkObjFiles(ctx, orgApp, objFiles, linkArgs, verbose)
 	check(err)
+
+	if orgApp != app {
+		fmt.Printf("cross compile: %#v\n", ctx.crossCompile)
+		err = firmware.MakeFirmwareImage(orgApp, app, ctx.crossCompile.BinaryFormat, ctx.crossCompile.FormatDetail)
+		check(err)
+	}
 
 	switch mode {
 	case ModeTest:
@@ -660,8 +830,6 @@ func linkObjFiles(ctx *context, app string, objFiles, linkArgs []string, verbose
 	buildArgs = append(buildArgs, "--cref")
 	buildArgs = append(buildArgs, "--Map=t.map")
 
-	buildArgs = append(buildArgs, ctx.crossCompile.LDFLAGS...)
-	buildArgs = append(buildArgs, ctx.crossCompile.EXTRAFLAGS...)
 	buildArgs = append(buildArgs, objFiles...)
 
 	cmd := ctx.linker()
@@ -730,8 +898,7 @@ call i32 @setvbuf(ptr %stderr_ptr, ptr null, i32 2, %size_t 0)
 	startDefine := `
 define weak void @_start() {
   ; argc = 0
-  %argc_val = icmp eq i32 0, 0
-  %argc = zext i1 %argc_val to i32
+  %argc = add i32 0, 0
   ; argv = null
   %argv = inttoptr i64 0 to i8**
   call i32 @main(i32 %argc, i8** %argv)
@@ -817,6 +984,9 @@ func buildPkg(ctx *context, aPkg *aPackage, verbose bool) error {
 		cl.SetDebug(0)
 	}
 	check(err)
+
+	ctx.cTransformer.TransformModule(ret.Path(), ret.Module())
+
 	aPkg.LPkg = ret
 	cgoLLFiles, cgoLdflags, err := buildCgo(ctx, aPkg, aPkg.Package.Syntax, externs, verbose)
 	if err != nil {
@@ -856,7 +1026,7 @@ func exportObject(ctx *context, pkgPath string, exportFile string, data []byte) 
 	if err != nil {
 		return exportFile, err
 	}
-	if ctx.isCheckEnable {
+	if ctx.isCheckEnabled {
 		if msg, err := llcCheck(ctx.env, f.Name()); err != nil {
 			fmt.Fprintf(os.Stderr, "==> lcc %v: %v\n%v\n", pkgPath, f.Name(), msg)
 		}
@@ -871,8 +1041,6 @@ func exportObject(ctx *context, pkgPath string, exportFile string, data []byte) 
 	}
 	exportFile += ".o"
 	args := []string{"-o", exportFile, "-c", f.Name(), "-Wno-override-module"}
-	args = append(args, ctx.crossCompile.CCFLAGS...)
-	args = append(args, ctx.crossCompile.CFLAGS...)
 	if ctx.buildConf.Verbose {
 		fmt.Fprintln(os.Stderr, "clang", args)
 	}
@@ -1002,6 +1170,8 @@ const llgoCheck = "LLGO_CHECK"
 const llgoWasmRuntime = "LLGO_WASM_RUNTIME"
 const llgoWasiThreads = "LLGO_WASI_THREADS"
 const llgoStdioNobuf = "LLGO_STDIO_NOBUF"
+const llgoCheckLinkArgs = "LLGO_CHECK_LINKARGS"
+const llgoFullRpath = "LLGO_FULL_RPATH"
 
 const defaultWasmRuntime = "wasmtime"
 
@@ -1041,12 +1211,20 @@ func IsOptimizeEnabled() bool {
 	return isEnvOn(llgoOptimize, true)
 }
 
-func IsCheckEnable() bool {
+func IsCheckEnabled() bool {
 	return isEnvOn(llgoCheck, false)
 }
 
 func IsWasiThreadsEnabled() bool {
 	return isEnvOn(llgoWasiThreads, true)
+}
+
+func IsCheckLinkArgsEnabled() bool {
+	return isEnvOn(llgoCheckLinkArgs, false)
+}
+
+func IsFullRpathEnabled() bool {
+	return isEnvOn(llgoFullRpath, true)
 }
 
 func WasmRuntime() string {
@@ -1132,8 +1310,6 @@ func clFile(ctx *context, args []string, cFile, expFile string, procFile func(li
 		llFile += ".o"
 		args = append(args, "-o", llFile, "-c", cFile)
 	}
-	args = append(args, ctx.crossCompile.CCFLAGS...)
-	args = append(args, ctx.crossCompile.CFLAGS...)
 	if verbose {
 		fmt.Fprintln(os.Stderr, "clang", args)
 	}
