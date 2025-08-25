@@ -28,16 +28,6 @@ func __noop__() c.Int {
 
 // -----------------------------------------------------------------------------
 
-type aThread struct {
-	Unused [8]byte
-}
-
-//llgo:type C
-type RoutineFunc func(c.Pointer) c.Pointer
-
-// Thread represents a POSIX thread.
-type Thread = *aThread
-
 // The pthread_exit() function terminates the calling thread and
 // returns a value via retval that (if the thread is joinable) is
 // available to another thread in the same process that calls
