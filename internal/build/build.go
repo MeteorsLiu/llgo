@@ -1618,13 +1618,20 @@ func buildPkg(ctx *context, aPkg *aPackage, verbose bool) error {
 	ctx.cTransformer.TransformModule(ret.Path(), ret.Module())
 	ctx.cTransformer.SetSkipFuncs(nil)
 
+	mod := ret.Module()
+	mod.SetDataLayout(ctx.prog.DataLayout())
+	mod.SetTarget(ctx.prog.Target().Spec().Triple)
+	pbo := gllvm.NewPassBuilderOptions()
+	defer pbo.Dispose()
+
+	// C ABI lowering materializes aggregate copies as load/store pairs. Run
+	// memcpyopt before SROA or code generation can scalarize those aggregates.
+	if err := mod.RunPasses("memcpyopt", ctx.prog.TargetMachine(), pbo); err != nil {
+		return fmt.Errorf("run LLVM memcpyopt pass failed for %v: %v", pkgPath, err)
+	}
+
 	// Run the default LLVM optimization pipeline selected by the requested -O level.
 	if ctx.passOpt {
-		mod := ret.Module()
-		mod.SetDataLayout(ctx.prog.DataLayout())
-		mod.SetTarget(ctx.prog.Target().Spec().Triple)
-		pbo := gllvm.NewPassBuilderOptions()
-		defer pbo.Dispose()
 		if err = gllvm.VerifyModule(mod, gllvm.ReturnStatusAction); err != nil {
 			return err
 		}
