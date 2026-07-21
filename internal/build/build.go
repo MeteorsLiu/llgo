@@ -163,7 +163,7 @@ type Config struct {
 	CompilerHash  string // metadata hash for the running compiler (development builds only)
 	GoVersion     string // Go language version accepted by the frontend (for example, "go1.22")
 	NoErrorColumn bool   // omit source columns from frontend diagnostics
-	NoBounds      bool   // disable index and slice bounds checks during IR generation
+	NoBounds      bool   // disable index bounds checks during IR generation
 	// GoBuildFlags contains normalized raw Go build flags forwarded to
 	// go/packages. Callers use internal/goflags to parse supported compiler and
 	// linker semantics into typed Config fields before calling Do.
