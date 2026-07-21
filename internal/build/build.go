@@ -163,6 +163,7 @@ type Config struct {
 	CompilerHash  string // metadata hash for the running compiler (development builds only)
 	GoVersion     string // Go language version accepted by the frontend (for example, "go1.22")
 	NoErrorColumn bool   // omit source columns from frontend diagnostics
+	NoBounds      bool   // disable index and slice bounds checks during IR generation
 	// GoBuildFlags contains normalized raw Go build flags forwarded to
 	// go/packages. Callers use internal/goflags to parse supported compiler and
 	// linker semantics into typed Config fields before calling Do.
@@ -365,6 +366,7 @@ func Do(args []string, conf *Config) ([]Package, error) {
 	}
 
 	prog := llssa.NewProgram(target)
+	prog.SetNoBounds(conf.NoBounds)
 	if conf.Mode != ModeGen {
 		// ModeGen callers (llgen and the golden suites) read LPkg.String()
 		// after Do returns and dispose the program themselves; every other

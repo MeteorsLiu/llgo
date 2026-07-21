@@ -147,14 +147,12 @@ func (b Builder) IndexAddr(x, idx Expr) Expr {
 	dbgInstrf("IndexAddr %v, %v\n", x.impl, idx.impl)
 	prog := b.Prog
 	telem := prog.Index(x.Type)
-	pt := prog.Pointer(telem)
 	switch t := x.raw.Type.Underlying().(type) {
 	case *types.Slice:
 		ptr := b.SliceData(x)
 		max := b.SliceLen(x)
 		idx = b.checkIndex(idx, max)
-		indices := []llvm.Value{idx.impl}
-		return Expr{llvm.CreateInBoundsGEP(b.impl, telem.ll, ptr.impl, indices), pt}
+		return b.elementAddr(telem, ptr, idx)
 	case *types.Pointer:
 		ar := t.Elem().Underlying().(*types.Array)
 		max := prog.IntVal(uint64(ar.Len()), prog.Int())
@@ -163,8 +161,15 @@ func (b Builder) IndexAddr(x, idx Expr) Expr {
 			b.AssertNilDeref(x)
 		}
 	}
+	return b.elementAddr(telem, x, idx)
+}
+
+func (b Builder) elementAddr(elem Type, ptr, idx Expr) Expr {
 	indices := []llvm.Value{idx.impl}
-	return Expr{llvm.CreateInBoundsGEP(b.impl, telem.ll, x.impl, indices), pt}
+	if b.Prog.noBounds {
+		return Expr{llvm.CreateGEP(b.impl, elem.ll, ptr.impl, indices), b.Prog.Pointer(elem)}
+	}
+	return Expr{llvm.CreateInBoundsGEP(b.impl, elem.ll, ptr.impl, indices), b.Prog.Pointer(elem)}
 }
 
 func isKnownNonNilArrayBase(v llvm.Value) bool {
@@ -260,6 +265,9 @@ func (b Builder) checkIndex(idx Expr, max Expr) Expr {
 		idx.Type = typ
 		idx.impl = castUintptr(b, idx.impl, srcType, typ)
 	}
+	if prog.noBounds {
+		return idx
+	}
 	// check range expr
 	var check Expr
 	if checkMin {
@@ -319,9 +327,7 @@ func (b Builder) Index(x, idx Expr, takeAddr func() (addr Expr, zero bool)) Expr
 		ptr = b.Alloc(x.Type, false)
 		b.impl.CreateStore(x.impl, ptr.impl)
 	}
-	pt := prog.Pointer(telem)
-	indices := []llvm.Value{idx.impl}
-	buf := Expr{llvm.CreateInBoundsGEP(b.impl, telem.ll, ptr.impl, indices), pt}
+	buf := b.elementAddr(telem, ptr, idx)
 	return b.Load(buf)
 }
 
@@ -378,6 +384,12 @@ func (b Builder) Slice(x, low, high, max Expr) (ret Expr) {
 			highArg, highSigned = b.boundsArg(high)
 		}
 		ret.Type = x.Type
+		if prog.noBounds {
+			data := b.Advance(b.StringData(x), low)
+			size := b.impl.CreateSub(high.impl, low.impl, "")
+			ret.impl = b.unsafeString(data.impl, size).impl
+			return
+		}
 		ret.impl = b.InlineCall(b.Pkg.rtFunc("StringSlice2"), x, lowArg, highArg, prog.BoolVal(lowSigned), prog.BoolVal(highSigned)).impl
 		return
 	case *types.Slice:
@@ -408,6 +420,21 @@ func (b Builder) Slice(x, low, high, max Expr) (ret Expr) {
 			}
 			base = x
 		}
+	}
+	if prog.noBounds {
+		data := base
+		if _, ok := x.raw.Type.Underlying().(*types.Pointer); ok {
+			data = Expr{base.impl, prog.Pointer(prog.Index(ret.Type))}
+		}
+		data = b.Advance(data, low)
+		upper := nCap
+		if !max.IsNil() {
+			upper = max
+		}
+		length := b.impl.CreateSub(high.impl, low.impl, "")
+		capacity := b.impl.CreateSub(upper.impl, low.impl, "")
+		ret.impl = b.unsafeSlice(data, length, capacity).impl
+		return
 	}
 	if max.IsNil() {
 		ret.impl = b.InlineCall(

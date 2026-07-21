@@ -87,6 +87,27 @@ func TestCollectFingerprint(t *testing.T) {
 	if data.Package.PkgPath != "example.com/test" {
 		t.Error("manifest should contain PKG_PATH")
 	}
+
+	ctx.buildConf.NoBounds = true
+	noBoundsPkg := &aPackage{
+		Package: &packages.Package{
+			PkgPath: "example.com/test",
+			GoFiles: []string{goFile},
+		},
+	}
+	if err := ctx.collectFingerprint(noBoundsPkg); err != nil {
+		t.Fatalf("collectFingerprint with NoBounds: %v", err)
+	}
+	if pkg.Fingerprint == noBoundsPkg.Fingerprint {
+		t.Fatal("bounds-checked and -B builds should not share a cache fingerprint")
+	}
+	noBoundsData, err := decodeManifest(noBoundsPkg.Manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if noBoundsData.Common == nil || !noBoundsData.Common.NoBounds {
+		t.Fatalf("manifest does not contain NO_BOUNDS=true:\n%s", noBoundsPkg.Manifest)
+	}
 }
 
 func TestCollectFingerprintDeterminism(t *testing.T) {

@@ -237,6 +237,7 @@ type aProgram struct {
 	enableGoGlobalDCE     bool
 	pthreadStackSize      uint64
 	enableLTOPluginMarker bool
+	noBounds              bool
 
 	enableFuncInfoMetadata bool
 	enableFuncInfoSites    bool
@@ -350,6 +351,11 @@ func (p Program) SetCompileMethods(check func(Package, types.Type)) {
 
 func (p Program) EnableGoGlobalDCE(enable bool) {
 	p.enableGoGlobalDCE = enable
+}
+
+// SetNoBounds controls whether index and slice bounds checks are emitted.
+func (p Program) SetNoBounds(noBounds bool) {
+	p.noBounds = noBounds
 }
 
 func (p Program) SetPthreadStackSize(size uint64) {

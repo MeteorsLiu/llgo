@@ -161,6 +161,7 @@ func runCmd(_ *base.Command, args []string) {
 	conf := build.NewDefaultConf(build.ModeGen)
 	conf.GoVersion = opts.lang
 	conf.NoErrorColumn = opts.noColumns.value != 0
+	conf.NoBounds = opts.noBounds.value != 0
 	conf.AllowNoBody = !opts.complete
 	var loaderCompilerFlags []string
 	if opts.allErrors.value != 0 {
@@ -195,7 +196,6 @@ func (opts *options) unsupported() []string {
 			out = append(out, name)
 		}
 	}
-	appendFlag(opts.noBounds.value != 0, "-B")
 	appendFlag(opts.dynlink, "-dynlink")
 	appendFlag(opts.showOpt.value != 0, "-m")
 	appendFlag(opts.live, "-live")
