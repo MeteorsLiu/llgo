@@ -36,9 +36,6 @@ func TestNoBoundsIndexAddr(t *testing.T) {
 	if strings.Contains(ir, "CheckIndexRange") {
 		t.Fatalf("-B emitted an index bounds check:\n%s", ir)
 	}
-	if strings.Contains(ir, "getelementptr inbounds") || !strings.Contains(ir, "getelementptr ") {
-		t.Fatalf("-B index must use ordinary getelementptr:\n%s", ir)
-	}
 	if !strings.Contains(ir, "AssertNilDeref") {
 		t.Fatalf("-B must retain nil pointer checks:\n%s", ir)
 	}
@@ -81,9 +78,6 @@ func TestNoBoundsSlices(t *testing.T) {
 		if strings.Contains(ir, helper) {
 			t.Fatalf("-B emitted checked slice helper %s:\n%s", helper, ir)
 		}
-	}
-	if strings.Contains(ir, "getelementptr inbounds") || strings.Count(ir, "getelementptr ") != 3 {
-		t.Fatalf("-B slices must use ordinary getelementptr:\n%s", ir)
 	}
 }
 

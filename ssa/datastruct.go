@@ -147,12 +147,14 @@ func (b Builder) IndexAddr(x, idx Expr) Expr {
 	dbgInstrf("IndexAddr %v, %v\n", x.impl, idx.impl)
 	prog := b.Prog
 	telem := prog.Index(x.Type)
+	pt := prog.Pointer(telem)
 	switch t := x.raw.Type.Underlying().(type) {
 	case *types.Slice:
 		ptr := b.SliceData(x)
 		max := b.SliceLen(x)
 		idx = b.checkIndex(idx, max)
-		return b.elementAddr(telem, ptr, idx)
+		indices := []llvm.Value{idx.impl}
+		return Expr{llvm.CreateInBoundsGEP(b.impl, telem.ll, ptr.impl, indices), pt}
 	case *types.Pointer:
 		ar := t.Elem().Underlying().(*types.Array)
 		max := prog.IntVal(uint64(ar.Len()), prog.Int())
@@ -161,15 +163,8 @@ func (b Builder) IndexAddr(x, idx Expr) Expr {
 			b.AssertNilDeref(x)
 		}
 	}
-	return b.elementAddr(telem, x, idx)
-}
-
-func (b Builder) elementAddr(elem Type, ptr, idx Expr) Expr {
 	indices := []llvm.Value{idx.impl}
-	if b.Prog.noBounds {
-		return Expr{llvm.CreateGEP(b.impl, elem.ll, ptr.impl, indices), b.Prog.Pointer(elem)}
-	}
-	return Expr{llvm.CreateInBoundsGEP(b.impl, elem.ll, ptr.impl, indices), b.Prog.Pointer(elem)}
+	return Expr{llvm.CreateInBoundsGEP(b.impl, telem.ll, x.impl, indices), pt}
 }
 
 func isKnownNonNilArrayBase(v llvm.Value) bool {
@@ -327,7 +322,9 @@ func (b Builder) Index(x, idx Expr, takeAddr func() (addr Expr, zero bool)) Expr
 		ptr = b.Alloc(x.Type, false)
 		b.impl.CreateStore(x.impl, ptr.impl)
 	}
-	buf := b.elementAddr(telem, ptr, idx)
+	pt := prog.Pointer(telem)
+	indices := []llvm.Value{idx.impl}
+	buf := Expr{llvm.CreateInBoundsGEP(b.impl, telem.ll, ptr.impl, indices), pt}
 	return b.Load(buf)
 }
 
