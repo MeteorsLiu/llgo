@@ -353,7 +353,7 @@ func (p Program) EnableGoGlobalDCE(enable bool) {
 	p.enableGoGlobalDCE = enable
 }
 
-// SetNoBounds controls whether index bounds checks are emitted.
+// SetNoBounds controls whether bounds checks are emitted.
 func (p Program) SetNoBounds(noBounds bool) {
 	p.noBounds = noBounds
 }
