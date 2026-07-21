@@ -77,6 +77,10 @@ func NewSlice3(base unsafe.Pointer, eltSize, cap, i, j, k int) (s Slice) {
 	return newSliceUnchecked(base, eltSize, i, j, k)
 }
 
+func NewSliceNoBounds(base unsafe.Pointer, eltSize, i, j, k int) Slice {
+	return newSliceUnchecked(base, eltSize, i, j, k)
+}
+
 func newSliceUnchecked(base unsafe.Pointer, eltSize, i, j, k int) (s Slice) {
 	s.len = j - i
 	s.cap = k - i

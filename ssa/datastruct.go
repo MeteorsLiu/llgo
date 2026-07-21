@@ -382,11 +382,7 @@ func (b Builder) Slice(x, low, high, max Expr) (ret Expr) {
 		}
 		ret.Type = x.Type
 		if prog.noBounds {
-			size := b.impl.CreateSub(high.impl, low.impl, "")
-			nonEmpty := b.impl.CreateICmp(llvm.IntSGT, size, llvm.ConstInt(size.Type(), 0, false), "")
-			offset := b.impl.CreateSelect(nonEmpty, low.impl, llvm.ConstInt(low.ll, 0, false), "")
-			data := b.Advance(b.StringData(x), Expr{offset, low.Type})
-			ret.impl = b.unsafeString(data.impl, size).impl
+			ret.impl = b.InlineCall(b.Pkg.rtFunc("StringSliceNoBounds"), x, low, high).impl
 			return
 		}
 		ret.impl = b.InlineCall(b.Pkg.rtFunc("StringSlice2"), x, lowArg, highArg, prog.BoolVal(lowSigned), prog.BoolVal(highSigned)).impl
@@ -421,20 +417,11 @@ func (b Builder) Slice(x, low, high, max Expr) (ret Expr) {
 		}
 	}
 	if prog.noBounds {
-		data := base
-		if _, ok := x.raw.Type.Underlying().(*types.Pointer); ok {
-			data = Expr{base.impl, prog.Pointer(prog.Index(ret.Type))}
-		}
 		upper := nCap
 		if !max.IsNil() {
 			upper = max
 		}
-		length := b.impl.CreateSub(high.impl, low.impl, "")
-		capacity := b.impl.CreateSub(upper.impl, low.impl, "")
-		nonEmpty := b.impl.CreateICmp(llvm.IntSGT, capacity, llvm.ConstInt(capacity.Type(), 0, false), "")
-		offset := b.impl.CreateSelect(nonEmpty, low.impl, llvm.ConstInt(low.ll, 0, false), "")
-		data = b.Advance(data, Expr{offset, low.Type})
-		ret.impl = b.unsafeSlice(data, length, capacity).impl
+		ret.impl = b.InlineCall(b.Pkg.rtFunc("NewSliceNoBounds"), base, nEltSize, low, high, upper).impl
 		return
 	}
 	if max.IsNil() {

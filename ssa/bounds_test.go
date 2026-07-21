@@ -107,6 +107,12 @@ func TestNoBoundsSlicesAndConversion(t *testing.T) {
 			t.Fatalf("-B emitted checked helper %s:\n%s", helper, unchecked)
 		}
 	}
+	if !strings.Contains(unchecked, "NewSliceNoBounds") {
+		t.Fatalf("-B did not emit unchecked slice helper:\n%s", unchecked)
+	}
+	if !strings.Contains(unchecked, "StringSliceNoBounds") {
+		t.Fatalf("-B did not emit unchecked string helper:\n%s", unchecked)
+	}
 }
 
 func newBoundsTestProgram(t *testing.T) Program {

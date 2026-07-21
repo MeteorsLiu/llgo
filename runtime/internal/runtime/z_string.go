@@ -80,6 +80,14 @@ func StringSlice2(base String, i, j int64, iSigned, jSigned bool) String {
 	return String{base.data, 0}
 }
 
+func StringSliceNoBounds(base String, i, j int) String {
+	size := j - i
+	if size > 0 {
+		return String{c.Advance(base.data, i), size}
+	}
+	return String{base.data, size}
+}
+
 type StringIter struct {
 	s   string
 	pos int
