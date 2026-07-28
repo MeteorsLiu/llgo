@@ -36,6 +36,7 @@ import (
 	"sync"
 	"sync/atomic"
 
+	gopackages "golang.org/x/tools/go/packages"
 	"golang.org/x/tools/go/ssa"
 
 	"github.com/goplus/llgo/cl"
@@ -2028,7 +2029,23 @@ func buildSSAPkgs(ctx *context, initial []*packages.Package, verbose bool) ([]*a
 	})
 	if len(errs) > 0 {
 		for _, errPkg := range errs {
+			var parserRecoveryLine string
 			for _, err := range errPkg.Errors {
+				if err.Kind != gopackages.ListError {
+					continue
+				}
+				for _, line := range strings.Split(err.Msg, "\n") {
+					if pos, ok := strings.CutSuffix(line, ": syntax error: unexpected name u, expected ("); ok {
+						parserRecoveryLine = packageErrorLine(pos)
+						break
+					}
+				}
+			}
+			for _, err := range errPkg.Errors {
+				if parserRecoveryLine != "" && packageErrorLine(err.Pos) == parserRecoveryLine &&
+					(err.Kind == gopackages.ParseError || err.Kind == gopackages.TypeError) {
+					continue
+				}
 				fmt.Fprintln(os.Stderr, formatPackageError(err, ctx.buildConf.NoErrorColumn))
 			}
 			fmt.Fprintln(os.Stderr, "cannot build SSA for package", errPkg)
@@ -2036,6 +2053,17 @@ func buildSSAPkgs(ctx *context, initial []*packages.Package, verbose bool) ([]*a
 		return nil, fmt.Errorf("cannot build SSA for packages")
 	}
 	return all, nil
+}
+
+func packageErrorLine(pos string) string {
+	if line, ok := positionWithoutColumn(pos); ok {
+		pos = line
+	}
+	colon := strings.LastIndexByte(pos, ':')
+	if colon < 0 {
+		return pos
+	}
+	return filepath.Base(pos[:colon]) + pos[colon:]
 }
 
 func formatPackageError(err packages.Error, noColumn bool) string {

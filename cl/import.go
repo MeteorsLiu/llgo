@@ -762,6 +762,9 @@ func ParsePkgSyntax(prog llssa.Program, pkg *types.Package, files []*ast.File) {
 		for _, decl := range file.Decls {
 			switch decl := decl.(type) {
 			case *ast.FuncDecl:
+				if decl.Doc == nil {
+					continue
+				}
 				fullName, _ := astFuncName(pkgPath, decl)
 				ctx.processNoInterfaceByDoc(decl.Doc, fullName)
 			case *ast.GenDecl:
