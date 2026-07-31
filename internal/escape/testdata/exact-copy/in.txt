@@ -1,0 +1,77 @@
+target datalayout = "e-p:64:64-i64:64-n32:64-S128"
+
+@escaped = global ptr null
+
+declare ptr @"github.com/goplus/llgo/runtime/internal/runtime.AllocU"(i64)
+declare void @clobber(ptr)
+
+define void @exact_copy() {
+entry:
+  %p = call ptr @"github.com/goplus/llgo/runtime/internal/runtime.AllocU"(i64 8)
+  %slot = alloca ptr
+  store ptr %p, ptr %slot
+  %q = load ptr, ptr %slot
+  store i8 1, ptr %q
+  ret void
+}
+
+define void @alias() {
+entry:
+  %p = call ptr @"github.com/goplus/llgo/runtime/internal/runtime.AllocU"(i64 8)
+  %slot = alloca ptr
+  %alias = getelementptr ptr, ptr %slot, i64 0
+  store ptr %p, ptr %slot
+  %q = load ptr, ptr %alias
+  store i8 1, ptr %q
+  ret void
+}
+
+define void @slot_address_escape() {
+entry:
+  %p = call ptr @"github.com/goplus/llgo/runtime/internal/runtime.AllocU"(i64 8)
+  %slot = alloca ptr
+  store ptr %p, ptr %slot
+  store ptr %slot, ptr @escaped
+  ret void
+}
+
+define void @unknown_clobber() {
+entry:
+  %p = call ptr @"github.com/goplus/llgo/runtime/internal/runtime.AllocU"(i64 8)
+  %slot = alloca ptr
+  store ptr %p, ptr %slot
+  call void @clobber(ptr %slot)
+  ret void
+}
+
+define void @unsupported_reader() {
+entry:
+  %p = call ptr @"github.com/goplus/llgo/runtime/internal/runtime.AllocU"(i64 8)
+  %slot = alloca ptr
+  store ptr %p, ptr %slot
+  %q = load i64, ptr %slot
+  ret void
+}
+
+define void @other_store() {
+entry:
+  %p = call ptr @"github.com/goplus/llgo/runtime/internal/runtime.AllocU"(i64 8)
+  %slot = alloca ptr
+  store ptr %p, ptr %slot
+  store ptr null, ptr %slot
+  ret void
+}
+
+define void @global_destination() {
+entry:
+  %p = call ptr @"github.com/goplus/llgo/runtime/internal/runtime.AllocU"(i64 8)
+  store ptr %p, ptr @escaped
+  ret void
+}
+
+define void @nonlocal_destination(ptr %dst) {
+entry:
+  %p = call ptr @"github.com/goplus/llgo/runtime/internal/runtime.AllocU"(i64 8)
+  store ptr %p, ptr %dst
+  ret void
+}
