@@ -3,8 +3,11 @@ source_filename = "testdata/calls/in.txt"
 target datalayout = "e-p:64:64-i64:64-n32:64-S128"
 
 @escaped = global ptr null
+@atomic_slot = global ptr null
 
 declare ptr @"github.com/goplus/llgo/runtime/internal/runtime.AllocU"(i64)
+
+declare void @external(ptr)
 
 define void @read(ptr %p) {
 entry:
@@ -80,9 +83,67 @@ entry:
   ret void
 }
 
+define void @derived(ptr %p, i1 %cond) {
+entry:
+  %g = getelementptr i8, ptr %p, i64 1
+  %b = bitcast ptr %g to ptr
+  %s = select i1 %cond, ptr %b, ptr %p
+  %f = freeze ptr %s
+  %same = icmp eq ptr %f, null
+  store volatile i8 1, ptr %f, align 1
+  %v = load volatile i8, ptr %f, align 1
+  ret void
+}
+
+define void @phi_addrspace(ptr %p, i1 %cond) {
+entry:
+  br i1 %cond, label %left, label %right
+
+left:                                             ; preds = %entry
+  %q = addrspacecast ptr %p to ptr addrspace(1)
+  %r = addrspacecast ptr addrspace(1) %q to ptr
+  br label %join
+
+right:                                            ; preds = %entry
+  br label %join
+
+join:                                             ; preds = %right, %left
+  %x = phi ptr [ %r, %left ], [ %p, %right ]
+  %v = load i8, ptr %x, align 1
+  ret void
+}
+
+define void @atomic_use(ptr %p) {
+entry:
+  store atomic i32 1, ptr %p monotonic, align 4
+  %v = load atomic i32, ptr %p monotonic, align 4
+  %cx = cmpxchg ptr @atomic_slot, ptr %p, ptr null monotonic monotonic, align 8
+  %rmw = atomicrmw add ptr %p, i32 1 monotonic, align 4
+  ret void
+}
+
+define void @atomic_sink(ptr %p) {
+entry:
+  %cx = cmpxchg ptr @atomic_slot, ptr null, ptr %p monotonic monotonic, align 8
+  ret void
+}
+
+define void @unknown_param(ptr %p) {
+entry:
+  call void @external(ptr %p)
+  ret void
+}
+
+define void @recursive_load(ptr %p) {
+entry:
+  %q = load ptr, ptr %p, align 8
+  call void @recursive_load(ptr %q)
+  ret void
+}
+
 define void @known_no_leak() {
 entry:
-  %p.stack = alloca i8, i64 8, align 8
+  %p.stack = alloca i8, i64 8, align 1
   call void @read(ptr %p.stack)
   ret void
 }
@@ -96,22 +157,22 @@ entry:
 
 define void @known_mutator() {
 entry:
-  %p.stack = alloca i8, i64 8, align 8
+  %p.stack = alloca i8, i64 8, align 1
   call void @write(ptr %p.stack)
   ret void
 }
 
 define void @known_content_leak() {
 entry:
-  %p.stack = alloca i8, i64 8, align 8
+  %p.stack = alloca i8, i64 8, align 1
   call void @leak_content(ptr %p.stack)
   ret void
 }
 
 define void @result_local() {
 entry:
-  %p.stack = alloca i8, i64 8, align 1
-  %q = call ptr @identity(ptr %p.stack)
+  %p = call ptr @"github.com/goplus/llgo/runtime/internal/runtime.AllocU"(i64 8)
+  %q = call ptr @identity(ptr %p)
   store i8 1, ptr %q, align 1
   ret void
 }
@@ -156,5 +217,47 @@ define void @callee_effect() {
 entry:
   %p.stack = alloca i8, i64 8, align 1
   call void @call_parameter(ptr %p.stack)
+  ret void
+}
+
+define void @known_derived(i1 %cond) {
+entry:
+  %p.stack = alloca i8, i64 8, align 1
+  call void @derived(ptr %p.stack, i1 %cond)
+  ret void
+}
+
+define void @known_phi_addrspace(i1 %cond) {
+entry:
+  %p.stack = alloca i8, i64 8, align 1
+  call void @phi_addrspace(ptr %p.stack, i1 %cond)
+  ret void
+}
+
+define void @known_atomic() {
+entry:
+  %p.stack = alloca i8, i64 8, align 1
+  call void @atomic_use(ptr %p.stack)
+  ret void
+}
+
+define void @known_atomic_sink() {
+entry:
+  %p = call ptr @"github.com/goplus/llgo/runtime/internal/runtime.AllocU"(i64 8)
+  call void @atomic_sink(ptr %p)
+  ret void
+}
+
+define void @known_unknown_param() {
+entry:
+  %p = call ptr @"github.com/goplus/llgo/runtime/internal/runtime.AllocU"(i64 8)
+  call void @unknown_param(ptr %p)
+  ret void
+}
+
+define void @recursive_alignment() {
+entry:
+  %p.stack = alloca i8, i64 8, align 1
+  call void @recursive_load(ptr %p.stack)
   ret void
 }

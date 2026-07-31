@@ -15,8 +15,6 @@ const (
 	runtimeAllocZ = runtimePrefix + "AllocZ"
 	runtimeAllocU = runtimePrefix + "AllocU"
 
-	maxDereferenceLevel = 16
-
 	// github.com/xgo-dev/llvm does not expose these LLVM 19 C opcode names.
 	opcodeAtomicCmpXchg = llvm.Opcode(56)
 	opcodeAtomicRMW     = llvm.Opcode(57)
@@ -24,114 +22,45 @@ const (
 	opcodeFreeze        = llvm.Opcode(68)
 )
 
-type summaryKey struct {
+type paramKey struct {
 	fn    llvm.Value
 	param int
 }
 
-type summaryState uint8
-
-const (
-	summaryUnseen summaryState = iota
-	summaryEvaluating
-	summaryEvaluated
-)
-
-type parameterSummary struct {
-	heapLevel    int
-	mutatorLevel int
-	calleeLevel  int
-	results      map[int]int
-	alignments   map[int]int
+type locationEdge struct {
+	from    llvm.Value
+	to      llvm.Value
+	operand int
 }
 
-func newParameterSummary() parameterSummary {
-	return parameterSummary{
-		heapLevel:    -1,
-		mutatorLevel: -1,
-		calleeLevel:  -1,
-		results:      make(map[int]int),
-		alignments:   make(map[int]int),
-	}
+// locationGraph records diagnostic pointer flows but is never queried by the
+// optimization analyses.
+type locationGraph struct {
+	edges map[locationEdge]struct{}
 }
 
-func minLevel(dst *int, level int) bool {
-	if *dst >= 0 && *dst <= level {
-		return false
-	}
-	*dst = level
-	return true
+func newLocationGraph() locationGraph {
+	return locationGraph{edges: make(map[locationEdge]struct{})}
 }
 
-func (s *parameterSummary) addHeap(level int) bool {
-	return minLevel(&s.heapLevel, level)
+func (g *locationGraph) addUse(from llvm.Value, state useState) {
+	g.edges[locationEdge{from: from, to: state.user, operand: state.operand}] = struct{}{}
 }
 
-func (s *parameterSummary) addMutator(level int) bool {
-	return minLevel(&s.mutatorLevel, level)
-}
-
-func (s *parameterSummary) addCallee(level int) bool {
-	return minLevel(&s.calleeLevel, level)
-}
-
-func (s *parameterSummary) addResult(index, level int) bool {
-	old, ok := s.results[index]
-	if ok && old <= level {
-		return false
-	}
-	s.results[index] = level
-	return true
-}
-
-func (s *parameterSummary) addAlignment(level, align int) bool {
-	if align <= s.alignments[level] {
-		return false
-	}
-	s.alignments[level] = align
-	return true
-}
-
-func (s *parameterSummary) join(src parameterSummary) bool {
-	changed := false
-	if src.heapLevel >= 0 {
-		changed = s.addHeap(src.heapLevel) || changed
-	}
-	if src.mutatorLevel >= 0 {
-		changed = s.addMutator(src.mutatorLevel) || changed
-	}
-	if src.calleeLevel >= 0 {
-		changed = s.addCallee(src.calleeLevel) || changed
-	}
-	for index, level := range src.results {
-		changed = s.addResult(index, level) || changed
-	}
-	for level, align := range src.alignments {
-		changed = s.addAlignment(level, align) || changed
-	}
-	return changed
-}
-
-type summaryEntry struct {
-	state      summaryState
-	summary    parameterSummary
-	dependents map[summaryKey]struct{}
+func (g *locationGraph) addFlow(from, to llvm.Value) {
+	g.edges[locationEdge{from: from, to: to, operand: -1}] = struct{}{}
 }
 
 type analyzer struct {
-	mod llvm.Module
-
-	summaries   map[summaryKey]*summaryEntry
-	summaryKeys []summaryKey
-	pending     []summaryKey
-	pendingSet  map[summaryKey]bool
+	noCapture     map[paramKey]bool
+	noCaptureKeys []paramKey
+	locations     locationGraph
 }
 
 func newAnalyzer(mod llvm.Module) *analyzer {
 	a := &analyzer{
-		mod:        mod,
-		summaries:  make(map[summaryKey]*summaryEntry),
-		pendingSet: make(map[summaryKey]bool),
+		noCapture: make(map[paramKey]bool),
+		locations: newLocationGraph(),
 	}
 	for fn := mod.FirstFunction(); !fn.IsNil(); fn = llvm.NextFunction(fn) {
 		if fn.IsDeclaration() || isRuntimeFunction(fn) {
@@ -141,12 +70,9 @@ func newAnalyzer(mod llvm.Module) *analyzer {
 			if !isPointer(param.Type()) {
 				continue
 			}
-			key := summaryKey{fn: fn, param: index}
-			a.summaries[key] = &summaryEntry{
-				summary:    newParameterSummary(),
-				dependents: make(map[summaryKey]struct{}),
-			}
-			a.summaryKeys = append(a.summaryKeys, key)
+			key := paramKey{fn: fn, param: index}
+			a.noCapture[key] = true
+			a.noCaptureKeys = append(a.noCaptureKeys, key)
 		}
 	}
 	return a
@@ -160,89 +86,57 @@ func isPointer(typ llvm.Type) bool {
 	return typ.TypeKind() == llvm.PointerTypeKind
 }
 
-func (a *analyzer) solveSummaries() {
-	for _, key := range a.summaryKeys {
-		a.evaluateSummary(key)
-	}
-	for len(a.pending) != 0 {
-		key := a.pending[0]
-		a.pending = a.pending[1:]
-		delete(a.pendingSet, key)
-		a.evaluateSummary(key)
-	}
-}
-
-func (a *analyzer) enqueueSummary(key summaryKey) {
-	if a.pendingSet[key] {
-		return
-	}
-	a.pendingSet[key] = true
-	a.pending = append(a.pending, key)
-}
-
-func (a *analyzer) evaluateSummary(key summaryKey) {
-	entry := a.summaries[key]
-	if entry == nil || entry.state == summaryEvaluating {
-		return
-	}
-	entry.state = summaryEvaluating
-	result := a.walk(key.fn.Param(key.param), true, key)
-	entry.state = summaryEvaluated
-	if entry.summary.join(result.summary) {
-		for dependent := range entry.dependents {
-			a.enqueueSummary(dependent)
+func (a *analyzer) solveNoCapture() {
+	for {
+		changed := false
+		for _, key := range a.noCaptureKeys {
+			if a.noCapture[key] && !a.parameterNoCapture(key) {
+				a.noCapture[key] = false
+				changed = true
+			}
+		}
+		if !changed {
+			return
 		}
 	}
-}
-
-func (a *analyzer) summaryFor(key, consumer summaryKey) (parameterSummary, bool) {
-	entry := a.summaries[key]
-	if entry == nil {
-		return parameterSummary{}, false
-	}
-	entry.dependents[consumer] = struct{}{}
-	if entry.state == summaryUnseen {
-		a.evaluateSummary(key)
-	}
-	return entry.summary, true
 }
 
 type useState struct {
 	user    llvm.Value
 	operand int
-	derefs  int
 }
 
 type walkResult struct {
 	escaped   bool
 	alignment int
-	summary   parameterSummary
 }
 
-func newWalkResult(parameter bool) walkResult {
-	result := walkResult{}
-	if parameter {
-		result.summary = newParameterSummary()
-	}
-	return result
-}
-
-func addUses(worklist *[]useState, value llvm.Value, derefs int) {
+func (a *analyzer) addUses(worklist *[]useState, value llvm.Value) {
 	for use := value.FirstUse(); !use.IsNil(); use = use.NextUse() {
 		user := use.User()
 		for operand := 0; operand < user.OperandsCount(); operand++ {
 			if user.Operand(operand) == value {
-				*worklist = append(*worklist, useState{user: user, operand: operand, derefs: derefs})
+				state := useState{user: user, operand: operand}
+				*worklist = append(*worklist, state)
+				a.locations.addUse(value, state)
 			}
 		}
 	}
 }
 
-func (a *analyzer) walk(root llvm.Value, parameter bool, consumer summaryKey) walkResult {
-	result := newWalkResult(parameter)
+type useAction uint8
+
+const (
+	useSafe useAction = iota
+	useFollow
+	useCapture
+)
+
+func (a *analyzer) checkForAllUses(root llvm.Value, classify func(useState) useAction) bool {
 	worklist := make([]useState, 0, 8)
-	addUses(&worklist, root, 0)
+	a.addUses(&worklist, root)
 	visited := make(map[useState]struct{})
+	valid := true
 
 	for len(worklist) != 0 {
 		state := worklist[len(worklist)-1]
@@ -251,108 +145,30 @@ func (a *analyzer) walk(root llvm.Value, parameter bool, consumer summaryKey) wa
 			continue
 		}
 		visited[state] = struct{}{}
-		if state.derefs > maxDereferenceLevel {
-			a.recordEscape(&result, parameter, maxDereferenceLevel)
-			continue
-		}
 
-		user := state.user
-		opcode := user.InstructionOpcode()
-		switch opcode {
-		case llvm.Load:
-			a.recordAddressUse(&result, parameter, state.derefs, user.Alignment(), false)
-			if parameter && isPointer(user.Type()) {
-				addUses(&worklist, user, state.derefs+1)
-			}
-		case llvm.Store:
-			switch state.operand {
-			case 0:
-				copies, ok := exactLocalCopies(user)
-				if !ok {
-					a.recordEscape(&result, parameter, state.derefs)
-					continue
-				}
+		if state.user.InstructionOpcode() == llvm.Store && state.operand == 0 {
+			copies, ok := exactLocalCopies(state.user)
+			if ok {
 				for _, copy := range copies {
-					addUses(&worklist, copy, state.derefs)
+					a.locations.addFlow(state.user.Operand(0), copy)
+					a.addUses(&worklist, copy)
 				}
-			case 1:
-				a.recordAddressUse(&result, parameter, state.derefs, user.Alignment(), true)
-			default:
-				a.recordEscape(&result, parameter, state.derefs)
+				continue
 			}
-		case llvm.GetElementPtr:
-			if state.operand == 0 {
-				addUses(&worklist, user, state.derefs)
-			} else {
-				a.recordEscape(&result, parameter, state.derefs)
-			}
-		case llvm.BitCast, llvm.PHI:
-			addUses(&worklist, user, state.derefs)
-		case llvm.Select:
-			if state.operand == 1 || state.operand == 2 {
-				addUses(&worklist, user, state.derefs)
-			} else {
-				a.recordEscape(&result, parameter, state.derefs)
-			}
-		case opcodeFreeze:
-			if state.operand == 0 {
-				addUses(&worklist, user, state.derefs)
-			} else {
-				a.recordEscape(&result, parameter, state.derefs)
-			}
-		case llvm.ICmp:
-			// A comparison observes pointer identity but does not retain it.
-		case llvm.Ret:
-			if parameter && state.operand == 0 {
-				result.summary.addResult(0, state.derefs)
-			} else {
-				a.recordEscape(&result, parameter, state.derefs)
-			}
-		case llvm.Call, llvm.Invoke:
-			a.handleCall(&result, &worklist, state, parameter, consumer)
-		case opcodeAtomicCmpXchg:
-			switch state.operand {
-			case 0:
-				a.recordAddressUse(&result, parameter, state.derefs, user.Alignment(), true)
-			case 1:
-				// Comparing the expected value does not publish it.
-			default:
-				a.recordEscape(&result, parameter, state.derefs)
-			}
-		case opcodeAtomicRMW:
-			if state.operand == 0 {
-				a.recordAddressUse(&result, parameter, state.derefs, user.Alignment(), true)
-			} else {
-				a.recordEscape(&result, parameter, state.derefs)
-			}
-		case llvm.PtrToInt, llvm.IntToPtr, opcodeAddrSpaceCast:
-			a.recordEscape(&result, parameter, state.derefs)
-		default:
-			a.recordEscape(&result, parameter, state.derefs)
+		}
+
+		switch classify(state) {
+		case useFollow:
+			a.addUses(&worklist, state.user)
+		case useCapture:
+			valid = false
 		}
 	}
-	return result
+	return valid
 }
 
-func (a *analyzer) recordEscape(result *walkResult, parameter bool, level int) {
-	if parameter {
-		result.summary.addHeap(level)
-		return
-	}
-	result.escaped = true
-}
-
-func (a *analyzer) recordAddressUse(result *walkResult, parameter bool, level, align int, mutator bool) {
-	if parameter {
-		result.summary.addAlignment(level, align)
-		if mutator {
-			result.summary.addMutator(level)
-		}
-		return
-	}
-	if align > result.alignment {
-		result.alignment = align
-	}
+func (a *analyzer) parameterNoCapture(key paramKey) bool {
+	return a.checkForAllUses(key.fn.Param(key.param), a.classifyNoCaptureUse)
 }
 
 func exactLocalCopies(store llvm.Value) ([]llvm.Value, bool) {
@@ -397,104 +213,152 @@ func callCalleeOperand(call llvm.Value) int {
 	return index
 }
 
-func (a *analyzer) handleCall(result *walkResult, worklist *[]useState, state useState, parameter bool, consumer summaryKey) {
+func (a *analyzer) classifyNoCaptureUse(state useState) useAction {
+	user := state.user
+	switch user.InstructionOpcode() {
+	case llvm.Call, llvm.Invoke:
+		if a.callArgumentNoCapture(state) {
+			return useSafe
+		}
+	case llvm.Load:
+		return useSafe
+	case llvm.Store:
+		if state.operand == 1 {
+			return useSafe
+		}
+	case opcodeAtomicRMW:
+		if state.operand == 0 {
+			return useSafe
+		}
+	case opcodeAtomicCmpXchg:
+		if state.operand == 0 || state.operand == 1 {
+			return useSafe
+		}
+	case llvm.VAArg:
+		return useSafe
+	case llvm.GetElementPtr:
+		if state.operand == 0 && user.Type().TypeKind() != llvm.VectorTypeKind {
+			return useFollow
+		}
+	case llvm.BitCast, llvm.PHI, opcodeAddrSpaceCast:
+		return useFollow
+	case llvm.Select:
+		if state.operand == 1 || state.operand == 2 {
+			return useFollow
+		}
+	case opcodeFreeze:
+		if state.operand == 0 {
+			return useFollow
+		}
+	case llvm.ICmp:
+		return useSafe
+	}
+	return useCapture
+}
+
+func (a *analyzer) allocationUses(root llvm.Value) walkResult {
+	result := walkResult{}
+	result.escaped = !a.checkForAllUses(root, func(state useState) useAction {
+		user := state.user
+		switch user.InstructionOpcode() {
+		case llvm.Load:
+			if user.Alignment() > result.alignment {
+				result.alignment = user.Alignment()
+			}
+			return useSafe
+		case llvm.Store:
+			if state.operand == 1 {
+				if user.Alignment() > result.alignment {
+					result.alignment = user.Alignment()
+				}
+				return useSafe
+			}
+		case llvm.Call, llvm.Invoke:
+			if a.callArgumentNoCapture(state) {
+				return useSafe
+			}
+		case llvm.GetElementPtr:
+			if state.operand == 0 {
+				return useFollow
+			}
+		case llvm.BitCast, llvm.PHI:
+			return useFollow
+		case llvm.Select:
+			if state.operand == 1 || state.operand == 2 {
+				return useFollow
+			}
+		case opcodeFreeze:
+			if state.operand == 0 {
+				return useFollow
+			}
+		case llvm.ICmp:
+			return useSafe
+		case opcodeAtomicCmpXchg:
+			switch state.operand {
+			case 0:
+				if user.Alignment() > result.alignment {
+					result.alignment = user.Alignment()
+				}
+				return useSafe
+			case 1:
+				return useSafe
+			}
+		case opcodeAtomicRMW:
+			if state.operand == 0 {
+				if user.Alignment() > result.alignment {
+					result.alignment = user.Alignment()
+				}
+				return useSafe
+			}
+		}
+		return useCapture
+	})
+	return result
+}
+
+func (a *analyzer) callArgumentNoCapture(state useState) bool {
 	call := state.user
 	calleeOperand := callCalleeOperand(call)
 	if state.operand == calleeOperand {
-		if parameter {
-			result.summary.addCallee(state.derefs)
-		} else {
-			result.escaped = true
-		}
-		return
+		return true
 	}
 
 	callee := call.CalledValue()
 	if !callee.IsAInlineAsm().IsNil() {
-		a.recordEscape(result, parameter, state.derefs)
-		return
+		return false
 	}
 	fn := callee.IsAFunction()
 	if fn.IsNil() {
-		a.recordEscape(result, parameter, state.derefs)
-		return
+		return false
 	}
 	if fn.IntrinsicID() != 0 {
-		if !a.handleIntrinsic(result, state, parameter) {
-			a.recordEscape(result, parameter, state.derefs)
-		}
-		return
+		return intrinsicArgumentNoCapture(call, fn, state.operand)
 	}
 	if fn.IsDeclaration() || isRuntimeFunction(fn) || state.operand >= fn.ParamsCount() {
-		a.recordEscape(result, parameter, state.derefs)
-		return
+		return false
 	}
 
-	calleeSummary, ok := a.summaryFor(summaryKey{fn: fn, param: state.operand}, consumer)
-	if !ok {
-		a.recordEscape(result, parameter, state.derefs)
-		return
-	}
-	a.composeSummary(result, worklist, call, state.derefs, parameter, calleeSummary)
+	a.locations.addFlow(call.Operand(state.operand), fn.Param(state.operand))
+	return a.noCapture[paramKey{fn: fn, param: state.operand}]
 }
 
-func (a *analyzer) handleIntrinsic(result *walkResult, state useState, parameter bool) bool {
-	name := state.user.CalledValue().Name()
-	switch {
-	case strings.HasPrefix(name, "llvm.dbg."),
-		strings.HasPrefix(name, "llvm.lifetime.start."),
-		strings.HasPrefix(name, "llvm.lifetime.end."),
-		strings.HasPrefix(name, "llvm.objectsize."):
+func intrinsicArgumentNoCapture(call, fn llvm.Value, argument int) bool {
+	name := fn.Name()
+	if argument < 0 {
+		return false
+	}
+	if strings.HasPrefix(name, "llvm.dbg.") ||
+		strings.HasPrefix(name, "llvm.lifetime.start.") ||
+		strings.HasPrefix(name, "llvm.lifetime.end.") ||
+		strings.HasPrefix(name, "llvm.objectsize.") {
 		return true
-	case strings.HasPrefix(name, "llvm.memset."):
-		if state.operand == 0 {
-			a.recordAddressUse(result, parameter, state.derefs, 0, true)
-			return true
-		}
-	case strings.HasPrefix(name, "llvm.memcpy."), strings.HasPrefix(name, "llvm.memmove."):
-		if state.operand == 0 {
-			a.recordAddressUse(result, parameter, state.derefs, 0, true)
-			return true
-		}
-		if state.operand == 1 {
-			return true
-		}
 	}
-	return false
-}
-
-func (a *analyzer) composeSummary(result *walkResult, worklist *[]useState, call llvm.Value, level int, parameter bool, summary parameterSummary) {
-	if summary.heapLevel >= 0 {
-		if parameter {
-			result.summary.addHeap(level + summary.heapLevel)
-		} else if summary.heapLevel == 0 {
-			result.escaped = true
-		}
+	kind := llvm.AttributeKindID("nocapture")
+	attributeIndex := argument + 1
+	if attr := call.GetCallSiteEnumAttribute(attributeIndex, kind); !attr.IsNil() {
+		return true
 	}
-	if parameter {
-		if summary.mutatorLevel >= 0 {
-			result.summary.addMutator(level + summary.mutatorLevel)
-		}
-		if summary.calleeLevel >= 0 {
-			result.summary.addCallee(level + summary.calleeLevel)
-		}
-		for derefs, align := range summary.alignments {
-			result.summary.addAlignment(level+derefs, align)
-		}
-	} else if align := summary.alignments[0]; align > result.alignment {
-		result.alignment = align
-	}
-
-	for index, derefs := range summary.results {
-		if index != 0 || !isPointer(call.Type()) {
-			a.recordEscape(result, parameter, level)
-			continue
-		}
-		if !parameter && derefs != 0 {
-			continue
-		}
-		addUses(worklist, call, level+derefs)
-	}
+	return !fn.GetEnumAttributeAtIndex(attributeIndex, kind).IsNil()
 }
 
 type allocationPlan struct {
@@ -508,7 +372,7 @@ type allocationPlan struct {
 // AllocZ and AllocU calls, and verifies the resulting LLVM module.
 func TransformModule(mod llvm.Module) error {
 	a := newAnalyzer(mod)
-	a.solveSummaries()
+	a.solveNoCapture()
 
 	var plans []allocationPlan
 	for fn := mod.FirstFunction(); !fn.IsNil(); fn = llvm.NextFunction(fn) {
@@ -558,7 +422,7 @@ func (a *analyzer) planAllocation(instr llvm.Value) (allocationPlan, bool) {
 		return allocationPlan{}, false
 	}
 
-	result := a.walk(call, false, summaryKey{})
+	result := a.allocationUses(call)
 	if result.escaped {
 		return allocationPlan{}, false
 	}
