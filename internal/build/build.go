@@ -48,6 +48,7 @@ import (
 	"github.com/goplus/llgo/internal/dcepass"
 	"github.com/goplus/llgo/internal/deadcode"
 	"github.com/goplus/llgo/internal/env"
+	llescape "github.com/goplus/llgo/internal/escape"
 	"github.com/goplus/llgo/internal/firmware"
 	"github.com/goplus/llgo/internal/flash"
 	"github.com/goplus/llgo/internal/goembed"
@@ -1833,6 +1834,9 @@ func buildPkg(ctx *context, aPkg *aPackage, verbose bool) error {
 	}
 
 	ctx.cTransformer.SetSkipFuncs(cabiSkipFuncsForPlan9Asm(ctx, pkgPath, ret.Module()))
+	if err := llescape.TransformModule(ret.Module()); err != nil {
+		return fmt.Errorf("run escape analysis for %v failed: %w", pkgPath, err)
+	}
 	llabi.LowerLargeAggregates(ctx.prog.TargetData(), ret.Module())
 	ctx.cTransformer.TransformModule(ret.Path(), ret.Module())
 	ctx.cTransformer.SetSkipFuncs(nil)
