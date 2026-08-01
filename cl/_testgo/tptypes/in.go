@@ -89,93 +89,90 @@ type (
 // CHECK-NEXT:   call void @"{{.*}}/runtime/internal/runtime.PrintByte"(i8 10)
 // CHECK-NEXT:   call void @"{{.*}}/runtime/internal/runtime.PrintInt"(i64 0)
 // CHECK-NEXT:   call void @"{{.*}}/runtime/internal/runtime.PrintByte"(i8 10)
-// CHECK-NEXT:   %.stack = alloca i8, i64 24, align 8
-// CHECK-NEXT:   call void @llvm.memset.p0.i64(ptr %.stack, i8 0, i64 24, i1 false)
-// CHECK-NEXT:   %16 = call ptr @"{{.*}}/runtime/internal/runtime.AllocZ"(i64 8)
-// CHECK-NEXT:   %17 = getelementptr inbounds i64, ptr %16, i64 0
-// CHECK-NEXT:   store i64 100, ptr %17, align 8
-// CHECK-NEXT:   %18 = insertvalue %"{{.*}}/runtime/internal/runtime.Slice" undef, ptr %16, 0
-// CHECK-NEXT:   %19 = insertvalue %"{{.*}}/runtime/internal/runtime.Slice" %18, i64 1, 1
-// CHECK-NEXT:   %20 = insertvalue %"{{.*}}/runtime/internal/runtime.Slice" %19, i64 1, 2
-// CHECK-NEXT:   %21 = call %"{{.*}}/runtime/internal/runtime.Slice" @"main.(*Slice{{\[\[\]int,int\]}}).Append"(ptr %.stack, %"{{.*}}/runtime/internal/runtime.Slice" %20)
-// CHECK-NEXT:   %.stack1 = alloca i8, i64 24, align 8
-// CHECK-NEXT:   call void @llvm.memset.p0.i64(ptr %.stack1, i8 0, i64 24, i1 false)
-// CHECK-NEXT:   %22 = call ptr @"{{.*}}/runtime/internal/runtime.AllocZ"(i64 16)
-// CHECK-NEXT:   %23 = getelementptr inbounds %"{{.*}}/runtime/internal/runtime.String", ptr %22, i64 0
-// CHECK-NEXT:   store %"{{.*}}/runtime/internal/runtime.String" { ptr @0, i64 5 }, ptr %23, align 8
-// CHECK-NEXT:   %24 = insertvalue %"{{.*}}/runtime/internal/runtime.Slice" undef, ptr %22, 0
-// CHECK-NEXT:   %25 = insertvalue %"{{.*}}/runtime/internal/runtime.Slice" %24, i64 1, 1
-// CHECK-NEXT:   %26 = insertvalue %"{{.*}}/runtime/internal/runtime.Slice" %25, i64 1, 2
-// CHECK-NEXT:   %27 = call %"{{.*}}/runtime/internal/runtime.Slice" @"main.(*Slice{{\[\[\]string,string\]}}).Append"(ptr %.stack1, %"{{.*}}/runtime/internal/runtime.Slice" %26)
-// CHECK-NEXT:   %.stack2 = alloca i8, i64 24, align 8
-// CHECK-NEXT:   call void @llvm.memset.p0.i64(ptr %.stack2, i8 0, i64 24, i1 false)
-// CHECK-NEXT:   %28 = call ptr @"{{.*}}/runtime/internal/runtime.AllocZ"(i64 32)
-// CHECK-NEXT:   %29 = getelementptr inbounds i64, ptr %28, i64 0
-// CHECK-NEXT:   store i64 1, ptr %29, align 8
-// CHECK-NEXT:   %30 = getelementptr inbounds i64, ptr %28, i64 1
-// CHECK-NEXT:   store i64 2, ptr %30, align 8
-// CHECK-NEXT:   %31 = getelementptr inbounds i64, ptr %28, i64 2
-// CHECK-NEXT:   store i64 3, ptr %31, align 8
-// CHECK-NEXT:   %32 = getelementptr inbounds i64, ptr %28, i64 3
-// CHECK-NEXT:   store i64 4, ptr %32, align 8
-// CHECK-NEXT:   %33 = insertvalue %"{{.*}}/runtime/internal/runtime.Slice" undef, ptr %28, 0
-// CHECK-NEXT:   %34 = insertvalue %"{{.*}}/runtime/internal/runtime.Slice" %33, i64 4, 1
-// CHECK-NEXT:   %35 = insertvalue %"{{.*}}/runtime/internal/runtime.Slice" %34, i64 4, 2
-// CHECK-NEXT:   %36 = call %"{{.*}}/runtime/internal/runtime.Slice" @"main.(*Slice{{\[\[\]int,int\]}}).Append"(ptr %.stack2, %"{{.*}}/runtime/internal/runtime.Slice" %35)
-// CHECK-NEXT:   %37 = call ptr @"{{.*}}/runtime/internal/runtime.AllocZ"(i64 32)
-// CHECK-NEXT:   %38 = getelementptr inbounds i64, ptr %37, i64 0
-// CHECK-NEXT:   store i64 1, ptr %38, align 8
-// CHECK-NEXT:   %39 = getelementptr inbounds i64, ptr %37, i64 1
-// CHECK-NEXT:   store i64 2, ptr %39, align 8
-// CHECK-NEXT:   %40 = getelementptr inbounds i64, ptr %37, i64 2
-// CHECK-NEXT:   store i64 3, ptr %40, align 8
-// CHECK-NEXT:   %41 = getelementptr inbounds i64, ptr %37, i64 3
-// CHECK-NEXT:   store i64 4, ptr %41, align 8
-// CHECK-NEXT:   %42 = insertvalue %"{{.*}}/runtime/internal/runtime.Slice" undef, ptr %37, 0
-// CHECK-NEXT:   %43 = insertvalue %"{{.*}}/runtime/internal/runtime.Slice" %42, i64 4, 1
-// CHECK-NEXT:   %44 = insertvalue %"{{.*}}/runtime/internal/runtime.Slice" %43, i64 4, 2
-// CHECK-NEXT:   %45 = call %"{{.*}}/runtime/internal/runtime.Slice" @"main.(*Slice{{\[\[\]int,int\]}}).Append2"(ptr %.stack2, %"{{.*}}/runtime/internal/runtime.Slice" %44)
-// CHECK-NEXT:   %46 = getelementptr inbounds %"main.Slice{{\[\[\]int,int\]}}", ptr %.stack, i32 0, i32 0
-// CHECK-NEXT:   %47 = load %"{{.*}}/runtime/internal/runtime.Slice", ptr %46, align 8
-// CHECK-NEXT:   %48 = getelementptr inbounds %"main.Slice{{\[\[\]int,int\]}}", ptr %.stack, i32 0, i32 0
-// CHECK-NEXT:   %49 = load %"{{.*}}/runtime/internal/runtime.Slice", ptr %48, align 8
-// CHECK-NEXT:   %50 = extractvalue %"{{.*}}/runtime/internal/runtime.Slice" %49, 0
-// CHECK-NEXT:   %51 = extractvalue %"{{.*}}/runtime/internal/runtime.Slice" %49, 1
-// CHECK-NEXT:   %52 = icmp uge i64 0, %51
-// CHECK-NEXT:   call void @"{{.*}}/runtime/internal/runtime.CheckIndexRange"(i1 %52, {{.*}})
-// CHECK-NEXT:   %53 = getelementptr inbounds i64, ptr %50, i64 0
-// CHECK-NEXT:   %54 = load i64, ptr %53, align 8
-// CHECK-NEXT:   call void @"{{.*}}/runtime/internal/runtime.PrintSlice"(%"{{.*}}/runtime/internal/runtime.Slice" %47)
+// CHECK-NEXT:   %16 = call ptr @"{{.*}}/runtime/internal/runtime.AllocZ"(i64 24)
+// CHECK-NEXT:   %17 = call ptr @"{{.*}}/runtime/internal/runtime.AllocZ"(i64 8)
+// CHECK-NEXT:   %18 = getelementptr inbounds i64, ptr %17, i64 0
+// CHECK-NEXT:   store i64 100, ptr %18, align 8
+// CHECK-NEXT:   %19 = insertvalue %"{{.*}}/runtime/internal/runtime.Slice" undef, ptr %17, 0
+// CHECK-NEXT:   %20 = insertvalue %"{{.*}}/runtime/internal/runtime.Slice" %19, i64 1, 1
+// CHECK-NEXT:   %21 = insertvalue %"{{.*}}/runtime/internal/runtime.Slice" %20, i64 1, 2
+// CHECK-NEXT:   %22 = call %"{{.*}}/runtime/internal/runtime.Slice" @"main.(*Slice{{\[\[\]int,int\]}}).Append"(ptr %16, %"{{.*}}/runtime/internal/runtime.Slice" %21)
+// CHECK-NEXT:   %23 = call ptr @"{{.*}}/runtime/internal/runtime.AllocZ"(i64 24)
+// CHECK-NEXT:   %24 = call ptr @"{{.*}}/runtime/internal/runtime.AllocZ"(i64 16)
+// CHECK-NEXT:   %25 = getelementptr inbounds %"{{.*}}/runtime/internal/runtime.String", ptr %24, i64 0
+// CHECK-NEXT:   store %"{{.*}}/runtime/internal/runtime.String" { ptr @0, i64 5 }, ptr %25, align 8
+// CHECK-NEXT:   %26 = insertvalue %"{{.*}}/runtime/internal/runtime.Slice" undef, ptr %24, 0
+// CHECK-NEXT:   %27 = insertvalue %"{{.*}}/runtime/internal/runtime.Slice" %26, i64 1, 1
+// CHECK-NEXT:   %28 = insertvalue %"{{.*}}/runtime/internal/runtime.Slice" %27, i64 1, 2
+// CHECK-NEXT:   %29 = call %"{{.*}}/runtime/internal/runtime.Slice" @"main.(*Slice{{\[\[\]string,string\]}}).Append"(ptr %23, %"{{.*}}/runtime/internal/runtime.Slice" %28)
+// CHECK-NEXT:   %30 = call ptr @"{{.*}}/runtime/internal/runtime.AllocZ"(i64 24)
+// CHECK-NEXT:   %31 = call ptr @"{{.*}}/runtime/internal/runtime.AllocZ"(i64 32)
+// CHECK-NEXT:   %32 = getelementptr inbounds i64, ptr %31, i64 0
+// CHECK-NEXT:   store i64 1, ptr %32, align 8
+// CHECK-NEXT:   %33 = getelementptr inbounds i64, ptr %31, i64 1
+// CHECK-NEXT:   store i64 2, ptr %33, align 8
+// CHECK-NEXT:   %34 = getelementptr inbounds i64, ptr %31, i64 2
+// CHECK-NEXT:   store i64 3, ptr %34, align 8
+// CHECK-NEXT:   %35 = getelementptr inbounds i64, ptr %31, i64 3
+// CHECK-NEXT:   store i64 4, ptr %35, align 8
+// CHECK-NEXT:   %36 = insertvalue %"{{.*}}/runtime/internal/runtime.Slice" undef, ptr %31, 0
+// CHECK-NEXT:   %37 = insertvalue %"{{.*}}/runtime/internal/runtime.Slice" %36, i64 4, 1
+// CHECK-NEXT:   %38 = insertvalue %"{{.*}}/runtime/internal/runtime.Slice" %37, i64 4, 2
+// CHECK-NEXT:   %39 = call %"{{.*}}/runtime/internal/runtime.Slice" @"main.(*Slice{{\[\[\]int,int\]}}).Append"(ptr %30, %"{{.*}}/runtime/internal/runtime.Slice" %38)
+// CHECK-NEXT:   %40 = call ptr @"{{.*}}/runtime/internal/runtime.AllocZ"(i64 32)
+// CHECK-NEXT:   %41 = getelementptr inbounds i64, ptr %40, i64 0
+// CHECK-NEXT:   store i64 1, ptr %41, align 8
+// CHECK-NEXT:   %42 = getelementptr inbounds i64, ptr %40, i64 1
+// CHECK-NEXT:   store i64 2, ptr %42, align 8
+// CHECK-NEXT:   %43 = getelementptr inbounds i64, ptr %40, i64 2
+// CHECK-NEXT:   store i64 3, ptr %43, align 8
+// CHECK-NEXT:   %44 = getelementptr inbounds i64, ptr %40, i64 3
+// CHECK-NEXT:   store i64 4, ptr %44, align 8
+// CHECK-NEXT:   %45 = insertvalue %"{{.*}}/runtime/internal/runtime.Slice" undef, ptr %40, 0
+// CHECK-NEXT:   %46 = insertvalue %"{{.*}}/runtime/internal/runtime.Slice" %45, i64 4, 1
+// CHECK-NEXT:   %47 = insertvalue %"{{.*}}/runtime/internal/runtime.Slice" %46, i64 4, 2
+// CHECK-NEXT:   %48 = call %"{{.*}}/runtime/internal/runtime.Slice" @"main.(*Slice{{\[\[\]int,int\]}}).Append2"(ptr %30, %"{{.*}}/runtime/internal/runtime.Slice" %47)
+// CHECK-NEXT:   %49 = getelementptr inbounds %"main.Slice{{\[\[\]int,int\]}}", ptr %16, i32 0, i32 0
+// CHECK-NEXT:   %50 = load %"{{.*}}/runtime/internal/runtime.Slice", ptr %49, align 8
+// CHECK-NEXT:   %51 = getelementptr inbounds %"main.Slice{{\[\[\]int,int\]}}", ptr %16, i32 0, i32 0
+// CHECK-NEXT:   %52 = load %"{{.*}}/runtime/internal/runtime.Slice", ptr %51, align 8
+// CHECK-NEXT:   %53 = extractvalue %"{{.*}}/runtime/internal/runtime.Slice" %52, 0
+// CHECK-NEXT:   %54 = extractvalue %"{{.*}}/runtime/internal/runtime.Slice" %52, 1
+// CHECK-NEXT:   %55 = icmp uge i64 0, %54
+// CHECK-NEXT:   call void @"{{.*}}/runtime/internal/runtime.CheckIndexRange"(i1 %55, {{.*}})
+// CHECK-NEXT:   %56 = getelementptr inbounds i64, ptr %53, i64 0
+// CHECK-NEXT:   %57 = load i64, ptr %56, align 8
+// CHECK-NEXT:   call void @"{{.*}}/runtime/internal/runtime.PrintSlice"(%"{{.*}}/runtime/internal/runtime.Slice" %50)
 // CHECK-NEXT:   call void @"{{.*}}/runtime/internal/runtime.PrintByte"(i8 32)
-// CHECK-NEXT:   call void @"{{.*}}/runtime/internal/runtime.PrintInt"(i64 %54)
+// CHECK-NEXT:   call void @"{{.*}}/runtime/internal/runtime.PrintInt"(i64 %57)
 // CHECK-NEXT:   call void @"{{.*}}/runtime/internal/runtime.PrintByte"(i8 10)
-// CHECK-NEXT:   %55 = getelementptr inbounds %"main.Slice{{\[\[\]string,string\]}}", ptr %.stack1, i32 0, i32 0
-// CHECK-NEXT:   %56 = load %"{{.*}}/runtime/internal/runtime.Slice", ptr %55, align 8
-// CHECK-NEXT:   %57 = getelementptr inbounds %"main.Slice{{\[\[\]string,string\]}}", ptr %.stack1, i32 0, i32 0
-// CHECK-NEXT:   %58 = load %"{{.*}}/runtime/internal/runtime.Slice", ptr %57, align 8
-// CHECK-NEXT:   %59 = extractvalue %"{{.*}}/runtime/internal/runtime.Slice" %58, 0
-// CHECK-NEXT:   %60 = extractvalue %"{{.*}}/runtime/internal/runtime.Slice" %58, 1
-// CHECK-NEXT:   %61 = icmp uge i64 0, %60
-// CHECK-NEXT:   call void @"{{.*}}/runtime/internal/runtime.CheckIndexRange"(i1 %61, {{.*}})
-// CHECK-NEXT:   %62 = getelementptr inbounds %"{{.*}}/runtime/internal/runtime.String", ptr %59, i64 0
-// CHECK-NEXT:   %63 = load %"{{.*}}/runtime/internal/runtime.String", ptr %62, align 8
-// CHECK-NEXT:   call void @"{{.*}}/runtime/internal/runtime.PrintSlice"(%"{{.*}}/runtime/internal/runtime.Slice" %56)
+// CHECK-NEXT:   %58 = getelementptr inbounds %"main.Slice{{\[\[\]string,string\]}}", ptr %23, i32 0, i32 0
+// CHECK-NEXT:   %59 = load %"{{.*}}/runtime/internal/runtime.Slice", ptr %58, align 8
+// CHECK-NEXT:   %60 = getelementptr inbounds %"main.Slice{{\[\[\]string,string\]}}", ptr %23, i32 0, i32 0
+// CHECK-NEXT:   %61 = load %"{{.*}}/runtime/internal/runtime.Slice", ptr %60, align 8
+// CHECK-NEXT:   %62 = extractvalue %"{{.*}}/runtime/internal/runtime.Slice" %61, 0
+// CHECK-NEXT:   %63 = extractvalue %"{{.*}}/runtime/internal/runtime.Slice" %61, 1
+// CHECK-NEXT:   %64 = icmp uge i64 0, %63
+// CHECK-NEXT:   call void @"{{.*}}/runtime/internal/runtime.CheckIndexRange"(i1 %64, {{.*}})
+// CHECK-NEXT:   %65 = getelementptr inbounds %"{{.*}}/runtime/internal/runtime.String", ptr %62, i64 0
+// CHECK-NEXT:   %66 = load %"{{.*}}/runtime/internal/runtime.String", ptr %65, align 8
+// CHECK-NEXT:   call void @"{{.*}}/runtime/internal/runtime.PrintSlice"(%"{{.*}}/runtime/internal/runtime.Slice" %59)
 // CHECK-NEXT:   call void @"{{.*}}/runtime/internal/runtime.PrintByte"(i8 32)
-// CHECK-NEXT:   call void @"{{.*}}/runtime/internal/runtime.PrintString"(%"{{.*}}/runtime/internal/runtime.String" %63)
+// CHECK-NEXT:   call void @"{{.*}}/runtime/internal/runtime.PrintString"(%"{{.*}}/runtime/internal/runtime.String" %66)
 // CHECK-NEXT:   call void @"{{.*}}/runtime/internal/runtime.PrintByte"(i8 10)
-// CHECK-NEXT:   %64 = getelementptr inbounds %"main.Slice{{\[\[\]int,int\]}}", ptr %.stack2, i32 0, i32 0
-// CHECK-NEXT:   %65 = load %"{{.*}}/runtime/internal/runtime.Slice", ptr %64, align 8
-// CHECK-NEXT:   %66 = getelementptr inbounds %"main.Slice{{\[\[\]int,int\]}}", ptr %.stack2, i32 0, i32 0
-// CHECK-NEXT:   %67 = load %"{{.*}}/runtime/internal/runtime.Slice", ptr %66, align 8
-// CHECK-NEXT:   %68 = extractvalue %"{{.*}}/runtime/internal/runtime.Slice" %67, 0
-// CHECK-NEXT:   %69 = extractvalue %"{{.*}}/runtime/internal/runtime.Slice" %67, 1
-// CHECK-NEXT:   %70 = icmp uge i64 0, %69
-// CHECK-NEXT:   call void @"{{.*}}/runtime/internal/runtime.CheckIndexRange"(i1 %70, {{.*}})
-// CHECK-NEXT:   %71 = getelementptr inbounds i64, ptr %68, i64 0
-// CHECK-NEXT:   %72 = load i64, ptr %71, align 8
-// CHECK-NEXT:   call void @"{{.*}}/runtime/internal/runtime.PrintSlice"(%"{{.*}}/runtime/internal/runtime.Slice" %65)
+// CHECK-NEXT:   %67 = getelementptr inbounds %"main.Slice{{\[\[\]int,int\]}}", ptr %30, i32 0, i32 0
+// CHECK-NEXT:   %68 = load %"{{.*}}/runtime/internal/runtime.Slice", ptr %67, align 8
+// CHECK-NEXT:   %69 = getelementptr inbounds %"main.Slice{{\[\[\]int,int\]}}", ptr %30, i32 0, i32 0
+// CHECK-NEXT:   %70 = load %"{{.*}}/runtime/internal/runtime.Slice", ptr %69, align 8
+// CHECK-NEXT:   %71 = extractvalue %"{{.*}}/runtime/internal/runtime.Slice" %70, 0
+// CHECK-NEXT:   %72 = extractvalue %"{{.*}}/runtime/internal/runtime.Slice" %70, 1
+// CHECK-NEXT:   %73 = icmp uge i64 0, %72
+// CHECK-NEXT:   call void @"{{.*}}/runtime/internal/runtime.CheckIndexRange"(i1 %73, {{.*}})
+// CHECK-NEXT:   %74 = getelementptr inbounds i64, ptr %71, i64 0
+// CHECK-NEXT:   %75 = load i64, ptr %74, align 8
+// CHECK-NEXT:   call void @"{{.*}}/runtime/internal/runtime.PrintSlice"(%"{{.*}}/runtime/internal/runtime.Slice" %68)
 // CHECK-NEXT:   call void @"{{.*}}/runtime/internal/runtime.PrintByte"(i8 32)
-// CHECK-NEXT:   call void @"{{.*}}/runtime/internal/runtime.PrintInt"(i64 %72)
+// CHECK-NEXT:   call void @"{{.*}}/runtime/internal/runtime.PrintInt"(i64 %75)
 // CHECK-NEXT:   call void @"{{.*}}/runtime/internal/runtime.PrintByte"(i8 10)
 // CHECK-NEXT:   ret void
 // CHECK-NEXT: }

@@ -189,6 +189,8 @@ type Config struct {
 	// DisableBoundsChecks disables index, slice, and slice-to-array conversion
 	// bounds checks while retaining required integer conversions and nil checks.
 	DisableBoundsChecks bool
+	// DisableEscapeAnalysis skips the heap-to-stack transform.
+	DisableEscapeAnalysis bool
 
 	// PthreadStackSize sets a custom stack size, in bytes, for pthread-backed
 	// goroutines. A zero value keeps the platform pthread default.
@@ -1834,8 +1836,10 @@ func buildPkg(ctx *context, aPkg *aPackage, verbose bool) error {
 	}
 
 	ctx.cTransformer.SetSkipFuncs(cabiSkipFuncsForPlan9Asm(ctx, pkgPath, ret.Module()))
-	if err := llescape.TransformModule(ret.Module()); err != nil {
-		return fmt.Errorf("run escape analysis for %v failed: %w", pkgPath, err)
+	if !ctx.buildConf.DisableEscapeAnalysis {
+		if err := llescape.TransformModule(ret.Module()); err != nil {
+			return fmt.Errorf("run escape analysis for %v failed: %w", pkgPath, err)
+		}
 	}
 	llabi.LowerLargeAggregates(ctx.prog.TargetData(), ret.Module())
 	ctx.cTransformer.TransformModule(ret.Path(), ret.Module())

@@ -62,3 +62,10 @@ func TestApplyGoBuildFlagsFileErrorIncludesPath(t *testing.T) {
 		t.Fatalf("applyGoBuildFlagsFile(%q) error = %v, want path", data, err)
 	}
 }
+
+func TestGenFromDisablesEscapeAnalysis(t *testing.T) {
+	ir := GenFrom("../build/testdata/escape_phase1")
+	if !strings.Contains(ir, "runtime.AllocZ") {
+		t.Fatalf("GenFrom output has no pre-transform heap allocation:\n%s", ir)
+	}
+}

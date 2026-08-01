@@ -73,14 +73,13 @@ func check(fn func()) {
 
 // CHECK-LABEL: define ptr @main.closurePtr(%"{{.*}}/runtime/internal/runtime.eface" %0){{.*}} {
 // CHECK-NEXT: _llgo_0:
-// CHECK-NEXT:   %.stack = alloca i8, i64 16, align 8
-// CHECK-NEXT:   call void @llvm.memset.p0.i64(ptr %.stack, i8 0, i64 16, i1 false)
-// CHECK-NEXT:   store %"{{.*}}/runtime/internal/runtime.eface" %0, ptr %.stack, align 8
-// CHECK-NEXT:   %1 = getelementptr inbounds %main.rtype, ptr %.stack, i32 0, i32 1
-// CHECK-NEXT:   %2 = load ptr, ptr %1, align 8
-// CHECK-NEXT:   %3 = getelementptr inbounds { ptr, ptr }, ptr %2, i32 0, i32 0
-// CHECK-NEXT:   %4 = load ptr, ptr %3, align 8
-// CHECK-NEXT:   ret ptr %4
+// CHECK-NEXT:   %1 = call ptr @"{{.*}}/runtime/internal/runtime.AllocZ"(i64 16)
+// CHECK-NEXT:   store %"{{.*}}/runtime/internal/runtime.eface" %0, ptr %1, align 8
+// CHECK-NEXT:   %2 = getelementptr inbounds %main.rtype, ptr %1, i32 0, i32 1
+// CHECK-NEXT:   %3 = load ptr, ptr %2, align 8
+// CHECK-NEXT:   %4 = getelementptr inbounds { ptr, ptr }, ptr %3, i32 0, i32 0
+// CHECK-NEXT:   %5 = load ptr, ptr %4, align 8
+// CHECK-NEXT:   ret ptr %5
 // CHECK-NEXT: }
 
 func closurePtr(a any) unsafe.Pointer {

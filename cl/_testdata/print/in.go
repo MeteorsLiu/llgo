@@ -40,23 +40,22 @@ type stringStruct struct {
 // CHECK-NEXT: _llgo_0:
 // CHECK-NEXT:   %1 = call ptr @"{{.*}}/runtime/internal/runtime.AllocZ"(i64 16)
 // CHECK-NEXT:   store %"{{.*}}/runtime/internal/runtime.String" %0, ptr %1, align 8
-// CHECK-NEXT:   %.stack = alloca i8, i64 24, align 8
-// CHECK-NEXT:   call void @llvm.memset.p0.i64(ptr %.stack, i8 0, i64 24, i1 false)
-// CHECK-NEXT:   %2 = call ptr @main.stringStructOf(ptr %1)
-// CHECK-NEXT:   %3 = getelementptr inbounds %main.stringStruct, ptr %2, i32 0, i32 0
-// CHECK-NEXT:   %4 = load ptr, ptr %3, align 8
-// CHECK-NEXT:   %5 = getelementptr inbounds %main.slice, ptr %.stack, i32 0, i32 0
-// CHECK-NEXT:   store ptr %4, ptr %5, align 8
-// CHECK-NEXT:   %6 = getelementptr inbounds %main.stringStruct, ptr %2, i32 0, i32 1
-// CHECK-NEXT:   %7 = load i64, ptr %6, align 8
-// CHECK-NEXT:   %8 = getelementptr inbounds %main.slice, ptr %.stack, i32 0, i32 1
-// CHECK-NEXT:   store i64 %7, ptr %8, align 8
-// CHECK-NEXT:   %9 = getelementptr inbounds %main.stringStruct, ptr %2, i32 0, i32 1
-// CHECK-NEXT:   %10 = load i64, ptr %9, align 8
-// CHECK-NEXT:   %11 = getelementptr inbounds %main.slice, ptr %.stack, i32 0, i32 2
-// CHECK-NEXT:   store i64 %10, ptr %11, align 8
-// CHECK-NEXT:   %12 = load %"{{.*}}/runtime/internal/runtime.Slice", ptr %.stack, align 8
-// CHECK-NEXT:   ret %"{{.*}}/runtime/internal/runtime.Slice" %12
+// CHECK-NEXT:   %2 = call ptr @"{{.*}}/runtime/internal/runtime.AllocZ"(i64 24)
+// CHECK-NEXT:   %3 = call ptr @main.stringStructOf(ptr %1)
+// CHECK-NEXT:   %4 = getelementptr inbounds %main.stringStruct, ptr %3, i32 0, i32 0
+// CHECK-NEXT:   %5 = load ptr, ptr %4, align 8
+// CHECK-NEXT:   %6 = getelementptr inbounds %main.slice, ptr %2, i32 0, i32 0
+// CHECK-NEXT:   store ptr %5, ptr %6, align 8
+// CHECK-NEXT:   %7 = getelementptr inbounds %main.stringStruct, ptr %3, i32 0, i32 1
+// CHECK-NEXT:   %8 = load i64, ptr %7, align 8
+// CHECK-NEXT:   %9 = getelementptr inbounds %main.slice, ptr %2, i32 0, i32 1
+// CHECK-NEXT:   store i64 %8, ptr %9, align 8
+// CHECK-NEXT:   %10 = getelementptr inbounds %main.stringStruct, ptr %3, i32 0, i32 1
+// CHECK-NEXT:   %11 = load i64, ptr %10, align 8
+// CHECK-NEXT:   %12 = getelementptr inbounds %main.slice, ptr %2, i32 0, i32 2
+// CHECK-NEXT:   store i64 %11, ptr %12, align 8
+// CHECK-NEXT:   %13 = load %"{{.*}}/runtime/internal/runtime.Slice", ptr %2, align 8
+// CHECK-NEXT:   ret %"{{.*}}/runtime/internal/runtime.Slice" %13
 // CHECK-NEXT: }
 
 func bytes(s string) (ret []byte) {

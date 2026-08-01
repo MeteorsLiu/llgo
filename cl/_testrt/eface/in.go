@@ -19,12 +19,11 @@ func (t *T) Invoke() {
 
 // CHECK-LABEL: define void @main.dump(%"{{.*}}/runtime/internal/runtime.eface" %0){{.*}} {
 // CHECK-NEXT: _llgo_0:
-// CHECK-NEXT:   %.stack = alloca i8, i64 16, align 8
-// CHECK-NEXT:   call void @llvm.memset.p0.i64(ptr %.stack, i8 0, i64 16, i1 false)
-// CHECK-NEXT:   store %"{{.*}}/runtime/internal/runtime.eface" %0, ptr %.stack, align 8
-// CHECK-NEXT:   %1 = getelementptr inbounds %main.eface, ptr %.stack, i32 0, i32 0
-// CHECK-NEXT:   %2 = load ptr, ptr %1, align 8
-// CHECK-NEXT:   call void @main.dumpTyp(ptr %2, %"{{.*}}/runtime/internal/runtime.String" zeroinitializer)
+// CHECK-NEXT:   %1 = call ptr @"{{.*}}/runtime/internal/runtime.AllocZ"(i64 16)
+// CHECK-NEXT:   store %"{{.*}}/runtime/internal/runtime.eface" %0, ptr %1, align 8
+// CHECK-NEXT:   %2 = getelementptr inbounds %main.eface, ptr %1, i32 0, i32 0
+// CHECK-NEXT:   %3 = load ptr, ptr %2, align 8
+// CHECK-NEXT:   call void @main.dumpTyp(ptr %3, %"{{.*}}/runtime/internal/runtime.String" zeroinitializer)
 // CHECK-NEXT:   ret void
 // CHECK-NEXT: }
 func dump(v any) {

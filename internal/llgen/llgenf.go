@@ -28,7 +28,7 @@ import (
 )
 
 func GenFrom(fileOrPkg string) string {
-	pkg, err := genFrom(fileOrPkg, 0)
+	pkg, err := genFrom(fileOrPkg, 0, true)
 	check(err)
 	out := pkg.LPkg.String()
 	// Release the compile's LLVM context: golden suites call GenFrom for
@@ -38,11 +38,12 @@ func GenFrom(fileOrPkg string) string {
 	return out
 }
 
-func genFrom(pkgPath string, abiMode build.AbiMode) (build.Package, error) {
+func genFrom(pkgPath string, abiMode build.AbiMode, disableEscapeAnalysis bool) (build.Package, error) {
 	conf := &build.Config{
-		Mode:    build.ModeGen,
-		AbiMode: abiMode,
-		GenLL:   true,
+		Mode:                  build.ModeGen,
+		AbiMode:               abiMode,
+		GenLL:                 true,
+		DisableEscapeAnalysis: disableEscapeAnalysis,
 	}
 	if err := applyGoBuildFlagsFile(conf, filepath.Join(pkgPath, "flags.txt")); err != nil {
 		return nil, err
@@ -91,7 +92,7 @@ func SmartDoFile(pkgPath string) {
 }
 
 func SmartDoFileEx(pkgPath string, abiMode build.AbiMode) {
-	pkg, err := genFrom(pkgPath, abiMode)
+	pkg, err := genFrom(pkgPath, abiMode, false)
 	check(err)
 
 	const autgenFile = "llgo_autogen.ll"

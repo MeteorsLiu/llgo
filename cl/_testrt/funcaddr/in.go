@@ -21,25 +21,23 @@ func add(a, b int) int {
 
 // CHECK-LABEL: define void @main.main(){{.*}} {
 // CHECK-NEXT: _llgo_0:
-// CHECK-NEXT:   %.stack = alloca i8, i64 8, align 8
-// CHECK-NEXT:   call void @llvm.memset.p0.i64(ptr %.stack, i8 0, i64 8, i1 false)
-// CHECK-NEXT:   store ptr @main.add, ptr %.stack, align 8
-// CHECK-NEXT:   %.stack1 = alloca i8, i64 8, align 8
-// CHECK-NEXT:   call void @llvm.memset.p0.i64(ptr %.stack1, i8 0, i64 8, i1 false)
-// CHECK-NEXT:   store ptr @"main.main$1", ptr %.stack1, align 8
-// CHECK-NEXT:   %0 = load ptr, ptr %.stack, align 8
-// CHECK-NEXT:   %1 = icmp eq ptr @main.add, %0
-// CHECK-NEXT:   call void @"{{.*}}/runtime/internal/runtime.PrintBool"(i1 %1)
+// CHECK-NEXT:   %0 = call ptr @"{{.*}}/runtime/internal/runtime.AllocZ"(i64 8)
+// CHECK-NEXT:   store ptr @main.add, ptr %0, align 8
+// CHECK-NEXT:   %1 = call ptr @"{{.*}}/runtime/internal/runtime.AllocZ"(i64 8)
+// CHECK-NEXT:   store ptr @"main.main$1", ptr %1, align 8
+// CHECK-NEXT:   %2 = load ptr, ptr %0, align 8
+// CHECK-NEXT:   %3 = icmp eq ptr @main.add, %2
+// CHECK-NEXT:   call void @"{{.*}}/runtime/internal/runtime.PrintBool"(i1 %3)
 // CHECK-NEXT:   call void @"{{.*}}/runtime/internal/runtime.PrintByte"(i8 10)
-// CHECK-NEXT:   %2 = load ptr, ptr %.stack, align 8
-// CHECK-NEXT:   %3 = load ptr, ptr %.stack, align 8
-// CHECK-NEXT:   %4 = icmp eq ptr %2, %3
-// CHECK-NEXT:   call void @"{{.*}}/runtime/internal/runtime.PrintBool"(i1 %4)
+// CHECK-NEXT:   %4 = load ptr, ptr %0, align 8
+// CHECK-NEXT:   %5 = load ptr, ptr %0, align 8
+// CHECK-NEXT:   %6 = icmp eq ptr %4, %5
+// CHECK-NEXT:   call void @"{{.*}}/runtime/internal/runtime.PrintBool"(i1 %6)
 // CHECK-NEXT:   call void @"{{.*}}/runtime/internal/runtime.PrintByte"(i8 10)
-// CHECK-NEXT:   %5 = load ptr, ptr %.stack1, align 8
-// CHECK-NEXT:   %6 = load ptr, ptr %.stack1, align 8
-// CHECK-NEXT:   %7 = icmp eq ptr %5, %6
-// CHECK-NEXT:   call void @"{{.*}}/runtime/internal/runtime.PrintBool"(i1 %7)
+// CHECK-NEXT:   %7 = load ptr, ptr %1, align 8
+// CHECK-NEXT:   %8 = load ptr, ptr %1, align 8
+// CHECK-NEXT:   %9 = icmp eq ptr %7, %8
+// CHECK-NEXT:   call void @"{{.*}}/runtime/internal/runtime.PrintBool"(i1 %9)
 // CHECK-NEXT:   call void @"{{.*}}/runtime/internal/runtime.PrintByte"(i8 10)
 // CHECK-NEXT:   ret void
 // CHECK-NEXT: }

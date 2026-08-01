@@ -119,35 +119,34 @@ type S []int
 // CHECK-NEXT:   %51 = call %"{{.*}}/runtime/internal/runtime.String" @"{{.*}}/runtime/internal/runtime.StringFromUint64"(i64 %50)
 // CHECK-NEXT:   call void @"{{.*}}/runtime/internal/runtime.PrintString"(%"{{.*}}/runtime/internal/runtime.String" %51)
 // CHECK-NEXT:   call void @"{{.*}}/runtime/internal/runtime.PrintByte"(i8 10)
-// CHECK-NEXT:   %.stack = alloca i8, i64 16, align 8
-// CHECK-NEXT:   call void @llvm.memset.p0.i64(ptr %.stack, i8 0, i64 16, i1 false)
-// CHECK-NEXT:   %52 = getelementptr inbounds i64, ptr %.stack, i64 0
-// CHECK-NEXT:   %53 = getelementptr inbounds i64, ptr %.stack, i64 1
-// CHECK-NEXT:   store i64 1, ptr %52, align 8
-// CHECK-NEXT:   store i64 2, ptr %53, align 8
-// CHECK-NEXT:   %54 = getelementptr inbounds i64, ptr %.stack, i64 1
-// CHECK-NEXT:   %55 = load i64, ptr %54, align 8
-// CHECK-NEXT:   call void @"{{.*}}/runtime/internal/runtime.PrintInt"(i64 %55)
+// CHECK-NEXT:   %52 = call ptr @"{{.*}}/runtime/internal/runtime.AllocZ"(i64 16)
+// CHECK-NEXT:   %53 = getelementptr inbounds i64, ptr %52, i64 0
+// CHECK-NEXT:   %54 = getelementptr inbounds i64, ptr %52, i64 1
+// CHECK-NEXT:   store i64 1, ptr %53, align 8
+// CHECK-NEXT:   store i64 2, ptr %54, align 8
+// CHECK-NEXT:   %55 = getelementptr inbounds i64, ptr %52, i64 1
+// CHECK-NEXT:   %56 = load i64, ptr %55, align 8
+// CHECK-NEXT:   call void @"{{.*}}/runtime/internal/runtime.PrintInt"(i64 %56)
 // CHECK-NEXT:   call void @"{{.*}}/runtime/internal/runtime.PrintByte"(i8 10)
-// CHECK-NEXT:   %56 = call ptr @"{{.*}}/runtime/internal/runtime.AllocZ"(i64 32)
-// CHECK-NEXT:   %57 = getelementptr inbounds i64, ptr %56, i64 0
-// CHECK-NEXT:   store i64 1, ptr %57, align 8
-// CHECK-NEXT:   %58 = getelementptr inbounds i64, ptr %56, i64 1
-// CHECK-NEXT:   store i64 2, ptr %58, align 8
-// CHECK-NEXT:   %59 = getelementptr inbounds i64, ptr %56, i64 2
-// CHECK-NEXT:   store i64 3, ptr %59, align 8
-// CHECK-NEXT:   %60 = getelementptr inbounds i64, ptr %56, i64 3
-// CHECK-NEXT:   store i64 4, ptr %60, align 8
-// CHECK-NEXT:   %61 = insertvalue %"{{.*}}/runtime/internal/runtime.Slice" undef, ptr %56, 0
-// CHECK-NEXT:   %62 = insertvalue %"{{.*}}/runtime/internal/runtime.Slice" %61, i64 4, 1
-// CHECK-NEXT:   %63 = insertvalue %"{{.*}}/runtime/internal/runtime.Slice" %62, i64 4, 2
-// CHECK-NEXT:   %64 = extractvalue %"{{.*}}/runtime/internal/runtime.Slice" %63, 0
-// CHECK-NEXT:   %65 = extractvalue %"{{.*}}/runtime/internal/runtime.Slice" %63, 1
-// CHECK-NEXT:   %66 = icmp uge i64 1, %65
-// CHECK-NEXT:   call void @"{{.*}}/runtime/internal/runtime.CheckIndexRange"(i1 %66, i64 1, i1 true, i64 %65)
-// CHECK-NEXT:   %67 = getelementptr inbounds i64, ptr %64, i64 1
-// CHECK-NEXT:   %68 = load i64, ptr %67, align 8
-// CHECK-NEXT:   call void @"{{.*}}/runtime/internal/runtime.PrintInt"(i64 %68)
+// CHECK-NEXT:   %57 = call ptr @"{{.*}}/runtime/internal/runtime.AllocZ"(i64 32)
+// CHECK-NEXT:   %58 = getelementptr inbounds i64, ptr %57, i64 0
+// CHECK-NEXT:   store i64 1, ptr %58, align 8
+// CHECK-NEXT:   %59 = getelementptr inbounds i64, ptr %57, i64 1
+// CHECK-NEXT:   store i64 2, ptr %59, align 8
+// CHECK-NEXT:   %60 = getelementptr inbounds i64, ptr %57, i64 2
+// CHECK-NEXT:   store i64 3, ptr %60, align 8
+// CHECK-NEXT:   %61 = getelementptr inbounds i64, ptr %57, i64 3
+// CHECK-NEXT:   store i64 4, ptr %61, align 8
+// CHECK-NEXT:   %62 = insertvalue %"{{.*}}/runtime/internal/runtime.Slice" undef, ptr %57, 0
+// CHECK-NEXT:   %63 = insertvalue %"{{.*}}/runtime/internal/runtime.Slice" %62, i64 4, 1
+// CHECK-NEXT:   %64 = insertvalue %"{{.*}}/runtime/internal/runtime.Slice" %63, i64 4, 2
+// CHECK-NEXT:   %65 = extractvalue %"{{.*}}/runtime/internal/runtime.Slice" %64, 0
+// CHECK-NEXT:   %66 = extractvalue %"{{.*}}/runtime/internal/runtime.Slice" %64, 1
+// CHECK-NEXT:   %67 = icmp uge i64 1, %66
+// CHECK-NEXT:   call void @"{{.*}}/runtime/internal/runtime.CheckIndexRange"(i1 %67, i64 1, i1 true, i64 %66)
+// CHECK-NEXT:   %68 = getelementptr inbounds i64, ptr %65, i64 1
+// CHECK-NEXT:   %69 = load i64, ptr %68, align 8
+// CHECK-NEXT:   call void @"{{.*}}/runtime/internal/runtime.PrintInt"(i64 %69)
 // CHECK-NEXT:   call void @"{{.*}}/runtime/internal/runtime.PrintByte"(i8 10)
 // CHECK-NEXT:   call void @"{{.*}}/runtime/internal/runtime.PrintInt"(i64 0)
 // CHECK-NEXT:   call void @"{{.*}}/runtime/internal/runtime.PrintByte"(i8 10)
