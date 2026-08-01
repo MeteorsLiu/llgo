@@ -238,7 +238,7 @@ func (a *analyzer) classifyNoCaptureUse(state useState) useAction {
 			return useSafe
 		}
 	case opcodeAtomicCmpXchg:
-		if state.operand == 0 || state.operand == 1 {
+		if state.operand == 0 {
 			return useSafe
 		}
 	case llvm.VAArg:
@@ -257,8 +257,6 @@ func (a *analyzer) classifyNoCaptureUse(state useState) useAction {
 		if state.operand == 0 {
 			return useFollow
 		}
-	case llvm.ICmp:
-		return useSafe
 	}
 	return useCapture
 }
@@ -356,16 +354,11 @@ func (a *analyzer) allocationUses(root llvm.Value) walkResult {
 			if state.operand == 0 {
 				return useFollow
 			}
-		case llvm.ICmp:
-			return useSafe
 		case opcodeAtomicCmpXchg:
-			switch state.operand {
-			case 0:
+			if state.operand == 0 {
 				if user.Alignment() > result.alignment {
 					result.alignment = user.Alignment()
 				}
-				return useSafe
-			case 1:
 				return useSafe
 			}
 		case opcodeAtomicRMW:

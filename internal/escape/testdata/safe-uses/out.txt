@@ -67,8 +67,8 @@ exit:                                             ; preds = %loop
 
 define i1 @compare() {
 entry:
-  %p.stack = alloca i8, i64 8, align 1
-  %same = icmp eq ptr %p.stack, null
+  %p = call ptr @"github.com/goplus/llgo/runtime/internal/runtime.AllocU"(i64 8)
+  %same = icmp eq ptr %p, null
   ret i1 %same
 }
 
@@ -110,8 +110,8 @@ entry:
 
 define void @cmpxchg_expected() {
 entry:
-  %p.stack = alloca i8, i64 8, align 1
-  %old = cmpxchg ptr @escaped_pointer, ptr %p.stack, ptr null monotonic monotonic, align 8
+  %p = call ptr @"github.com/goplus/llgo/runtime/internal/runtime.AllocU"(i64 8)
+  %old = cmpxchg ptr @escaped_pointer, ptr %p, ptr null monotonic monotonic, align 8
   ret void
 }
 

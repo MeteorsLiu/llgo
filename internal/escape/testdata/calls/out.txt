@@ -222,8 +222,8 @@ entry:
 
 define void @known_derived(i1 %cond) {
 entry:
-  %p.stack = alloca i8, i64 8, align 1
-  call void @derived(ptr %p.stack, i1 %cond)
+  %p = call ptr @"github.com/goplus/llgo/runtime/internal/runtime.AllocU"(i64 8)
+  call void @derived(ptr %p, i1 %cond)
   ret void
 }
 
@@ -236,8 +236,8 @@ entry:
 
 define void @known_atomic() {
 entry:
-  %p.stack = alloca i8, i64 8, align 4
-  call void @atomic_use(ptr %p.stack)
+  %p = call ptr @"github.com/goplus/llgo/runtime/internal/runtime.AllocU"(i64 8)
+  call void @atomic_use(ptr %p)
   ret void
 }
 
