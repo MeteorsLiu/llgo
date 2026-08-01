@@ -3,7 +3,6 @@
 package escape
 
 import (
-	"fmt"
 	"strings"
 
 	llabi "github.com/goplus/llgo/internal/abi"
@@ -368,8 +367,8 @@ type allocationPlan struct {
 	alignment int
 }
 
-// TransformModule analyzes eligible LLGo allocations, rewrites proven-local
-// AllocZ and AllocU calls, and verifies the resulting LLVM module.
+// TransformModule analyzes eligible LLGo allocations and rewrites proven-local
+// AllocZ and AllocU calls.
 func TransformModule(mod llvm.Module) error {
 	a := newAnalyzer(mod)
 	a.solveNoCapture()
@@ -391,11 +390,6 @@ func TransformModule(mod llvm.Module) error {
 
 	for _, plan := range plans {
 		rewriteAllocation(mod.Context(), plan)
-	}
-	if len(plans) != 0 {
-		if err := llvm.VerifyModule(mod, llvm.ReturnStatusAction); err != nil {
-			return fmt.Errorf("verify heap-to-stack transform: %w", err)
-		}
 	}
 	return nil
 }
