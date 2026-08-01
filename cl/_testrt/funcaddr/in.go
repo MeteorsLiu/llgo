@@ -41,6 +41,16 @@ func add(a, b int) int {
 // CHECK-NEXT:   call void @"{{.*}}/runtime/internal/runtime.PrintByte"(i8 10)
 // CHECK-NEXT:   ret void
 // CHECK-NEXT: }
+// ESCAPE-LABEL: define void @main.main(){{.*}} {
+// ESCAPE: %.stack = alloca i8, i64 8, align 8
+// ESCAPE: call void @llvm.memset.p0.i64(ptr %.stack, i8 0, i64 8, i1 false)
+// ESCAPE: store ptr @main.add, ptr %.stack, align 8
+// ESCAPE: %.stack1 = alloca i8, i64 8, align 8
+// ESCAPE: call void @llvm.memset.p0.i64(ptr %.stack1, i8 0, i64 8, i1 false)
+// ESCAPE: store ptr @"main.main$1", ptr %.stack1, align 8
+// ESCAPE: load ptr, ptr %.stack, align 8
+// ESCAPE: load ptr, ptr %.stack1, align 8
+// ESCAPE: ret void
 func main() {
 	var fn Add = add
 	// CHECK-LABEL: define i64 @"main.main$1"(i64 %0, i64 %1){{.*}} {

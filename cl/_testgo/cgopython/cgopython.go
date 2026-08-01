@@ -16,6 +16,14 @@ import "C"
 // CHECK-NEXT:   ret i32 %4
 // CHECK-NEXT: }
 
+// ESCAPE-LABEL: define i32 @main._Cfunc_PyRun_SimpleString(ptr %0){{.*}} {
+// ESCAPE: %.stack = alloca i8, i64 8, align 1
+// ESCAPE: call void @llvm.memset.p0.i64(ptr %.stack, i8 0, i64 8, i1 false)
+// ESCAPE: %1 = load ptr, ptr @main._cgo_{{.*}}_Cfunc_PyRun_SimpleString, align 8
+// ESCAPE: %2 = load ptr, ptr %1, align 8
+// ESCAPE: %3 = call i32 %2(ptr %0)
+// ESCAPE: ret i32 %3
+
 // CHECK-LABEL: define [0 x i8] @main._Cfunc_Py_Finalize(){{.*}} {
 // CHECK-NEXT: _llgo_0:
 // CHECK-NEXT:   %0 = load ptr, ptr @main._cgo_{{.*}}_Cfunc_Py_Finalize, align 8

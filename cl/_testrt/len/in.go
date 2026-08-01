@@ -98,6 +98,28 @@ type data struct {
 // CHECK-NEXT:   call void @"{{.*}}/runtime/internal/runtime.PrintByte"(i8 10)
 // CHECK-NEXT:   ret void
 // CHECK-NEXT: }
+// ESCAPE-LABEL: define void @main.main(){{.*}} {
+// ESCAPE: %.stack = alloca i8, i64 56, align 8
+// ESCAPE: call void @llvm.memset.p0.i64(ptr %.stack, i8 0, i64 56, i1 false)
+// ESCAPE: getelementptr inbounds %main.data, ptr %.stack, i32 0, i32 0
+// ESCAPE: getelementptr inbounds %main.data, ptr %.stack, i32 0, i32 1
+// ESCAPE: getelementptr inbounds %main.data, ptr %.stack, i32 0, i32 2
+// ESCAPE: getelementptr inbounds %main.data, ptr %.stack, i32 0, i32 3
+// ESCAPE: %.stack1 = alloca i8, i64 56, align 8
+// ESCAPE: call void @llvm.memset.p0.i64(ptr %.stack1, i8 0, i64 56, i1 false)
+// ESCAPE: call ptr @"{{.*}}/runtime/internal/runtime.NewChan"(i64 8, i64 2)
+// ESCAPE: call ptr @"{{.*}}/runtime/internal/runtime.MakeMap"
+// ESCAPE: call ptr @"{{.*}}/runtime/internal/runtime.AllocU"(i64 8)
+// ESCAPE: call ptr @"{{.*}}/runtime/internal/runtime.AllocZ"(i64 24)
+// ESCAPE: store %"{{.*}}/runtime/internal/runtime.String" {{.*}}, ptr {{%.*}}, align 8
+// ESCAPE: store ptr {{%.*}}, ptr {{%.*}}, align 8
+// ESCAPE: store ptr {{%.*}}, ptr {{%.*}}, align 8
+// ESCAPE: store %"{{.*}}/runtime/internal/runtime.Slice" {{%.*}}, ptr {{%.*}}, align 8
+// ESCAPE: getelementptr inbounds %main.data, ptr %.stack1, i32 0, i32 0
+// ESCAPE: getelementptr inbounds %main.data, ptr %.stack1, i32 0, i32 1
+// ESCAPE: getelementptr inbounds %main.data, ptr %.stack1, i32 0, i32 2
+// ESCAPE: getelementptr inbounds %main.data, ptr %.stack1, i32 0, i32 3
+// ESCAPE: ret void
 func main() {
 	d := &data{}
 	println(len(d.s), len(d.c), len(d.m), len(d.a), cap(d.c), cap(d.a))

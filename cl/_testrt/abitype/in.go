@@ -51,6 +51,19 @@ import (
 // CHECK-NEXT:   ret void
 // CHECK-NEXT: }
 
+// ESCAPE-LABEL: define void @main.main(){{.*}} {
+// ESCAPE: %.stack = alloca i8, i64 16, align 8
+// ESCAPE: call void @llvm.memset.p0.i64(ptr %.stack, i8 0, i64 16, i1 false)
+// ESCAPE: %0 = call ptr @"{{.*}}/runtime/internal/runtime.AllocU"(i64 4)
+// ESCAPE: store %"{{.*}}/runtime/internal/runtime.eface" {{%.*}}, ptr %.stack, align 8
+// ESCAPE: getelementptr inbounds %main.eface, ptr %.stack, i32 0, i32 0
+// ESCAPE: call ptr @"{{.*}}/runtime/internal/runtime.AllocU"(i64 16)
+// ESCAPE: call ptr @"{{.*}}/runtime/internal/runtime.AllocU"(i64 1)
+// ESCAPE: store %"{{.*}}/runtime/internal/runtime.eface" {{%.*}}, ptr %.stack, align 8
+// ESCAPE: getelementptr inbounds %main.eface, ptr %.stack, i32 0, i32 0
+// ESCAPE: call ptr @"{{.*}}/runtime/internal/runtime.AllocU"(i64 16)
+// ESCAPE: ret void
+
 type eface struct {
 	typ  *abi.Type
 	data unsafe.Pointer

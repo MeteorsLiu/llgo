@@ -153,6 +153,16 @@ type S []int
 // CHECK-NEXT:   ret void
 // CHECK-NEXT: }
 
+// ESCAPE-LABEL: define void @main.main(){{.*}} {
+// ESCAPE: %.stack = alloca i8, i64 16, align 8
+// ESCAPE: call void @llvm.memset.p0.i64(ptr %.stack, i8 0, i64 16, i1 false)
+// ESCAPE: getelementptr inbounds i64, ptr %.stack, i64 0
+// ESCAPE: getelementptr inbounds i64, ptr %.stack, i64 1
+// ESCAPE: load i64, ptr {{%.*}}, align 8
+// ESCAPE: call ptr @"{{.*}}/runtime/internal/runtime.AllocZ"(i64 32)
+// ESCAPE: call void @"{{.*}}/runtime/internal/runtime.CheckIndexRange"
+// ESCAPE: ret void
+
 func main() {
 	a := [...]point{{1, 2}, {3, 4}, {5, 6}}[2]
 	println(a.x, a.y)

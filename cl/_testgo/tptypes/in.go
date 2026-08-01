@@ -177,6 +177,26 @@ type (
 // CHECK-NEXT:   ret void
 // CHECK-NEXT: }
 
+// ESCAPE-LABEL: define void @main.main(){{.*}} {
+// ESCAPE: %.stack = alloca i8, i64 24, align 8
+// ESCAPE: call void @llvm.memset.p0.i64(ptr %.stack, i8 0, i64 24, i1 false)
+// ESCAPE: %16 = call ptr @"{{.*}}/runtime/internal/runtime.AllocZ"(i64 8)
+// ESCAPE: call %"{{.*}}/runtime/internal/runtime.Slice" @"main.(*Slice{{\[\[\]int,int\]}}).Append"(ptr %.stack, %"{{.*}}/runtime/internal/runtime.Slice" {{%.*}})
+// ESCAPE: %.stack1 = alloca i8, i64 24, align 8
+// ESCAPE: call void @llvm.memset.p0.i64(ptr %.stack1, i8 0, i64 24, i1 false)
+// ESCAPE: %22 = call ptr @"{{.*}}/runtime/internal/runtime.AllocZ"(i64 16)
+// ESCAPE: call %"{{.*}}/runtime/internal/runtime.Slice" @"main.(*Slice{{\[\[\]string,string\]}}).Append"(ptr %.stack1, %"{{.*}}/runtime/internal/runtime.Slice" {{%.*}})
+// ESCAPE: %.stack2 = alloca i8, i64 24, align 8
+// ESCAPE: call void @llvm.memset.p0.i64(ptr %.stack2, i8 0, i64 24, i1 false)
+// ESCAPE: %28 = call ptr @"{{.*}}/runtime/internal/runtime.AllocZ"(i64 32)
+// ESCAPE: call %"{{.*}}/runtime/internal/runtime.Slice" @"main.(*Slice{{\[\[\]int,int\]}}).Append"(ptr %.stack2, %"{{.*}}/runtime/internal/runtime.Slice" {{%.*}})
+// ESCAPE: %37 = call ptr @"{{.*}}/runtime/internal/runtime.AllocZ"(i64 32)
+// ESCAPE: call %"{{.*}}/runtime/internal/runtime.Slice" @"main.(*Slice{{\[\[\]int,int\]}}).Append2"(ptr %.stack2, %"{{.*}}/runtime/internal/runtime.Slice" {{%.*}})
+// ESCAPE: getelementptr inbounds %"main.Slice{{\[\[\]int,int\]}}", ptr %.stack, i32 0, i32 0
+// ESCAPE: getelementptr inbounds %"main.Slice{{\[\[\]string,string\]}}", ptr %.stack1, i32 0, i32 0
+// ESCAPE: getelementptr inbounds %"main.Slice{{\[\[\]int,int\]}}", ptr %.stack2, i32 0, i32 0
+// ESCAPE: ret void
+
 func main() {
 	println(DataInt{1}.v)
 	println(DataString{"hello"}.v)

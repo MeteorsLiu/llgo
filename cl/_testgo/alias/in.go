@@ -44,6 +44,16 @@ func (p *Point) Scale(factor float64) {
 	p.y *= factor
 }
 
+// ESCAPE-LABEL: define void @main.main(){{.*}} {
+// ESCAPE: %.stack = alloca i8, i64 16, align 8
+// ESCAPE: call void @"main.(*Point).Scale"(ptr %.stack, double 2.000000e+00)
+// ESCAPE: call void @"main.(*Point).Move"(ptr %.stack, double 3.000000e+00, double 4.000000e+00)
+// ESCAPE: call void @"{{.*}}PrintFloat"(double %3)
+// ESCAPE-NEXT: call void @"{{.*}}PrintByte"(i8 32)
+// ESCAPE-NEXT: call void @"{{.*}}PrintFloat"(double %5)
+// ESCAPE-NEXT: call void @"{{.*}}PrintByte"(i8 10)
+// ESCAPE-NEXT: ret void
+
 // CHECK-LABEL: define void @main.main(){{.*}} {
 func main() {
 	// CHECK: call ptr @"{{.*}}AllocZ"(i64 16)

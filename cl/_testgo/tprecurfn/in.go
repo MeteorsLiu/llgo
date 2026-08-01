@@ -6,6 +6,16 @@ type My[T any] struct {
 	next *My[T]
 }
 
+// ESCAPE-LABEL: define void @main.main(){{.*}} {
+// ESCAPE: %.stack = alloca i8, i64 24, align 8
+// ESCAPE: call void @llvm.memset.p0.i64(ptr %.stack, i8 0, i64 24, i1 false)
+// ESCAPE: %0 = getelementptr inbounds %"main.My[int]", ptr %.stack, i32 0, i32 1
+// ESCAPE: %1 = call ptr @"{{.*}}/runtime/internal/runtime.AllocZ"(i64 24)
+// ESCAPE: store { ptr, ptr } { ptr @"__llgo_stub.main.main$1", ptr null }, ptr {{%.*}}, align 8
+// ESCAPE: store ptr %1, ptr %0, align 8
+// ESCAPE: call void {{%.*}}(ptr {{%.*}}, i64 100)
+// ESCAPE: ret void
+
 // CHECK-LABEL: define void @main.main(){{.*}} {
 func main() {
 	// CHECK:  %0 = call ptr @"{{.*}}/runtime/internal/runtime.AllocZ"(i64 24)

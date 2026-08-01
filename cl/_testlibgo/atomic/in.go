@@ -5,6 +5,17 @@ import (
 	"sync/atomic"
 )
 
+// ESCAPE-LABEL: define void @main.main(){{.*}} {
+// ESCAPE: %.stack = alloca i8, i64 8, align 8
+// ESCAPE: call void @llvm.memset.p0.i64(ptr %.stack, i8 0, i64 8, i1 false)
+// ESCAPE: store atomic i64 100, ptr %.stack seq_cst, align 8
+// ESCAPE: load atomic i64, ptr %.stack seq_cst, align 8
+// ESCAPE: atomicrmw add ptr %.stack, i64 1 seq_cst, align 8
+// ESCAPE: cmpxchg ptr %.stack, i64 100, i64 102 seq_cst seq_cst, align 8
+// ESCAPE: cmpxchg ptr %.stack, i64 101, i64 102 seq_cst seq_cst, align 8
+// ESCAPE: atomicrmw add ptr %.stack, i64 -1 seq_cst, align 8
+// ESCAPE: ret void
+
 // CHECK-LABEL: define void @main.main(){{.*}} {
 func main() {
 	var v int64

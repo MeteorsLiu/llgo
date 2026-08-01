@@ -117,6 +117,19 @@ type IFmt interface {
 // CHECK-NEXT:   %38 = extractvalue { %"{{.*}}/runtime/internal/runtime.iface", i1 } %36, 1
 // CHECK-NEXT:   br i1 %38, label %_llgo_2, label %_llgo_1
 // CHECK-NEXT: }
+// ESCAPE-LABEL: define void @main.main(){{.*}} {
+// ESCAPE: %.stack = alloca i8, i64 8, align 8
+// ESCAPE: call void @llvm.memset.p0.i64(ptr %.stack, i8 0, i64 8, i1 false)
+// ESCAPE: call void @"main.(*CFmt).SetFormat"(ptr %.stack, ptr @0)
+// ESCAPE: getelementptr inbounds %main.CFmt, ptr %.stack, i32 0, i32 0
+// ESCAPE: call i32 (ptr, ...) @printf
+// ESCAPE: call void @"main.(*CFmt).SetFormat"(ptr %.stack, ptr @2)
+// ESCAPE: getelementptr inbounds %main.CFmt, ptr %.stack, i32 0, i32 0
+// ESCAPE: call i32 (ptr, ...) @printf
+// ESCAPE: %6 = call ptr @"{{.*}}/runtime/internal/runtime.AllocZ"(i64 8)
+// ESCAPE: insertvalue %"{{.*}}/runtime/internal/runtime.eface" { ptr @"*_llgo_main.CFmt", ptr undef }, ptr %6, 1
+// ESCAPE: call i1 @"{{.*}}/runtime/internal/runtime.Implements"
+// ESCAPE: ret void
 func main() {
 	cfmt := &CFmt{}
 	cfmt.SetFormat(c.Str("%s (%d)\n"))

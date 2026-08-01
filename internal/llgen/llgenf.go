@@ -28,7 +28,15 @@ import (
 )
 
 func GenFrom(fileOrPkg string) string {
-	pkg, err := genFrom(fileOrPkg, 0, true)
+	return genStringFrom(fileOrPkg, true)
+}
+
+func GenFromWithEscape(fileOrPkg string) string {
+	return genStringFrom(fileOrPkg, false)
+}
+
+func genStringFrom(fileOrPkg string, disableEscapeAnalysis bool) string {
+	pkg, err := genFrom(fileOrPkg, 0, disableEscapeAnalysis)
 	check(err)
 	out := pkg.LPkg.String()
 	// Release the compile's LLVM context: golden suites call GenFrom for

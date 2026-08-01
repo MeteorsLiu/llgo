@@ -16,6 +16,14 @@ import "fmt"
 // CHECK-NEXT:   ret i32 %8
 // CHECK-NEXT: }
 
+// ESCAPE-LABEL: define i32 @main._Cfunc_test_structs(ptr %0, ptr %1, ptr %2, ptr %3, ptr %4){{.*}} {
+// ESCAPE: %.stack = alloca i8, i64 8, align 1
+// ESCAPE: call void @llvm.memset.p0.i64(ptr %.stack, i8 0, i64 8, i1 false)
+// ESCAPE: %5 = load ptr, ptr @main._cgo_{{.*}}_Cfunc_test_structs, align 8
+// ESCAPE: %6 = load ptr, ptr %5, align 8
+// ESCAPE: %7 = call i32 %6(ptr %0, ptr %1, ptr %2, ptr %3, ptr %4)
+// ESCAPE: ret i32 %7
+
 // CHECK-LABEL: define void @main.main(){{.*}} {
 // CHECK-NEXT: _llgo_0:
 // CHECK-NEXT:   %0 = call ptr @"{{.*}}/runtime/internal/runtime.AllocZ"(i64 4)

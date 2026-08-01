@@ -18,6 +18,15 @@ type u64parts struct {
 	hi uint32
 }
 
+// ESCAPE-LABEL: define void @main.check32(%"{{.*}}/runtime/internal/runtime.eface" %0){{.*}} {
+// ESCAPE: %.stack = alloca i8, i64 16, align 8
+// ESCAPE: call void @llvm.memset.p0.i64(ptr %.stack, i8 0, i64 16, i1 false)
+// ESCAPE: store %"{{.*}}/runtime/internal/runtime.eface" %0, ptr %.stack, align 8
+// ESCAPE: load %"{{.*}}/runtime/internal/runtime.eface", ptr %.stack, align 8
+// ESCAPE: icmp eq ptr {{.*}}, @_llgo_float32
+// ESCAPE: load i32, ptr
+// ESCAPE: icmp ne i32 {{.*}}, 1078530011
+
 // CHECK-LABEL: define void @main.check32(%"{{.*}}/runtime/internal/runtime.eface" %0){{.*}} {
 // CHECK: icmp eq ptr {{.*}}, @_llgo_float32
 // CHECK: load i32, ptr
@@ -33,6 +42,17 @@ func check32(v any) {
 		panic("error bits f32")
 	}
 }
+
+// ESCAPE-LABEL: define void @main.check64(%"{{.*}}/runtime/internal/runtime.eface" %0){{.*}} {
+// ESCAPE: %.stack = alloca i8, i64 16, align 8
+// ESCAPE: call void @llvm.memset.p0.i64(ptr %.stack, i8 0, i64 16, i1 false)
+// ESCAPE: store %"{{.*}}/runtime/internal/runtime.eface" %0, ptr %.stack, align 8
+// ESCAPE: load %"{{.*}}/runtime/internal/runtime.eface", ptr %.stack, align 8
+// ESCAPE: icmp eq ptr {{.*}}, @_llgo_float64
+// ESCAPE: load i32, ptr
+// ESCAPE: icmp ne i32 {{.*}}, 1405670641
+// ESCAPE: load i32, ptr
+// ESCAPE: icmp ne i32 {{.*}}, 1074340347
 
 // CHECK-LABEL: define void @main.check64(%"{{.*}}/runtime/internal/runtime.eface" %0){{.*}} {
 // CHECK: icmp eq ptr {{.*}}, @_llgo_float64
