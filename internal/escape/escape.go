@@ -429,7 +429,7 @@ type allocationPlan struct {
 
 // TransformModule analyzes eligible LLGo allocations and rewrites proven-local
 // AllocZ and AllocU calls.
-func TransformModule(mod llvm.Module) error {
+func TransformModule(mod llvm.Module) {
 	a := newAnalyzer(mod)
 	a.solveNoCapture()
 
@@ -451,7 +451,6 @@ func TransformModule(mod llvm.Module) error {
 	for _, plan := range plans {
 		rewriteAllocation(mod.Context(), plan)
 	}
-	return nil
 }
 
 func (a *analyzer) planAllocation(instr llvm.Value) (allocationPlan, bool) {

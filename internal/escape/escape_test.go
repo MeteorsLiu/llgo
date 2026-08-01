@@ -34,9 +34,7 @@ func TestTransformModule(t *testing.T) {
 				t.Fatalf("parse %s: %v", input, err)
 			}
 			defer mod.Dispose()
-			if err := TransformModule(mod); err != nil {
-				t.Fatal(err)
-			}
+			TransformModule(mod)
 
 			output := filepath.Join(dir, "out.txt")
 			want, err := os.ReadFile(output)

@@ -1837,9 +1837,7 @@ func buildPkg(ctx *context, aPkg *aPackage, verbose bool) error {
 
 	ctx.cTransformer.SetSkipFuncs(cabiSkipFuncsForPlan9Asm(ctx, pkgPath, ret.Module()))
 	if !ctx.buildConf.DisableEscapeAnalysis {
-		if err := llescape.TransformModule(ret.Module()); err != nil {
-			return fmt.Errorf("run escape analysis for %v failed: %w", pkgPath, err)
-		}
+		llescape.TransformModule(ret.Module())
 	}
 	llabi.LowerLargeAggregates(ctx.prog.TargetData(), ret.Module())
 	ctx.cTransformer.TransformModule(ret.Path(), ret.Module())

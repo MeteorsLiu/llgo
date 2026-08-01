@@ -9,6 +9,8 @@ declare ptr @"github.com/goplus/llgo/runtime/internal/runtime.AllocU"(i64)
 
 declare void @external(ptr)
 
+declare void @assert_nil(i1)
+
 define void @read(ptr %p) {
 entry:
   %v = load i8, ptr %p, align 8
@@ -19,6 +21,14 @@ define void @write(ptr %p) {
 entry:
   store i8 1, ptr %p, align 8
   ret void
+}
+
+define i8 @nil_checked_read(ptr %p) {
+entry:
+  %nil = icmp eq ptr %p, null
+  call void @assert_nil(i1 %nil)
+  %v = load i8, ptr %p, align 1
+  ret i8 %v
 }
 
 define void @save(ptr %p) {
@@ -160,6 +170,13 @@ entry:
   %p.stack = alloca i8, i64 8, align 8
   call void @write(ptr %p.stack)
   ret void
+}
+
+define i8 @known_nil_checked_read() {
+entry:
+  %p = call ptr @"github.com/goplus/llgo/runtime/internal/runtime.AllocU"(i64 8)
+  %v = call i8 @nil_checked_read(ptr %p)
+  ret i8 %v
 }
 
 define void @known_content_leak() {

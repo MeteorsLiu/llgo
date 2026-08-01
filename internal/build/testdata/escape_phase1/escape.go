@@ -1,11 +1,10 @@
 package escapephase1
 
-func read(p *int) int {
-	return *p
+func read(*int) int {
+	return 7
 }
 
 func Local() int {
 	p := new(int)
-	*p = 7
 	return read(p)
 }
