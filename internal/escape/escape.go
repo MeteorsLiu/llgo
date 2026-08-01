@@ -212,6 +212,14 @@ func callCalleeOperand(call llvm.Value) int {
 	return index
 }
 
+func definedCallParameter(call llvm.Value, argument int) (paramKey, bool) {
+	fn := call.CalledValue().IsAFunction()
+	if fn.IsNil() || fn.IntrinsicID() != 0 || fn.IsDeclaration() || isRuntimeFunction(fn) || argument >= fn.ParamsCount() {
+		return paramKey{}, false
+	}
+	return paramKey{fn: fn, param: argument}, true
+}
+
 func (a *analyzer) classifyNoCaptureUse(state useState) useAction {
 	user := state.user
 	switch user.InstructionOpcode() {
@@ -255,6 +263,59 @@ func (a *analyzer) classifyNoCaptureUse(state useState) useAction {
 	return useCapture
 }
 
+func (a *analyzer) requiredAlignment(root paramKey) int {
+	alignment := 0
+	worklist := []paramKey{root}
+	visited := make(map[paramKey]struct{})
+
+	for len(worklist) != 0 {
+		key := worklist[len(worklist)-1]
+		worklist = worklist[:len(worklist)-1]
+		if _, ok := visited[key]; ok {
+			continue
+		}
+		visited[key] = struct{}{}
+
+		a.checkForAllUses(key.fn.Param(key.param), func(state useState) useAction {
+			user := state.user
+			switch user.InstructionOpcode() {
+			case llvm.Load:
+				if user.Alignment() > alignment {
+					alignment = user.Alignment()
+				}
+			case llvm.Store:
+				if state.operand == 1 && user.Alignment() > alignment {
+					alignment = user.Alignment()
+				}
+			case llvm.Call, llvm.Invoke:
+				if callee, ok := definedCallParameter(user, state.operand); ok && a.noCapture[callee] {
+					worklist = append(worklist, callee)
+				}
+			case llvm.GetElementPtr:
+				if state.operand == 0 {
+					return useFollow
+				}
+			case llvm.BitCast, llvm.PHI, opcodeAddrSpaceCast:
+				return useFollow
+			case llvm.Select:
+				if state.operand == 1 || state.operand == 2 {
+					return useFollow
+				}
+			case opcodeFreeze:
+				if state.operand == 0 {
+					return useFollow
+				}
+			case opcodeAtomicCmpXchg, opcodeAtomicRMW:
+				if state.operand == 0 && user.Alignment() > alignment {
+					alignment = user.Alignment()
+				}
+			}
+			return useSafe
+		})
+	}
+	return alignment
+}
+
 func (a *analyzer) allocationUses(root llvm.Value) walkResult {
 	result := walkResult{}
 	result.escaped = !a.checkForAllUses(root, func(state useState) useAction {
@@ -274,6 +335,11 @@ func (a *analyzer) allocationUses(root llvm.Value) walkResult {
 			}
 		case llvm.Call, llvm.Invoke:
 			if a.callArgumentNoCapture(state) {
+				if key, ok := definedCallParameter(user, state.operand); ok {
+					if alignment := a.requiredAlignment(key); alignment > result.alignment {
+						result.alignment = alignment
+					}
+				}
 				return useSafe
 			}
 		case llvm.GetElementPtr:
@@ -333,12 +399,13 @@ func (a *analyzer) callArgumentNoCapture(state useState) bool {
 	if fn.IntrinsicID() != 0 {
 		return intrinsicArgumentNoCapture(call, fn, state.operand)
 	}
-	if fn.IsDeclaration() || isRuntimeFunction(fn) || state.operand >= fn.ParamsCount() {
+	key, ok := definedCallParameter(call, state.operand)
+	if !ok {
 		return false
 	}
 
-	a.locations.addFlow(call.Operand(state.operand), fn.Param(state.operand))
-	return a.noCapture[paramKey{fn: fn, param: state.operand}]
+	a.locations.addFlow(call.Operand(state.operand), key.fn.Param(key.param))
+	return a.noCapture[key]
 }
 
 func intrinsicArgumentNoCapture(call, fn llvm.Value, argument int) bool {

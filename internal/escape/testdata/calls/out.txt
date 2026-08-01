@@ -143,7 +143,7 @@ entry:
 
 define void @known_no_leak() {
 entry:
-  %p.stack = alloca i8, i64 8, align 1
+  %p.stack = alloca i8, i64 8, align 8
   call void @read(ptr %p.stack)
   ret void
 }
@@ -157,14 +157,14 @@ entry:
 
 define void @known_mutator() {
 entry:
-  %p.stack = alloca i8, i64 8, align 1
+  %p.stack = alloca i8, i64 8, align 8
   call void @write(ptr %p.stack)
   ret void
 }
 
 define void @known_content_leak() {
 entry:
-  %p.stack = alloca i8, i64 8, align 1
+  %p.stack = alloca i8, i64 8, align 8
   call void @leak_content(ptr %p.stack)
   ret void
 }
@@ -236,7 +236,7 @@ entry:
 
 define void @known_atomic() {
 entry:
-  %p.stack = alloca i8, i64 8, align 1
+  %p.stack = alloca i8, i64 8, align 4
   call void @atomic_use(ptr %p.stack)
   ret void
 }
@@ -257,7 +257,7 @@ entry:
 
 define void @recursive_alignment() {
 entry:
-  %p.stack = alloca i8, i64 8, align 1
+  %p.stack = alloca i8, i64 8, align 8
   call void @recursive_load(ptr %p.stack)
   ret void
 }
