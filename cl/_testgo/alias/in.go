@@ -46,12 +46,12 @@ func (p *Point) Scale(factor float64) {
 
 // CHECK-LABEL: define void @main.main(){{.*}} {
 func main() {
-	// CHECK: call ptr @"{{.*}}AllocZ"(i64 16)
-	// CHECK: call void @"main.(*Point).Scale"(ptr %0, double 2.000000e+00)
-	// CHECK: call void @"main.(*Point).Move"(ptr %0, double 3.000000e+00, double 4.000000e+00)
-	// CHECK: call void @"{{.*}}PrintFloat"(double %4)
+	// CHECK: %.stack = alloca i8, i64 16, align 8
+	// CHECK: call void @"main.(*Point).Scale"(ptr %.stack, double 2.000000e+00)
+	// CHECK: call void @"main.(*Point).Move"(ptr %.stack, double 3.000000e+00, double 4.000000e+00)
+	// CHECK: call void @"{{.*}}PrintFloat"(double %3)
 	// CHECK-NEXT: call void @"{{.*}}PrintByte"(i8 32)
-	// CHECK-NEXT: call void @"{{.*}}PrintFloat"(double %6)
+	// CHECK-NEXT: call void @"{{.*}}PrintFloat"(double %5)
 	// CHECK-NEXT: call void @"{{.*}}PrintByte"(i8 10)
 	// CHECK-NEXT: ret void
 	pt := &MyPoint{1, 2}

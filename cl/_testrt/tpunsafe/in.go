@@ -18,10 +18,12 @@ type M[T any] struct {
 
 // CHECK-LABEL: define void @main.main(){{.*}} {
 // CHECK-NEXT: _llgo_0:
-// CHECK-NEXT:   %0 = call ptr @"{{.*}}/runtime/internal/runtime.AllocZ"(i64 12)
-// CHECK-NEXT:   call void @"main.(*M[bool]).check"(ptr %0, i64 1, i64 8, i64 1)
-// CHECK-NEXT:   %1 = call ptr @"{{.*}}/runtime/internal/runtime.AllocZ"(i64 32)
-// CHECK-NEXT:   call void @"main.(*M[int64]).check"(ptr %1, i64 8, i64 16, i64 8)
+// CHECK-NEXT:   %.stack = alloca i8, i64 12, align 1
+// CHECK-NEXT:   call void @llvm.memset.p0.i64(ptr %.stack, i8 0, i64 12, i1 false)
+// CHECK-NEXT:   call void @"main.(*M[bool]).check"(ptr %.stack, i64 1, i64 8, i64 1)
+// CHECK-NEXT:   %.stack1 = alloca i8, i64 32, align 8
+// CHECK-NEXT:   call void @llvm.memset.p0.i64(ptr %.stack1, i8 0, i64 32, i1 false)
+// CHECK-NEXT:   call void @"main.(*M[int64]).check"(ptr %.stack1, i64 8, i64 16, i64 8)
 // CHECK-NEXT:   ret void
 // CHECK-NEXT: }
 func main() {
