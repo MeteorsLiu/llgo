@@ -3,6 +3,8 @@
 package escape
 
 import (
+	"math"
+	"sort"
 	"strings"
 
 	llabi "github.com/goplus/llgo/internal/abi"
@@ -26,40 +28,173 @@ type paramKey struct {
 	param int
 }
 
+type locationEdgeKind uint8
+
+const (
+	locationFlow locationEdgeKind = iota
+	locationDeref
+	locationHeap
+	locationMutator
+	locationCallee
+)
+
+type location struct {
+	value  llvm.Value
+	result int
+}
+
 type locationEdge struct {
-	from    llvm.Value
-	to      llvm.Value
-	operand int
+	to   location
+	kind locationEdgeKind
 }
 
 // locationGraph records diagnostic pointer flows but is never queried by the
 // optimization analyses.
 type locationGraph struct {
-	edges map[locationEdge]struct{}
+	edges map[location]map[locationEdge]struct{}
 }
 
 func newLocationGraph() locationGraph {
-	return locationGraph{edges: make(map[locationEdge]struct{})}
+	return locationGraph{edges: make(map[location]map[locationEdge]struct{})}
 }
 
-func (g *locationGraph) addUse(from llvm.Value, state useState) {
-	g.edges[locationEdge{from: from, to: state.user, operand: state.operand}] = struct{}{}
+func valueLocation(value llvm.Value) location {
+	return location{value: value, result: -1}
+}
+
+func resultLocation(fn llvm.Value, result int) location {
+	return location{value: fn, result: result}
+}
+
+func (g *locationGraph) add(from location, edge locationEdge) {
+	edges := g.edges[from]
+	if edges == nil {
+		edges = make(map[locationEdge]struct{})
+		g.edges[from] = edges
+	}
+	edges[edge] = struct{}{}
 }
 
 func (g *locationGraph) addFlow(from, to llvm.Value) {
-	g.edges[locationEdge{from: from, to: to, operand: -1}] = struct{}{}
+	g.add(valueLocation(from), locationEdge{to: valueLocation(to), kind: locationFlow})
+}
+
+func (g *locationGraph) addDeref(from, to llvm.Value) {
+	g.add(valueLocation(from), locationEdge{to: valueLocation(to), kind: locationDeref})
+}
+
+func (g *locationGraph) addHeap(from llvm.Value) {
+	g.add(valueLocation(from), locationEdge{kind: locationHeap})
+}
+
+func (g *locationGraph) addMutator(from llvm.Value) {
+	g.add(valueLocation(from), locationEdge{kind: locationMutator})
+}
+
+func (g *locationGraph) addCallee(from llvm.Value) {
+	g.add(valueLocation(from), locationEdge{kind: locationCallee})
+}
+
+func (g *locationGraph) addResult(from, fn llvm.Value, result int) {
+	g.add(valueLocation(from), locationEdge{to: resultLocation(fn, result), kind: locationFlow})
+}
+
+func (g *locationGraph) addCallResult(fn llvm.Value, result int, call llvm.Value) {
+	g.add(resultLocation(fn, result), locationEdge{to: valueLocation(call), kind: locationFlow})
+}
+
+const (
+	leakHeap = iota
+	leakMutator
+	leakCallee
+	leakResult0
+	numEscResults = 5
+)
+
+type leaks [leakResult0 + numEscResults]uint8
+
+func (l leaks) get(index int) int {
+	return int(l[index]) - 1
+}
+
+func (l *leaks) add(index, level int) {
+	if old := l.get(index); old >= 0 && old <= level {
+		return
+	}
+	value := level + 1
+	if value > math.MaxUint8 {
+		value = math.MaxUint8
+	}
+	l[index] = uint8(value)
+}
+
+func (l *leaks) optimize() {
+	heap := l.get(leakHeap)
+	if heap < 0 {
+		return
+	}
+	for index := leakMutator; index < len(l); index++ {
+		if l.get(index) >= heap {
+			l[index] = 0
+		}
+	}
+}
+
+func (g *locationGraph) summarize(root paramKey) leaks {
+	var summary leaks
+	start := valueLocation(root.fn.Param(root.param))
+	best := map[location]int{start: 0}
+	worklist := []location{start}
+
+	for len(worklist) != 0 {
+		current := worklist[len(worklist)-1]
+		worklist = worklist[:len(worklist)-1]
+		level := best[current]
+		for edge := range g.edges[current] {
+			switch edge.kind {
+			case locationFlow, locationDeref:
+				nextLevel := level
+				if edge.kind == locationDeref {
+					nextLevel++
+				}
+				if edge.to.result >= 0 && edge.to.value == root.fn {
+					if edge.to.result < numEscResults {
+						summary.add(leakResult0+edge.to.result, nextLevel)
+					}
+					continue
+				}
+				if old, ok := best[edge.to]; !ok || nextLevel < old {
+					best[edge.to] = nextLevel
+					worklist = append(worklist, edge.to)
+				}
+			case locationHeap:
+				summary.add(leakHeap, level)
+			case locationMutator:
+				summary.add(leakMutator, level)
+			case locationCallee:
+				summary.add(leakCallee, level)
+			}
+		}
+	}
+	summary.optimize()
+	return summary
 }
 
 type analyzer struct {
 	noCapture     map[paramKey]bool
 	noCaptureKeys []paramKey
-	locations     locationGraph
+	locations     *locationGraph
+	copies        *copyAnalysis
 }
 
-func newAnalyzer(mod llvm.Module) *analyzer {
+func newAnalyzer(mod llvm.Module, diagnostics bool) *analyzer {
 	a := &analyzer{
 		noCapture: make(map[paramKey]bool),
-		locations: newLocationGraph(),
+		copies:    newCopyAnalysis(mod),
+	}
+	if diagnostics {
+		locations := newLocationGraph()
+		a.locations = &locations
 	}
 	for fn := mod.FirstFunction(); !fn.IsNil(); fn = llvm.NextFunction(fn) {
 		if fn.IsDeclaration() || isRuntimeFunction(fn) {
@@ -117,7 +252,6 @@ func (a *analyzer) addUses(worklist *[]useState, value llvm.Value) {
 			if user.Operand(operand) == value {
 				state := useState{user: user, operand: operand}
 				*worklist = append(*worklist, state)
-				a.locations.addUse(value, state)
 			}
 		}
 	}
@@ -146,10 +280,9 @@ func (a *analyzer) checkForAllUses(root llvm.Value, classify func(useState) useA
 		visited[state] = struct{}{}
 
 		if state.user.InstructionOpcode() == llvm.Store && state.operand == 0 {
-			copies, ok := exactLocalCopies(state.user)
+			copies, ok := a.copies.getPotentialCopiesOfStoredValue(state.user)
 			if ok {
 				for _, copy := range copies {
-					a.locations.addFlow(state.user.Operand(0), copy)
 					a.addUses(&worklist, copy)
 				}
 				continue
@@ -168,37 +301,6 @@ func (a *analyzer) checkForAllUses(root llvm.Value, classify func(useState) useA
 
 func (a *analyzer) parameterNoCapture(key paramKey) bool {
 	return a.checkForAllUses(key.fn.Param(key.param), a.classifyNoCaptureUse)
-}
-
-func exactLocalCopies(store llvm.Value) ([]llvm.Value, bool) {
-	if store.IsVolatile() || store.Ordering() != llvm.AtomicOrderingNotAtomic {
-		return nil, false
-	}
-	slot := store.Operand(1).IsAAllocaInst()
-	if slot.IsNil() {
-		return nil, false
-	}
-
-	stores := 0
-	var copies []llvm.Value
-	for use := slot.FirstUse(); !use.IsNil(); use = use.NextUse() {
-		user := use.User()
-		switch {
-		case !user.IsAStoreInst().IsNil() && user.Operand(1) == slot:
-			stores++
-			if user != store || user.IsVolatile() || user.Ordering() != llvm.AtomicOrderingNotAtomic {
-				return nil, false
-			}
-		case !user.IsALoadInst().IsNil() && user.Operand(0) == slot:
-			if user.IsVolatile() || user.Ordering() != llvm.AtomicOrderingNotAtomic || !isPointer(user.Type()) {
-				return nil, false
-			}
-			copies = append(copies, user)
-		default:
-			return nil, false
-		}
-	}
-	return copies, stores == 1
 }
 
 func callCalleeOperand(call llvm.Value) int {
@@ -397,8 +499,162 @@ func (a *analyzer) callArgumentNoCapture(state useState) bool {
 		return false
 	}
 
-	a.locations.addFlow(call.Operand(state.operand), key.fn.Param(key.param))
 	return a.noCapture[key]
+}
+
+func (a *analyzer) recordLocations() {
+	for _, key := range a.noCaptureKeys {
+		a.recordParameterLocations(key)
+	}
+}
+
+func (a *analyzer) recordParameterLocations(root paramKey) {
+	worklist := make([]useState, 0, 8)
+	a.addUses(&worklist, root.fn.Param(root.param))
+	visited := make(map[useState]struct{})
+
+	for len(worklist) != 0 {
+		state := worklist[len(worklist)-1]
+		worklist = worklist[:len(worklist)-1]
+		if _, ok := visited[state]; ok {
+			continue
+		}
+		visited[state] = struct{}{}
+		from := state.user.Operand(state.operand)
+
+		if state.user.InstructionOpcode() == llvm.Store && state.operand == 0 {
+			copies, ok := a.copies.getPotentialCopiesOfStoredValue(state.user)
+			if ok {
+				for _, copy := range copies {
+					a.locations.addFlow(from, copy)
+					a.addUses(&worklist, copy)
+				}
+				continue
+			}
+		}
+
+		user := state.user
+		switch user.InstructionOpcode() {
+		case llvm.Load:
+			if state.operand == 0 && isPointer(user.Type()) {
+				a.locations.addDeref(from, user)
+				a.addUses(&worklist, user)
+			}
+		case llvm.Store:
+			if state.operand == 0 {
+				a.locations.addHeap(from)
+			} else if state.operand == 1 {
+				a.locations.addMutator(from)
+			}
+		case llvm.Call, llvm.Invoke:
+			calleeOperand := callCalleeOperand(user)
+			if state.operand == calleeOperand {
+				a.locations.addCallee(from)
+				continue
+			}
+			if callee, ok := definedCallParameter(user, state.operand); ok {
+				a.locations.addFlow(from, callee.fn.Param(callee.param))
+				if isPointer(user.Type()) {
+					a.locations.addCallResult(callee.fn, 0, user)
+					a.addUses(&worklist, user)
+				}
+				continue
+			}
+			fn := user.CalledValue().IsAFunction()
+			if fn.IsNil() || fn.IntrinsicID() == 0 || !intrinsicArgumentNoCapture(user, fn, state.operand) {
+				a.locations.addHeap(from)
+			}
+		case llvm.Ret:
+			a.locations.addResult(from, root.fn, 0)
+		case llvm.GetElementPtr:
+			if state.operand == 0 && user.Type().TypeKind() != llvm.VectorTypeKind {
+				a.locations.addFlow(from, user)
+				a.addUses(&worklist, user)
+			} else {
+				a.locations.addHeap(from)
+			}
+		case llvm.BitCast, llvm.PHI, opcodeAddrSpaceCast:
+			a.locations.addFlow(from, user)
+			a.addUses(&worklist, user)
+		case llvm.Select:
+			if state.operand == 1 || state.operand == 2 {
+				a.locations.addFlow(from, user)
+				a.addUses(&worklist, user)
+			} else {
+				a.locations.addHeap(from)
+			}
+		case opcodeFreeze:
+			if state.operand == 0 {
+				a.locations.addFlow(from, user)
+				a.addUses(&worklist, user)
+			} else {
+				a.locations.addHeap(from)
+			}
+		case opcodeAtomicRMW, opcodeAtomicCmpXchg:
+			if state.operand == 0 {
+				a.locations.addMutator(from)
+			} else {
+				a.locations.addHeap(from)
+			}
+		case llvm.VAArg:
+		default:
+			a.locations.addHeap(from)
+		}
+	}
+}
+
+// Result contains diagnostic facts computed independently from heap-to-stack
+// decisions.
+type Result struct {
+	Parameters []ParameterSummary
+}
+
+// ParameterSummary contains the Go-compatible leak summary for one LLVM formal
+// parameter.
+type ParameterSummary struct {
+	Function     string
+	Parameter    int
+	HeapLevel    int
+	MutatorLevel int
+	CalleeLevel  int
+	Results      []ResultLeak
+}
+
+// ResultLeak describes a parameter flow to one direct LLVM result.
+type ResultLeak struct {
+	Result int
+	Level  int
+}
+
+func (a *analyzer) result() Result {
+	if a.locations == nil {
+		return Result{}
+	}
+	result := Result{Parameters: make([]ParameterSummary, 0, len(a.noCaptureKeys))}
+	for _, key := range a.noCaptureKeys {
+		leaks := a.locations.summarize(key)
+		summary := ParameterSummary{
+			Function:     key.fn.Name(),
+			Parameter:    key.param,
+			HeapLevel:    leaks.get(leakHeap),
+			MutatorLevel: leaks.get(leakMutator),
+			CalleeLevel:  leaks.get(leakCallee),
+		}
+		for resultIndex := 0; resultIndex < numEscResults; resultIndex++ {
+			if level := leaks.get(leakResult0 + resultIndex); level >= 0 {
+				summary.Results = append(summary.Results, ResultLeak{Result: resultIndex, Level: level})
+			}
+		}
+		result.Parameters = append(result.Parameters, summary)
+	}
+	sort.Slice(result.Parameters, func(i, j int) bool {
+		left, right := result.Parameters[i], result.Parameters[j]
+		if left.Function != right.Function {
+			return left.Function < right.Function
+		}
+		return left.Parameter < right.Parameter
+	})
+	return result
 }
 
 func intrinsicArgumentNoCapture(call, fn llvm.Value, argument int) bool {
@@ -428,10 +684,16 @@ type allocationPlan struct {
 }
 
 // TransformModule analyzes eligible LLGo allocations and rewrites proven-local
-// AllocZ and AllocU calls.
-func TransformModule(mod llvm.Module) {
-	a := newAnalyzer(mod)
+// AllocZ and AllocU calls. Diagnostic summaries are computed only when
+// diagnostics is true.
+func TransformModule(mod llvm.Module, diagnostics bool) Result {
+	a := newAnalyzer(mod, diagnostics)
+	defer a.copies.dispose()
 	a.solveNoCapture()
+	if a.locations != nil {
+		a.recordLocations()
+	}
+	result := a.result()
 
 	var plans []allocationPlan
 	for fn := mod.FirstFunction(); !fn.IsNil(); fn = llvm.NextFunction(fn) {
@@ -451,6 +713,7 @@ func TransformModule(mod llvm.Module) {
 	for _, plan := range plans {
 		rewriteAllocation(mod.Context(), plan)
 	}
+	return result
 }
 
 func (a *analyzer) planAllocation(instr llvm.Value) (allocationPlan, bool) {
