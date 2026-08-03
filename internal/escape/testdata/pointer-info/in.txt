@@ -1,0 +1,106 @@
+target datalayout = "e-p:64:64-i64:64-n32:64-S128"
+
+%Pair = type { ptr, ptr }
+
+@escaped = global ptr null
+
+declare ptr @"github.com/goplus/llgo/runtime/internal/runtime.AllocU"(i64)
+
+define void @exact_field() {
+entry:
+  %root = call ptr @"github.com/goplus/llgo/runtime/internal/runtime.AllocU"(i64 8)
+  %object = alloca %Pair
+  %write = getelementptr %Pair, ptr %object, i32 0, i32 0
+  store ptr %root, ptr %write
+  %read = getelementptr %Pair, ptr %object, i32 0, i32 0
+  %q = load ptr, ptr %read
+  store i8 1, ptr %q
+  ret void
+}
+
+define void @disjoint_field() {
+entry:
+  %root = call ptr @"github.com/goplus/llgo/runtime/internal/runtime.AllocU"(i64 8)
+  %object = alloca %Pair
+  %first = getelementptr %Pair, ptr %object, i32 0, i32 0
+  store ptr %root, ptr %first
+  %second = getelementptr %Pair, ptr %object, i32 0, i32 1
+  store ptr null, ptr %second
+  %q = load ptr, ptr %second
+  store ptr %q, ptr @escaped
+  ret void
+}
+
+define void @overlapping_whole_read() {
+entry:
+  %root = call ptr @"github.com/goplus/llgo/runtime/internal/runtime.AllocU"(i64 8)
+  %object = alloca %Pair
+  %field = getelementptr %Pair, ptr %object, i32 0, i32 0
+  store ptr %root, ptr %field
+  %whole = load %Pair, ptr %object
+  %q = extractvalue %Pair %whole, 0
+  store ptr %q, ptr @escaped
+  ret void
+}
+
+define void @overwritten_before_read() {
+entry:
+  %root = call ptr @"github.com/goplus/llgo/runtime/internal/runtime.AllocU"(i64 8)
+  %object = alloca %Pair
+  %write = getelementptr %Pair, ptr %object, i32 0, i32 0
+  store ptr %root, ptr %write
+  store ptr null, ptr %write
+  %q = load ptr, ptr %write
+  store ptr %q, ptr @escaped
+  ret void
+}
+
+define void @unknown_offset(i64 %index) {
+entry:
+  %root = call ptr @"github.com/goplus/llgo/runtime/internal/runtime.AllocU"(i64 8)
+  %array = alloca [2 x ptr]
+  %element = getelementptr [2 x ptr], ptr %array, i64 0, i64 %index
+  store ptr %root, ptr %element
+  %q = load ptr, ptr %element
+  store i8 1, ptr %q
+  ret void
+}
+
+define void @undef_destination() {
+entry:
+  %root = call ptr @"github.com/goplus/llgo/runtime/internal/runtime.AllocU"(i64 8)
+  store ptr %root, ptr undef
+  ret void
+}
+
+define void @null_destination() {
+entry:
+  %root = call ptr @"github.com/goplus/llgo/runtime/internal/runtime.AllocU"(i64 8)
+  store ptr %root, ptr null
+  ret void
+}
+
+define void @null_pointer_valid() #0 {
+entry:
+  %root = call ptr @"github.com/goplus/llgo/runtime/internal/runtime.AllocU"(i64 8)
+  store ptr %root, ptr null
+  ret void
+}
+
+define void @unsupported_destination(ptr %destination) {
+entry:
+  %root = call ptr @"github.com/goplus/llgo/runtime/internal/runtime.AllocU"(i64 8)
+  store ptr %root, ptr %destination
+  ret void
+}
+
+define void @invalid_pointer_info() {
+entry:
+  %root = call ptr @"github.com/goplus/llgo/runtime/internal/runtime.AllocU"(i64 8)
+  %object = alloca ptr
+  store ptr %root, ptr %object
+  %address = ptrtoint ptr %object to i64
+  ret void
+}
+
+attributes #0 = { "null-pointer-is-valid" }

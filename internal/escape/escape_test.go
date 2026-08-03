@@ -22,6 +22,9 @@ func TestTransformModule(t *testing.T) {
 		if !entry.IsDir() {
 			continue
 		}
+		if entry.Name() == "pointer-info" {
+			continue
+		}
 		t.Run(entry.Name(), func(t *testing.T) {
 			dir := filepath.Join("testdata", entry.Name())
 			input := filepath.Join(dir, "in.txt")
