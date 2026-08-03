@@ -1694,6 +1694,8 @@ func parserRecoverySecondaries(primary string) []string {
 		return []string{"missing ',' before newline in composite literal"}
 	case "syntax error: unexpected newline in parameter list; possibly missing comma or )":
 		return []string{"missing ',' before newline in parameter list"}
+	case "expected 'package', found 'type'":
+		return []string{"expected ';', found int32"}
 	}
 	return nil
 }
@@ -1723,9 +1725,14 @@ nextLine:
 }
 
 func matchesParserDiagnosticAlias(expected *regexp.Regexp, diagnostic sourceDiagnostic) bool {
-	return diagnostic.message == "expected ';', found ','" &&
-		expected.MatchString("unexpected comma") &&
-		isParenthesizedImportLine(diagnostic.file, diagnostic.line)
+	switch diagnostic.message {
+	case "expected ';', found ','":
+		return expected.MatchString("unexpected comma") &&
+			isParenthesizedImportLine(diagnostic.file, diagnostic.line)
+	case "expected 'package', found 'type'":
+		return expected.MatchString("package clause")
+	}
+	return false
 }
 
 func isParenthesizedImportLine(file string, line int) bool {

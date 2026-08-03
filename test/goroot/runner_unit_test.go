@@ -805,6 +805,20 @@ func TestCheckExpectedErrorsScopesImportAlias(t *testing.T) {
 	}
 }
 
+func TestCheckExpectedErrorsMatchesMissingPackageClause(t *testing.T) {
+	file := filepath.Join(t.TempDir(), "case.go")
+	src := `type MyInt int32 // ERROR "package statement must be first|package clause"
+`
+	if err := os.WriteFile(file, []byte(src), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	output := file + ":1: expected 'package', found 'type'\n" +
+		file + ":1: expected ';', found int32"
+	if err := checkExpectedErrors(output, file, "case.go"); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestDiscardPairedParserDiagnosticsIsExactMultiset(t *testing.T) {
 	dir := t.TempDir()
 	fileA := filepath.Join(dir, "a", "case.go")

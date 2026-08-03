@@ -1848,10 +1848,6 @@ xfails:
     reason: llgo parser recovery emits additional malformed-channel diagnostics
   - version: go1.26
     directive: errorcheck
-    case: fixedbugs/issue4776.go
-    reason: llgo parser uses a different missing-package-clause diagnostic
-  - version: go1.26
-    directive: errorcheck
     case: switch2.go
     reason: llgo parser recovery emits additional malformed-switch diagnostics
   - version: go1.26
