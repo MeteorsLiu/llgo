@@ -160,6 +160,7 @@ type copyAnalysis struct {
 	infos     map[llvm.Value]*pointerInfo
 	states    map[llvm.Value]pointerInfoState
 	callSites map[llvm.Value][]llvm.Value
+	allCalls  map[llvm.Value]bool
 }
 
 func newCopyAnalysis(mod llvm.Module) *copyAnalysis {
@@ -169,6 +170,7 @@ func newCopyAnalysis(mod llvm.Module) *copyAnalysis {
 		infos:     make(map[llvm.Value]*pointerInfo),
 		states:    make(map[llvm.Value]pointerInfoState),
 		callSites: make(map[llvm.Value][]llvm.Value),
+		allCalls:  make(map[llvm.Value]bool),
 	}
 	for fn := mod.FirstFunction(); !fn.IsNil(); fn = llvm.NextFunction(fn) {
 		if fn.IsDeclaration() {
@@ -183,6 +185,15 @@ func newCopyAnalysis(mod llvm.Module) *copyAnalysis {
 				}
 			}
 		}
+	}
+	for fn := mod.FirstFunction(); !fn.IsNil(); fn = llvm.NextFunction(fn) {
+		linkage := fn.Linkage()
+		complete := linkage == llvm.InternalLinkage || linkage == llvm.PrivateLinkage
+		for use := fn.FirstUse(); complete && !use.IsNil(); use = use.NextUse() {
+			call := use.User().IsACallInst()
+			complete = !call.IsNil() && call.CalledValue() == fn
+		}
+		a.allCalls[fn] = complete
 	}
 	return a
 }
@@ -277,6 +288,9 @@ func (a *copyAnalysis) buildPointerInfo(root llvm.Value, info *pointerInfo) bool
 					}
 				case llvm.Ret:
 					fn := user.InstructionParent().Parent()
+					if !a.allCalls[fn] {
+						return false
+					}
 					for _, call := range a.callSites[fn] {
 						enqueue(call, valueOffsets)
 					}
@@ -300,12 +314,6 @@ func (a *copyAnalysis) buildPointerInfo(root llvm.Value, info *pointerInfo) bool
 					if !a.addCallAccesses(info, root, value, valueOffsets, user, operand) {
 						return false
 					}
-				case llvm.VAArg:
-				case opcodeFreeze:
-					if operand != 0 {
-						return false
-					}
-					enqueue(user, valueOffsets)
 				default:
 					return false
 				}

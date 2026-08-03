@@ -2,12 +2,14 @@ target datalayout = "e-p:64:64-i64:64-n32:64-S128"
 
 %Pair = type { ptr, ptr }
 %Nested = type { [2 x %Pair] }
+%Deep = type { [2 x [2 x ptr]] }
 
 @escaped = global ptr null
 @internal_copy_slot = internal global ptr null
 @internal_before_slot = internal global ptr null
 @private_slot = private global ptr null
 @thread_local_slot = internal thread_local global ptr null
+@constant_expr_slots = internal global [2 x ptr] zeroinitializer
 
 declare ptr @"github.com/goplus/llgo/runtime/internal/runtime.AllocU"(i64)
 declare noalias ptr @slot_alloc(i64)
@@ -28,10 +30,56 @@ entry:
   ret ptr %slot
 }
 
+define internal ptr @internal_return_slot(ptr %slot) {
+entry:
+  ret ptr %slot
+}
+
+define internal ptr @address_taken_return_slot(ptr %slot) {
+entry:
+  ret ptr %slot
+}
+
+@address_taken_return_slot_address = internal global ptr @address_taken_return_slot
+
 define void @read_slot(ptr %slot) {
 entry:
   %callee_q = load ptr, ptr %slot
   store i8 1, ptr %callee_q
+  ret void
+}
+
+define void @read_slot_twice(ptr %slot) {
+entry:
+  %q1 = load ptr, ptr %slot
+  %q2 = load ptr, ptr %slot
+  store i8 1, ptr %q1
+  store i8 2, ptr %q2
+  ret void
+}
+
+define void @read_pair(ptr %object) {
+entry:
+  %field0 = getelementptr %Pair, ptr %object, i32 0, i32 0
+  %q0 = load ptr, ptr %field0
+  %field1 = getelementptr %Pair, ptr %object, i32 0, i32 1
+  %q1 = load ptr, ptr %field1
+  store i8 1, ptr %q0
+  store i8 2, ptr %q1
+  ret void
+}
+
+define void @read_index(ptr %object, i64 %index) {
+entry:
+  %element = getelementptr [2 x ptr], ptr %object, i64 0, i64 %index
+  %indexed_q = load ptr, ptr %element
+  store i8 1, ptr %indexed_q
+  ret void
+}
+
+define void @overwrite_byval(ptr byval(ptr) %slot) {
+entry:
+  store ptr null, ptr %slot
   ret void
 }
 
@@ -294,6 +342,29 @@ entry:
   %object = alloca ptr
   store ptr %root, ptr %object
   %alias = call ptr @return_slot(ptr %object)
+  %q = load ptr, ptr %alias
+  store i8 1, ptr %q
+  ret void
+}
+
+define void @returned_internal_alias() {
+entry:
+  %root = call ptr @"github.com/goplus/llgo/runtime/internal/runtime.AllocU"(i64 8)
+  %object = alloca ptr
+  store ptr %root, ptr %object
+  %alias = call ptr @internal_return_slot(ptr %object)
+  %q = load ptr, ptr %alias
+  store i8 1, ptr %q
+  ret void
+}
+
+define void @returned_address_taken_alias() {
+entry:
+  %root = call ptr @"github.com/goplus/llgo/runtime/internal/runtime.AllocU"(i64 8)
+  %object = alloca ptr
+  store ptr %root, ptr %object
+  %fn = load ptr, ptr @address_taken_return_slot_address
+  %alias = call ptr %fn(ptr %object)
   %q = load ptr, ptr %alias
   store i8 1, ptr %q
   ret void
@@ -616,6 +687,155 @@ merge:
   %element = getelementptr [2 x ptr], ptr %array, i64 0, i64 %index
   store ptr %root, ptr %element
   %q = load ptr, ptr %element
+  ret void
+}
+
+define void @chained_constant_offsets() {
+entry:
+  %root = call ptr @"github.com/goplus/llgo/runtime/internal/runtime.AllocU"(i64 8)
+  %array = alloca [4 x ptr]
+  %base = getelementptr [4 x ptr], ptr %array, i64 0, i64 1
+  %write = getelementptr ptr, ptr %base, i64 1
+  store ptr %root, ptr %write
+  %read = getelementptr [4 x ptr], ptr %array, i64 0, i64 2
+  %q = load ptr, ptr %read
+  store i8 1, ptr %q
+  ret void
+}
+
+define void @chained_finite_offsets(i1 %condition) {
+entry:
+  %root = call ptr @"github.com/goplus/llgo/runtime/internal/runtime.AllocU"(i64 8)
+  %array = alloca [4 x ptr]
+  %index = select i1 %condition, i64 0, i64 1
+  %base = getelementptr [4 x ptr], ptr %array, i64 0, i64 %index
+  %element = getelementptr ptr, ptr %base, i64 1
+  store ptr %root, ptr %element
+  %q = load ptr, ptr %element
+  store i8 1, ptr %q
+  ret void
+}
+
+define void @nested_finite_offsets(i1 %left, i1 %right) {
+entry:
+  %root = call ptr @"github.com/goplus/llgo/runtime/internal/runtime.AllocU"(i64 8)
+  %object = alloca %Deep
+  %row = select i1 %left, i64 0, i64 1
+  %column = select i1 %right, i64 0, i64 1
+  %element = getelementptr %Deep, ptr %object, i64 0, i32 0, i64 %row, i64 %column
+  store ptr %root, ptr %element
+  %q = load ptr, ptr %element
+  store i8 1, ptr %q
+  ret void
+}
+
+define void @select_partial_overlap(i1 %condition) {
+entry:
+  %root = call ptr @"github.com/goplus/llgo/runtime/internal/runtime.AllocU"(i64 8)
+  %array = alloca [2 x ptr]
+  %element0 = getelementptr [2 x ptr], ptr %array, i64 0, i64 0
+  %element1 = getelementptr [2 x ptr], ptr %array, i64 0, i64 1
+  store ptr %root, ptr %element0
+  %selected = select i1 %condition, ptr %element0, ptr %element1
+  %q = load ptr, ptr %selected
+  store i8 1, ptr %q
+  ret void
+}
+
+define void @phi_partial_overlap(i1 %condition) {
+entry:
+  %root = call ptr @"github.com/goplus/llgo/runtime/internal/runtime.AllocU"(i64 8)
+  %array = alloca [2 x ptr]
+  %element0 = getelementptr [2 x ptr], ptr %array, i64 0, i64 0
+  %element1 = getelementptr [2 x ptr], ptr %array, i64 0, i64 1
+  store ptr %root, ptr %element0
+  br i1 %condition, label %left, label %right
+
+left:
+  br label %merge
+
+right:
+  br label %merge
+
+merge:
+  %selected = phi ptr [ %element0, %left ], [ %element1, %right ]
+  %q = load ptr, ptr %selected
+  store i8 1, ptr %q
+  ret void
+}
+
+define void @same_callee_loads() {
+entry:
+  %root = call ptr @"github.com/goplus/llgo/runtime/internal/runtime.AllocU"(i64 8)
+  %object = alloca ptr
+  store ptr %root, ptr %object
+  call void @read_slot_twice(ptr %object)
+  ret void
+}
+
+define void @different_callee_loads() {
+entry:
+  %root = call ptr @"github.com/goplus/llgo/runtime/internal/runtime.AllocU"(i64 8)
+  %object = alloca %Pair
+  %field0 = getelementptr %Pair, ptr %object, i32 0, i32 0
+  store ptr %root, ptr %field0
+  call void @read_pair(ptr %object)
+  ret void
+}
+
+define void @constant_callsite_index() {
+entry:
+  %root = call ptr @"github.com/goplus/llgo/runtime/internal/runtime.AllocU"(i64 8)
+  %object = alloca [2 x ptr]
+  %element = getelementptr [2 x ptr], ptr %object, i64 0, i64 1
+  store ptr %root, ptr %element
+  call void @read_index(ptr %object, i64 1)
+  ret void
+}
+
+define void @arithmetic_index() {
+entry:
+  %root = call ptr @"github.com/goplus/llgo/runtime/internal/runtime.AllocU"(i64 8)
+  %object = alloca [2 x ptr]
+  %index = add i64 0, 1
+  %element = getelementptr [2 x ptr], ptr %object, i64 0, i64 %index
+  store ptr %root, ptr %element
+  %q = load ptr, ptr %element
+  store i8 1, ptr %q
+  ret void
+}
+
+define void @loaded_index() {
+entry:
+  %root = call ptr @"github.com/goplus/llgo/runtime/internal/runtime.AllocU"(i64 8)
+  %object = alloca [2 x ptr]
+  %index_address = alloca i64
+  store i64 1, ptr %index_address
+  %index = load i64, ptr %index_address
+  %element = getelementptr [2 x ptr], ptr %object, i64 0, i64 %index
+  store ptr %root, ptr %element
+  %q = load ptr, ptr %element
+  store i8 1, ptr %q
+  ret void
+}
+
+define void @constant_expr_destination() {
+entry:
+  %root = call ptr @"github.com/goplus/llgo/runtime/internal/runtime.AllocU"(i64 8)
+  store ptr %root, ptr getelementptr ([2 x ptr], ptr @constant_expr_slots, i64 0, i64 1)
+  %q = load ptr, ptr getelementptr ([2 x ptr], ptr @constant_expr_slots, i64 0, i64 1)
+  store i8 1, ptr %q
+  ret void
+}
+
+define void @byval_write_isolated() {
+entry:
+  %root = call ptr @"github.com/goplus/llgo/runtime/internal/runtime.AllocU"(i64 8)
+  %object = alloca ptr
+  store ptr %root, ptr %object
+  call void @overwrite_byval(ptr byval(ptr) %object)
+  %q = load ptr, ptr %object
+  store i8 1, ptr %q
   ret void
 }
 

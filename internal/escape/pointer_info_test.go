@@ -54,8 +54,10 @@ func TestPotentialCopiesOfRoot(t *testing.T) {
 		{function: "phi_destination", wantOK: true, wantCopies: []string{"q1", "q2"}},
 		{function: "loop_invariant_phi", wantOK: true, wantCopies: []string{"q"}},
 		{function: "loop_variant_phi"},
-		{function: "frozen_reader", wantOK: true, wantCopies: []string{"q"}},
-		{function: "returned_alias", wantOK: true, wantCopies: []string{"q"}},
+		{function: "frozen_reader"},
+		{function: "returned_alias"},
+		{function: "returned_internal_alias", wantOK: true, wantCopies: []string{"q"}},
+		{function: "returned_address_taken_alias"},
 		{function: "nested_object_copy", wantOK: true, wantCopies: []string{"q"}},
 		// Supported stack, global, thread-local, and noalias allocation objects.
 		{function: "internal_global_copy", wantOK: true, wantCopies: []string{"q"}},
@@ -87,9 +89,22 @@ func TestPotentialCopiesOfRoot(t *testing.T) {
 		{function: "variadic_callee"},
 		{function: "atomicrmw_reader"},
 		{function: "cmpxchg_reader"},
-		{function: "vaarg_ignored", wantOK: true},
+		{function: "vaarg_ignored"},
 		{function: "finite_select_offset"},
 		{function: "finite_phi_offset"},
+		// Offset sets and interprocedural patterns adapted from LLVM 19 PointerInfo tests.
+		{function: "chained_constant_offsets", wantOK: true, wantCopies: []string{"q"}},
+		{function: "chained_finite_offsets"},
+		{function: "nested_finite_offsets"},
+		{function: "select_partial_overlap", wantOK: true, wantCopies: []string{"q"}},
+		{function: "phi_partial_overlap", wantOK: true, wantCopies: []string{"q"}},
+		{function: "same_callee_loads", wantOK: true, wantCopies: []string{"q1", "q2"}},
+		{function: "different_callee_loads", wantOK: true, wantCopies: []string{"q0"}},
+		{function: "constant_callsite_index"},
+		{function: "arithmetic_index"},
+		{function: "loaded_index"},
+		{function: "constant_expr_destination"},
+		{function: "byval_write_isolated", wantOK: true, wantCopies: []string{"q"}},
 	}
 	for _, test := range tests {
 		t.Run(test.function, func(t *testing.T) {

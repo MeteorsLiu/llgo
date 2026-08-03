@@ -20,7 +20,6 @@ const (
 	opcodeAtomicCmpXchg = llvm.Opcode(56)
 	opcodeAtomicRMW     = llvm.Opcode(57)
 	opcodeAddrSpaceCast = llvm.Opcode(60)
-	opcodeFreeze        = llvm.Opcode(68)
 )
 
 type paramKey struct {
@@ -355,10 +354,6 @@ func (a *analyzer) classifyNoCaptureUse(state useState) useAction {
 		if state.operand == 1 || state.operand == 2 {
 			return useFollow
 		}
-	case opcodeFreeze:
-		if state.operand == 0 {
-			return useFollow
-		}
 	}
 	return useCapture
 }
@@ -399,10 +394,6 @@ func (a *analyzer) requiredAlignment(root paramKey) int {
 				return useFollow
 			case llvm.Select:
 				if state.operand == 1 || state.operand == 2 {
-					return useFollow
-				}
-			case opcodeFreeze:
-				if state.operand == 0 {
 					return useFollow
 				}
 			case opcodeAtomicCmpXchg, opcodeAtomicRMW:
@@ -451,24 +442,6 @@ func (a *analyzer) allocationUses(root llvm.Value) walkResult {
 		case llvm.Select:
 			if state.operand == 1 || state.operand == 2 {
 				return useFollow
-			}
-		case opcodeFreeze:
-			if state.operand == 0 {
-				return useFollow
-			}
-		case opcodeAtomicCmpXchg:
-			if state.operand == 0 {
-				if user.Alignment() > result.alignment {
-					result.alignment = user.Alignment()
-				}
-				return useSafe
-			}
-		case opcodeAtomicRMW:
-			if state.operand == 0 {
-				if user.Alignment() > result.alignment {
-					result.alignment = user.Alignment()
-				}
-				return useSafe
 			}
 		}
 		return useCapture
@@ -578,13 +551,6 @@ func (a *analyzer) recordParameterLocations(root paramKey) {
 			a.addUses(&worklist, user)
 		case llvm.Select:
 			if state.operand == 1 || state.operand == 2 {
-				a.locations.addFlow(from, user)
-				a.addUses(&worklist, user)
-			} else {
-				a.locations.addHeap(from)
-			}
-		case opcodeFreeze:
-			if state.operand == 0 {
 				a.locations.addFlow(from, user)
 				a.addUses(&worklist, user)
 			} else {

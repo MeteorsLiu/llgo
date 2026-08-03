@@ -74,18 +74,18 @@ entry:
 
 define void @atomic_addresses() {
 entry:
-  %p.stack = alloca i8, i64 8, align 4
-  store atomic i32 1, ptr %p.stack monotonic, align 4
-  %v = load atomic i32, ptr %p.stack monotonic, align 4
-  %cx = cmpxchg ptr %p.stack, i32 %v, i32 2 monotonic monotonic, align 4
-  %rmw = atomicrmw add ptr %p.stack, i32 1 monotonic, align 4
+  %p = call ptr @"github.com/goplus/llgo/runtime/internal/runtime.AllocU"(i64 8)
+  store atomic i32 1, ptr %p monotonic, align 4
+  %v = load atomic i32, ptr %p monotonic, align 4
+  %cx = cmpxchg ptr %p, i32 %v, i32 2 monotonic monotonic, align 4
+  %rmw = atomicrmw add ptr %p, i32 1 monotonic, align 4
   ret void
 }
 
 define void @freeze_value() {
 entry:
-  %p.stack = alloca i8, i64 8, align 1
-  %q = freeze ptr %p.stack
+  %p = call ptr @"github.com/goplus/llgo/runtime/internal/runtime.AllocU"(i64 8)
+  %q = freeze ptr %p
   store i8 7, ptr %q, align 1
   ret void
 }

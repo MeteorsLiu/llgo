@@ -71,3 +71,45 @@ entry:
   store i8 1, ptr %p
   ret void
 }
+
+define void @negative_size() {
+entry:
+  %p = call ptr @"github.com/goplus/llgo/runtime/internal/runtime.AllocU"(i64 -1)
+  store i8 1, ptr %p
+  ret void
+}
+
+define i32 @irreducible_cfg(i32 %arg) {
+entry:
+  %p = call ptr @"github.com/goplus/llgo/runtime/internal/runtime.AllocU"(i64 4)
+  store i32 10, ptr %p
+  %condition = icmp eq i32 %arg, 1
+  br i1 %condition, label %left, label %right
+
+left:
+  %left_value = add nsw i32 %arg, 5
+  br label %loop_latch
+
+right:
+  br label %loop_header
+
+loop_header:
+  %current = phi i32 [ %next, %loop_latch ], [ 1, %right ]
+  %value = load i32, ptr %p
+  %decrement = add nsw i32 %value, -1
+  store i32 %decrement, ptr %p
+  %again = icmp ne i32 %value, 0
+  br i1 %again, label %continue, label %exit
+
+continue:
+  br label %loop_latch
+
+loop_latch:
+  %iteration = phi i32 [ %left_value, %left ], [ %current, %continue ]
+  %next = add nsw i32 %iteration, 1
+  br label %loop_header
+
+exit:
+  %result = load i32, ptr %p
+  ret i32 %result
+}
