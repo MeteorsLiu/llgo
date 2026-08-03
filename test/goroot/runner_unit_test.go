@@ -660,7 +660,7 @@ var _ = 0 // ERROR "mantissa requires a 'p' exponent"
 	}
 }
 
-func TestCheckExpectedErrorsDiscardsPairedMissingCommaDiagnostics(t *testing.T) {
+func TestCheckExpectedErrorsDiscardsPairedParserDiagnostics(t *testing.T) {
 	tests := []struct {
 		name      string
 		source    string
@@ -689,6 +689,15 @@ func f(x int /* // GC_ERROR "unexpected newline"
 			line:      2,
 			primary:   "syntax error: unexpected newline in parameter list; possibly missing comma or )",
 			secondary: "missing ',' before newline in parameter list",
+		},
+		{
+			name: "EOF after function literal",
+			source: `package p
+var f = func() { // ERROR "unexpected EOF|expected .*}.*"
+`,
+			line:      2,
+			primary:   "syntax error: unexpected EOF, expected }",
+			secondary: "expected ';', found 'EOF'",
 		},
 	}
 	for _, tt := range tests {

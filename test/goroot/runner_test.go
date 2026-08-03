@@ -1694,6 +1694,8 @@ func parserRecoverySecondaries(primary string) []string {
 		return []string{"missing ',' before newline in composite literal"}
 	case "syntax error: unexpected newline in parameter list; possibly missing comma or )":
 		return []string{"missing ',' before newline in parameter list"}
+	case "syntax error: unexpected EOF, expected }":
+		return []string{"expected ';', found 'EOF'"}
 	}
 	return nil
 }
