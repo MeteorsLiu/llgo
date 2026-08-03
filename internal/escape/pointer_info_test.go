@@ -32,6 +32,7 @@ func TestPotentialCopiesOfRoot(t *testing.T) {
 		wantOK     bool
 		wantCopies []string
 	}{
+		// Exact memory matching and conservative failures.
 		{function: "exact_field", wantOK: true, wantCopies: []string{"q"}},
 		{function: "disjoint_field", wantOK: true},
 		{function: "overlapping_whole_read"},
@@ -42,6 +43,53 @@ func TestPotentialCopiesOfRoot(t *testing.T) {
 		{function: "null_pointer_valid"},
 		{function: "unsupported_destination"},
 		{function: "invalid_pointer_info"},
+		// Address derivation through aggregate fields, casts, merges, and returned aliases.
+		{function: "direct_slot", wantOK: true, wantCopies: []string{"q"}},
+		{function: "array_element", wantOK: true, wantCopies: []string{"q"}},
+		{function: "vector_element", wantOK: true, wantCopies: []string{"q"}},
+		{function: "nested_field", wantOK: true, wantCopies: []string{"q"}},
+		{function: "bitcast_destination", wantOK: true, wantCopies: []string{"q"}},
+		{function: "addrspacecast_destination", wantOK: true, wantCopies: []string{"q"}},
+		{function: "selected_destination", wantOK: true, wantCopies: []string{"q1", "q2"}},
+		{function: "phi_destination", wantOK: true, wantCopies: []string{"q1", "q2"}},
+		{function: "loop_invariant_phi", wantOK: true, wantCopies: []string{"q"}},
+		{function: "loop_variant_phi"},
+		{function: "frozen_reader", wantOK: true, wantCopies: []string{"q"}},
+		{function: "returned_alias", wantOK: true, wantCopies: []string{"q"}},
+		{function: "nested_object_copy", wantOK: true, wantCopies: []string{"q"}},
+		// Supported stack, global, thread-local, and noalias allocation objects.
+		{function: "internal_global_copy", wantOK: true, wantCopies: []string{"q"}},
+		{function: "private_global_copy", wantOK: true, wantCopies: []string{"q"}},
+		{function: "noalias_object_copy", wantOK: true, wantCopies: []string{"q"}},
+		{function: "noalias_object_field_copy", wantOK: true, wantCopies: []string{"q"}},
+		{function: "callsite_noalias_object_copy", wantOK: true, wantCopies: []string{"q"}},
+		{function: "read_before_store", wantOK: true, wantCopies: []string{"before"}},
+		{function: "read_before_store_norecurse", wantOK: true},
+		{function: "global_read_before_store", wantOK: true, wantCopies: []string{"before"}},
+		{function: "thread_local_read_before_store", wantOK: true},
+		// Interprocedural and modeled memory-access behavior.
+		{function: "defined_callee_reader", wantOK: true, wantCopies: []string{"callee_q"}},
+		{function: "defined_callee_field_reader", wantOK: true, wantCopies: []string{"callee_q"}},
+		{function: "defined_callee_finite_offset"},
+		{function: "defined_callee_unknown_offset"},
+		// TODO: LLGo currently emits calls, not invokes. Enable this when invoke enters generated IR.
+		// {function: "invoke_callee_reader", wantOK: true, wantCopies: []string{"callee_q"}},
+		{function: "lifetime_ignored", wantOK: true, wantCopies: []string{"q"}},
+		{function: "memcpy_reader"},
+		{function: "memmove_reader"},
+		{function: "memset_overwrite", wantOK: true},
+		{function: "callee_readnone", wantOK: true, wantCopies: []string{"q"}},
+		{function: "callsite_readnone", wantOK: true, wantCopies: []string{"q"}},
+		{function: "callee_readonly"},
+		{function: "callee_readwrite"},
+		{function: "callee_capture"},
+		{function: "invalid_defined_callee"},
+		{function: "variadic_callee"},
+		{function: "atomicrmw_reader"},
+		{function: "cmpxchg_reader"},
+		{function: "vaarg_ignored", wantOK: true},
+		{function: "finite_select_offset"},
+		{function: "finite_phi_offset"},
 	}
 	for _, test := range tests {
 		t.Run(test.function, func(t *testing.T) {

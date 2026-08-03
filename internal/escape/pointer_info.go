@@ -295,7 +295,8 @@ func (a *copyAnalysis) buildPointerInfo(root llvm.Value, info *pointerInfo) bool
 					}
 					kind := accessRead | accessWrite | a.accessCertainty(root, value)
 					a.addAccess(info, user, user, valueOffsets, int64(a.td.TypeStoreSize(user.Operand(1).Type())), kind)
-				case llvm.Call, llvm.Invoke:
+				// TODO: Handle llvm.Invoke if LLGo starts emitting it.
+				case llvm.Call:
 					if !a.addCallAccesses(info, root, value, valueOffsets, user, operand) {
 						return false
 					}
