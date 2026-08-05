@@ -623,16 +623,16 @@ func diagnosticFileLine(pos string) (file string, line int, ok bool) {
 	return prefix, last, true
 }
 
+// go list reports compiler and child-tool failures as ListError. For example,
+// an assembler failure names asm.s even though only asm.go is in
+// CompiledGoFiles. Restricting positioned diagnostics to CompiledGoFiles keeps
+// child-tool failures from being mistaken for Go frontend diagnostics.
 func hasGoSourceListDiagnostics(errs []packages.Error, compiledGoFiles []string) bool {
 	for _, err := range errs {
 		if err.Kind != packages.ListError || !strings.HasPrefix(err.Msg, "# ") {
 			continue
 		}
-		_, diagnostics, ok := strings.Cut(err.Msg, "\n")
-		if !ok {
-			continue
-		}
-		for _, diagnostic := range strings.Split(diagnostics, "\n") {
+		for diagnostic := range strings.Lines(err.Msg) {
 			pos, _, ok := strings.Cut(diagnostic, ": ")
 			if !ok {
 				continue
@@ -651,6 +651,10 @@ func hasGoSourceListDiagnostics(errs []packages.Error, compiledGoFiles []string)
 	return false
 }
 
+// sameDiagnosticFile accepts relative suffixes because go list diagnostics may
+// shorten an absolute CompiledGoFiles path. For example, example/load.go
+// matches /tmp/project/example/load.go. Requiring a path separator before the
+// suffix prevents load.go from matching myload.go.
 func sameDiagnosticFile(left, right string) bool {
 	left = filepath.Clean(left)
 	right = filepath.Clean(right)
