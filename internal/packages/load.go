@@ -623,10 +623,16 @@ func diagnosticFileLine(pos string) (file string, line int, ok bool) {
 	return prefix, last, true
 }
 
-// go list reports compiler and child-tool failures as ListError. For example,
-// an assembler failure names asm.s even though only asm.go is in
-// CompiledGoFiles. Restricting positioned diagnostics to CompiledGoFiles keeps
-// child-tool failures from being mistaken for Go frontend diagnostics.
+// hasGoSourceListDiagnostics reports whether go list returned a positioned
+// ListError for one of the package's compiled Go files. For example:
+//
+//	# example.com/p
+//	load.go:2: undefined: missing
+//
+// The caller treats that go list block as authoritative and suppresses local
+// parser/type follow-on errors. The CompiledGoFiles check matters because go
+// list also forwards child-tool failures: an asm.s diagnostic must not match a
+// package whose compiled Go source is asm.go.
 func hasGoSourceListDiagnostics(errs []packages.Error, compiledGoFiles []string) bool {
 	for _, err := range errs {
 		if err.Kind != packages.ListError || !strings.HasPrefix(err.Msg, "# ") {
