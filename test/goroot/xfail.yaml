@@ -1820,6 +1820,18 @@ flakes:
 xfails:
   - version: go1.26
     directive: errorcheck
+    case: fixedbugs/bug299.go
+    reason: preload traverses a malformed parenthesized receiver AST and panics before the authoritative go list diagnostics are emitted
+  - version: go1.26
+    directive: errorcheck
+    case: fixedbugs/issue20789.go
+    reason: preload traverses a parser-recovery receiver AST and panics before the authoritative go list diagnostic is emitted
+  - version: go1.26
+    directive: errorcheck
+    case: fixedbugs/issue5089.go
+    reason: preload assumes the non-local selector receiver is a local named type and panics before the authoritative go list diagnostic is emitted
+  - version: go1.26
+    directive: errorcheck
     case: fixedbugs/issue4776.go
     reason: llgo parser uses a different missing-package-clause diagnostic
   - version: go1.26
