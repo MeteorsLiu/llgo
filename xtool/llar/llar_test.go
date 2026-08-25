@@ -60,8 +60,8 @@ func TestInstall(t *testing.T) {
 	if len(result.Deps) != 1 || result.Deps[0].Path != "owner/dep" {
 		t.Fatalf("deps = %+v", result.Deps)
 	}
-	if result.PkgConfig != "-L/tmp/root/lib -lroot" {
-		t.Fatalf("pkg-config = %q", result.PkgConfig)
+	if result.BuildFlags != "-L/tmp/root/lib -lroot" {
+		t.Fatalf("build flags = %q", result.BuildFlags)
 	}
 	if !strings.Contains(rawStdout.String(), `"path":"owner/root"`) {
 		t.Fatalf("stdout = %q, want JSON result", rawStdout.String())
@@ -133,8 +133,8 @@ func TestInstallReturnsJSONError(t *testing.T) {
 func TestResultJSONRoundTrip(t *testing.T) {
 	want := Result{
 		Path: "owner/root", Version: "v1.0.0", Dir: "/tmp/root",
-		Deps:      []Dependency{{Path: "owner/dep", Version: "v1.0.0", Dir: "/tmp/dep"}},
-		PkgConfig: "-lroot",
+		Deps:       []Dependency{{Path: "owner/dep", Version: "v1.0.0", Dir: "/tmp/dep"}},
+		BuildFlags: "-lroot",
 	}
 	data, err := json.Marshal(want)
 	if err != nil {
@@ -144,7 +144,7 @@ func TestResultJSONRoundTrip(t *testing.T) {
 	if err := json.Unmarshal(data, &got); err != nil {
 		t.Fatal(err)
 	}
-	if got.Path != want.Path || got.Version != want.Version || got.Dir != want.Dir || got.PkgConfig != want.PkgConfig || len(got.Deps) != 1 {
+	if got.Path != want.Path || got.Version != want.Version || got.Dir != want.Dir || got.BuildFlags != want.BuildFlags || len(got.Deps) != 1 {
 		t.Fatalf("round trip = %+v, want %+v", got, want)
 	}
 }

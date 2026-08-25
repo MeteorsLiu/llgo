@@ -55,11 +55,11 @@ type Dependency struct {
 
 // Result is the JSON result returned by llar install.
 type Result struct {
-	Path      string       `json:"path"`
-	Version   string       `json:"version"`
-	Dir       string       `json:"dir"`
-	Deps      []Dependency `json:"deps,omitempty"`
-	PkgConfig string       `json:"metadata"`
+	Path       string       `json:"path"`
+	Version    string       `json:"version"`
+	Dir        string       `json:"dir"`
+	Deps       []Dependency `json:"deps,omitempty"`
+	BuildFlags string       `json:"metadata"`
 }
 
 // Install runs llar install for mod and decodes the command's JSON result.
