@@ -1,6 +1,7 @@
 package llar
 
 import (
+	"bytes"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -15,6 +16,7 @@ func writeFakeLLAR(t *testing.T, output string) (bin, argsFile string) {
 	argsFile = filepath.Join(dir, "args")
 	script := "#!/bin/sh\n" +
 		"printf '%s\\n' \"$@\" > \"$LLAR_TEST_ARGS\"\n" +
+		"printf '%s\\n' 'progress' >&2\n" +
 		"printf '%s\\n' '" + output + "'\n"
 	if err := os.WriteFile(bin, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
@@ -35,7 +37,11 @@ func readArgs(t *testing.T, path string) []string {
 func TestInstall(t *testing.T) {
 	bin, argsFile := writeFakeLLAR(t, `{"path":"owner/root","version":"v1.2.3","dir":"/tmp/root","deps":[{"path":"owner/dep","version":"v1.0.0","dir":"/tmp/dep"}],"metadata":"-L/tmp/root/lib -lroot"}`)
 
-	result, err := New(bin, true).Install(Module{Path: "owner/root", Version: "v1.2.3"}, Config{
+	var rawStdout, rawStderr bytes.Buffer
+	cmd := New(bin)
+	cmd.Stdout = &rawStdout
+	cmd.Stderr = &rawStderr
+	result, err := cmd.Install(Module{Path: "owner/root", Version: "v1.2.3"}, Config{
 		To:   "/tmp/root",
 		OS:   "linux",
 		Arch: "amd64",
@@ -56,6 +62,12 @@ func TestInstall(t *testing.T) {
 	}
 	if result.Metadata != "-L/tmp/root/lib -lroot" {
 		t.Fatalf("metadata = %q", result.Metadata)
+	}
+	if !strings.Contains(rawStdout.String(), `"path":"owner/root"`) {
+		t.Fatalf("stdout = %q, want JSON result", rawStdout.String())
+	}
+	if rawStderr.String() != "progress\n" {
+		t.Fatalf("stderr = %q, want progress output", rawStderr.String())
 	}
 
 	wantArgs := []string{
@@ -80,7 +92,7 @@ func TestInstall(t *testing.T) {
 
 func TestInstallWithoutOutput(t *testing.T) {
 	bin, argsFile := writeFakeLLAR(t, `{"path":"owner/root","version":"v1.0.0","metadata":"-lroot"}`)
-	if _, err := New(bin, false).Install(Module{Path: "owner/root", Version: "v1.0.0"}, Config{}); err != nil {
+	if _, err := New(bin).Install(Module{Path: "owner/root", Version: "v1.0.0"}, Config{}); err != nil {
 		t.Fatalf("Install() error = %v", err)
 	}
 
@@ -104,7 +116,7 @@ func TestInstallReturnsCommandError(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	_, err := New(bin, false).Install(Module{Path: "owner/root"}, Config{To: t.TempDir()})
+	_, err := New(bin).Install(Module{Path: "owner/root"}, Config{To: t.TempDir()})
 	if err == nil || !strings.Contains(err.Error(), "install failed") || !strings.Contains(err.Error(), "exit status 7") {
 		t.Fatalf("error = %v", err)
 	}
@@ -112,7 +124,7 @@ func TestInstallReturnsCommandError(t *testing.T) {
 
 func TestInstallReturnsJSONError(t *testing.T) {
 	bin, _ := writeFakeLLAR(t, "not-json")
-	_, err := New(bin, false).Install(Module{Path: "owner/root"}, Config{})
+	_, err := New(bin).Install(Module{Path: "owner/root"}, Config{})
 	if err == nil || !strings.Contains(err.Error(), "decode result") {
 		t.Fatalf("error = %v", err)
 	}

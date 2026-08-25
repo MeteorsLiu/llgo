@@ -10,7 +10,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"os"
 	"os/exec"
 	"sort"
 	"strings"
@@ -18,16 +17,18 @@ import (
 
 // Cmd represents an llar command.
 type Cmd struct {
-	bin     string
-	verbose bool
+	bin string
+
+	Stdout io.Writer
+	Stderr io.Writer
 }
 
 // New creates an llar command wrapper. An empty bin uses llar from PATH.
-func New(bin string, verbose bool) *Cmd {
+func New(bin string) *Cmd {
 	if bin == "" {
 		bin = "llar"
 	}
-	return &Cmd{bin: bin, verbose: verbose}
+	return &Cmd{bin: bin}
 }
 
 // Module identifies an llar module to install.
@@ -67,7 +68,7 @@ func (p *Cmd) Install(mod Module, config Config) (Result, error) {
 	if config.To != "" {
 		args = append(args, "--output", config.To)
 	}
-	if p.verbose {
+	if p.Stderr != nil {
 		args = append(args, "--verbose")
 	}
 	if config.OS != "" {
@@ -98,12 +99,14 @@ func (p *Cmd) Install(mod Module, config Config) (Result, error) {
 
 	var stdout, stderr bytes.Buffer
 	cmd := exec.Command(p.bin, args...)
-	cmd.Stdout = &stdout
-	var stderrWriter io.Writer = &stderr
-	if p.verbose {
-		stderrWriter = io.MultiWriter(&stderr, os.Stderr)
+	cmd.Stdout = io.Writer(&stdout)
+	if p.Stdout != nil {
+		cmd.Stdout = io.MultiWriter(&stdout, p.Stdout)
 	}
-	cmd.Stderr = stderrWriter
+	cmd.Stderr = io.Writer(&stderr)
+	if p.Stderr != nil {
+		cmd.Stderr = io.MultiWriter(&stderr, p.Stderr)
+	}
 	if err := cmd.Run(); err != nil {
 		if message := strings.TrimSpace(stderr.String()); message != "" {
 			return Result{}, fmt.Errorf("llar install: %w: %s", err, message)
