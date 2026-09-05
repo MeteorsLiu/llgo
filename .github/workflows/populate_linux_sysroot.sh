@@ -16,6 +16,9 @@ cat > "${POPULATE_LINUX_SYSROOT_SCRIPT}" << EOF
 
 export DEBIAN_FRONTEND=noninteractive
 
+# Bullseye's security repository is no longer available on the primary mirror.
+sed -i '/bullseye-security/d' /etc/apt/sources.list
+
 apt-get update
 apt-get install -y build-essential zlib1g-dev rsync
 
