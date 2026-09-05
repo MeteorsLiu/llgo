@@ -16,8 +16,13 @@ cat > "${POPULATE_LINUX_SYSROOT_SCRIPT}" << EOF
 
 export DEBIAN_FRONTEND=noninteractive
 
-# Bullseye's security repository is no longer available on the primary mirror.
-sed -i '/bullseye-security/d' /etc/apt/sources.list
+# Use one immutable Bullseye snapshot so package indexes and .deb files stay
+# consistent after Bullseye's security packages leave the live mirror.
+printf '%s\n' \
+	'deb [check-valid-until=no] http://snapshot.debian.org/archive/debian/20260824T000000Z bullseye main' \
+	'deb [check-valid-until=no] http://snapshot.debian.org/archive/debian/20260824T000000Z bullseye-updates main' \
+	'deb [check-valid-until=no] http://snapshot.debian.org/archive/debian-security/20260824T000000Z bullseye-security main' \
+	> /etc/apt/sources.list
 
 apt-get update
 apt-get install -y build-essential zlib1g-dev rsync
