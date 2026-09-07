@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2024 The GoPlus Authors (goplus.org). All rights reserved.
+ * Copyright (c) 2024 The XGo Authors (xgo.dev). All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -20,21 +20,41 @@ import (
 	"fmt"
 	"go/token"
 	"go/types"
-	"sync"
+	"reflect"
 	"unsafe"
 )
 
 // -----------------------------------------------------------------------------
 
 type goTypes struct {
-	typs  map[unsafe.Pointer]unsafe.Pointer
-	typbg sync.Map
+	// typs and cvtneed are owned by the single lowering goroutine for one
+	// Program. packageSyntax is prepared before backend lowering and shared
+	// read-only by Programs with independent LLVM contexts.
+	typs          map[unsafe.Pointer]unsafe.Pointer
+	cvtneed       map[*types.Named]conversionRequirement
+	packageSyntax *packageSyntaxData
 }
 
-func newGoTypes() goTypes {
+func newGoTypes(syntax ...*packageSyntaxData) goTypes {
+	packageSyntax := newPackageSyntaxData()
+	if len(syntax) != 0 && syntax[0] != nil {
+		packageSyntax = syntax[0]
+	}
 	typs := make(map[unsafe.Pointer]unsafe.Pointer)
-	return goTypes{typs: typs}
+	return goTypes{
+		typs:          typs,
+		cvtneed:       make(map[*types.Named]conversionRequirement),
+		packageSyntax: packageSyntax,
+	}
 }
+
+type conversionRequirement uint8
+
+const (
+	conversionUnknown conversionRequirement = iota
+	conversionNotNeeded
+	conversionNeeded
+)
 
 type Background int
 
@@ -43,12 +63,16 @@ const (
 	InGo
 	InC
 	InPython
+	InStdcall
 )
 
 // Type convert a Go/C type into raw type.
 // C type = raw type
 // Go type: convert to raw type (because of closure)
 func (p Program) Type(typ types.Type, bg Background) Type {
+	if bg == InStdcall {
+		p.validateStdcallType(typ)
+	}
 	if bg == InGo {
 		typ, _ = p.gocvt.cvtType(typ)
 	}
@@ -57,6 +81,9 @@ func (p Program) Type(typ types.Type, bg Background) Type {
 
 // FuncDecl converts a Go/C function declaration into raw type.
 func (p Program) FuncDecl(sig *types.Signature, bg Background) Type {
+	if bg == InStdcall {
+		p.validateStdcallSignature(sig)
+	}
 	recv := sig.Recv()
 	if bg == InGo {
 		sig = p.gocvt.cvtFunc(sig, recv)
@@ -73,6 +100,9 @@ func (p Program) Closure(sig *types.Signature) Type {
 }
 
 func (p goTypes) cvtType(typ types.Type) (raw types.Type, cvt bool) {
+	if raw, ok := cvtGoSSAOpaqueType(typ); ok {
+		return raw, true
+	}
 	switch t := typ.(type) {
 	case *types.Basic:
 	case *types.Pointer:
@@ -92,12 +122,12 @@ func (p goTypes) cvtType(typ types.Type) (raw types.Type, cvt bool) {
 			return types.NewMap(key, elem), true
 		}
 	case *types.Struct:
-		if isClosure(t) {
+		if IsClosure(t) {
 			return typ, false
 		}
 		return p.cvtStruct(t)
 	case *types.Named:
-		if v, ok := p.typbg.Load(namedLinkname(t)); ok && v.(Background) == InC {
+		if !p.shouldConvertNamed(t) {
 			break
 		}
 		return p.cvtNamed(t)
@@ -117,10 +147,36 @@ func (p goTypes) cvtType(typ types.Type) (raw types.Type, cvt bool) {
 		return typ.Underlying(), false
 	case *types.Alias:
 		return p.cvtType(types.Unalias(t))
+	case *types.Union:
+		return p.cvtUnion(t)
 	default:
 		panic(fmt.Sprintf("cvtType: unexpected type - %T", typ))
 	}
 	return typ, false
+}
+
+func cvtGoSSAOpaqueType(typ types.Type) (types.Type, bool) {
+	if ptr, ok := typ.(*types.Pointer); ok && isGoSSAOpaqueType(ptr.Elem()) {
+		return types.Typ[types.UnsafePointer], true
+	}
+	if isGoSSAOpaqueType(typ) {
+		return types.Typ[types.UnsafePointer], true
+	}
+	return nil, false
+}
+
+func isGoSSAOpaqueType(typ types.Type) bool {
+	// opaqueType is unexported in x/tools/go/ssa with no public detection API.
+	// We fall back to reflection here; TestGoSSAOpaqueTypeConversion guards
+	// against upstream renames or representation changes.
+	rt := reflect.TypeOf(typ)
+	if rt == nil {
+		return false
+	}
+	if rt.Kind() == reflect.Pointer {
+		rt = rt.Elem()
+	}
+	return rt.PkgPath() == "golang.org/x/tools/go/ssa" && rt.Name() == "opaqueType"
 }
 
 func namedLinkname(t *types.Named) string {
@@ -131,11 +187,26 @@ func namedLinkname(t *types.Named) string {
 	return obj.Name()
 }
 
+func (p goTypes) shouldConvertNamed(t *types.Named) bool {
+	background, ok := p.packageSyntax.typeBackground(namedLinkname(t))
+	return !ok || !isNativeFuncBackground(background)
+}
+
 func (p goTypes) cvtNamed(t *types.Named) (raw *types.Named, cvt bool) {
 	if v, ok := p.typs[unsafe.Pointer(t)]; ok {
 		raw = (*types.Named)(v)
 		cvt = t != raw
 		return
+	}
+	// Decide whether the complete recursive type graph needs conversion before
+	// installing the recursion placeholder. Previously the placeholder was the
+	// original type. For mutually recursive named types, that made the result
+	// depend on which member of the cycle happened to be converted first: a
+	// closure reachable through a later member could leave an earlier member
+	// permanently cached in its unconverted form.
+	if !p.namedNeedsTypeConversion(t) {
+		p.typs[unsafe.Pointer(t)] = unsafe.Pointer(t)
+		return t, false
 	}
 	n := t.NumMethods()
 	methods := make([]*types.Func, n)
@@ -143,25 +214,142 @@ func (p goTypes) cvtNamed(t *types.Named) (raw *types.Named, cvt bool) {
 		m := t.Method(i) // don't need to convert method signature
 		methods[i] = m
 	}
-	named := types.NewNamed(t.Obj(), types.Typ[types.Int], methods)
+	origin := types.NewNamed(t.Obj(), types.Typ[types.Int], methods)
 	if tp := t.TypeParams(); tp != nil {
 		list := make([]*types.TypeParam, tp.Len())
 		for i := 0; i < tp.Len(); i++ {
 			param := tp.At(i)
 			list[i] = types.NewTypeParam(param.Obj(), param.Constraint())
 		}
-		named.SetTypeParams(list)
+		origin.SetTypeParams(list)
 	}
-	p.typs[unsafe.Pointer(t)] = unsafe.Pointer(t)
-	if tund, cvt := p.cvtType(t.Underlying()); cvt {
-		named.SetUnderlying(tund)
-		if typ, ok := Instantiate(named, t); ok {
-			named = typ.(*types.Named)
+	named := origin
+	if typ, ok := Instantiate(origin, t); ok {
+		named = typ.(*types.Named)
+	}
+	// Publish the converted placeholder before descending so every back-edge in
+	// the cycle observes the same conversion decision.
+	p.typs[unsafe.Pointer(t)] = unsafe.Pointer(named)
+	tund, _ := p.cvtType(t.Underlying())
+	// Generic instances derive their underlying type lazily from the origin.
+	// Fill the origin before any caller observes named.Underlying(), so a
+	// recursive My[T] back-edge resolves to the converted My[args] instance.
+	origin.SetUnderlying(tund)
+	return named, true
+}
+
+type conversionNeedState struct {
+	visiting bool
+	seen     bool
+}
+
+type conversionNeedQuery map[*types.Named]conversionNeedState
+
+func (p goTypes) namedNeedsTypeConversion(t *types.Named) bool {
+	if requirement := p.cvtneed[t]; requirement != conversionUnknown {
+		return requirement == conversionNeeded
+	}
+	query := make(conversionNeedQuery)
+	needed := p.needsTypeConversion(t, query)
+	if !needed {
+		// A complete negative query proves that every named type it reached is
+		// also conversion-free. Negative results observed only on a cycle
+		// back-edge are never stored here.
+		for named, state := range query {
+			if state.seen {
+				p.cvtneed[named] = conversionNotNeeded
+			}
 		}
-		p.typs[unsafe.Pointer(t)] = unsafe.Pointer(named)
-		return named, true
 	}
-	return t, false
+	return needed
+}
+
+// needsTypeConversion reports whether cvtType changes any part of typ. The
+// recursion set deliberately belongs to one query: a cycle back-edge alone is
+// not a conversion, but another member of that cycle may still require one.
+// Keep its traversal and conversion predicates in lock-step with cvtType.
+func (p goTypes) needsTypeConversion(typ types.Type, query conversionNeedQuery) bool {
+	if _, ok := cvtGoSSAOpaqueType(typ); ok {
+		return true
+	}
+	switch t := typ.(type) {
+	case *types.Basic:
+		return false
+	case *types.Pointer:
+		return p.needsTypeConversion(t.Elem(), query)
+	case *types.Interface:
+		for i := 0; i < t.NumExplicitMethods(); i++ {
+			sig := t.ExplicitMethod(i).Type().(*types.Signature)
+			if p.needsTypeConversion(sig.Params(), query) || p.needsTypeConversion(sig.Results(), query) {
+				return true
+			}
+		}
+		for i := 0; i < t.NumEmbeddeds(); i++ {
+			if p.needsTypeConversion(t.EmbeddedType(i), query) {
+				return true
+			}
+		}
+		return false
+	case *types.Slice:
+		return p.needsTypeConversion(t.Elem(), query)
+	case *types.Map:
+		return p.needsTypeConversion(t.Key(), query) || p.needsTypeConversion(t.Elem(), query)
+	case *types.Struct:
+		if IsClosure(t) {
+			return false
+		}
+		for i := 0; i < t.NumFields(); i++ {
+			if p.needsTypeConversion(t.Field(i).Type(), query) {
+				return true
+			}
+		}
+		return false
+	case *types.Named:
+		if !p.shouldConvertNamed(t) {
+			return false
+		}
+		if requirement := p.cvtneed[t]; requirement != conversionUnknown {
+			return requirement == conversionNeeded
+		}
+		state := query[t]
+		state.seen = true
+		if state.visiting {
+			query[t] = state
+			return false
+		}
+		state.visiting = true
+		query[t] = state
+		ret := p.needsTypeConversion(t.Underlying(), query)
+		state = query[t]
+		state.visiting = false
+		query[t] = state
+		if ret {
+			p.cvtneed[t] = conversionNeeded
+		}
+		return ret
+	case *types.Signature:
+		return true
+	case *types.Array:
+		return p.needsTypeConversion(t.Elem(), query)
+	case *types.Chan:
+		return p.needsTypeConversion(t.Elem(), query)
+	case *types.Tuple:
+		for i := 0; i < t.Len(); i++ {
+			if p.needsTypeConversion(t.At(i).Type(), query) {
+				return true
+			}
+		}
+		return false
+	case *types.TypeParam:
+		return false
+	case *types.Alias:
+		return p.needsTypeConversion(types.Unalias(t), query)
+	case *types.Union:
+		// cvtUnion currently always creates a raw union.
+		return true
+	default:
+		panic(fmt.Sprintf("needsTypeConversion: unexpected type - %T", typ))
+	}
 }
 
 func Instantiate(orig types.Type, t *types.Named) (types.Type, bool) {
@@ -170,7 +358,10 @@ func Instantiate(orig types.Type, t *types.Named) (types.Type, bool) {
 		for i := 0; i < tp.Len(); i++ {
 			targs[i] = tp.At(i)
 		}
-		if typ, err := types.Instantiate(nil, orig, targs, true); err == nil {
+		// Use validate=false because the newly created type parameters may not
+		// match the original constraint references. The original type was already
+		// validated by the Go type checker, so we can skip validation here.
+		if typ, err := types.Instantiate(nil, orig, targs, false); err == nil {
 			return typ, true
 		}
 	}
@@ -178,6 +369,9 @@ func Instantiate(orig types.Type, t *types.Named) (types.Type, bool) {
 }
 
 func (p goTypes) cvtClosure(sig *types.Signature) *types.Struct {
+	if sig.Recv() != nil {
+		sig = types.NewSignatureType(nil, nil, nil, sig.Params(), sig.Results(), sig.Variadic())
+	}
 	raw := p.cvtFunc(sig, nil)
 	flds := []*types.Var{
 		types.NewField(token.NoPos, nil, "$f", raw, false),
@@ -275,6 +469,7 @@ func (p goTypes) cvtStruct(typ *types.Struct) (raw *types.Struct, cvt bool) {
 	}()
 	n := typ.NumFields()
 	flds := make([]*types.Var, n)
+	tags := make([]string, n)
 	needcvt := false
 	for i := 0; i < n; i++ {
 		f := typ.Field(i)
@@ -283,11 +478,33 @@ func (p goTypes) cvtStruct(typ *types.Struct) (raw *types.Struct, cvt bool) {
 			needcvt = true
 		}
 		flds[i] = f
+		tags[i] = typ.Tag(i)
 	}
 	if needcvt {
-		return types.NewStruct(flds, nil), true
+		return types.NewStruct(flds, tags), true
 	}
 	return typ, false
+}
+
+func (p goTypes) cvtUnion(typ *types.Union) (raw *types.Union, cvt bool) {
+	if v, ok := p.typs[unsafe.Pointer(typ)]; ok {
+		raw = (*types.Union)(v)
+		cvt = typ != raw
+		return
+	}
+	defer func() {
+		p.typs[unsafe.Pointer(typ)] = unsafe.Pointer(raw)
+	}()
+	n := typ.Len()
+	terms := make([]*types.Term, n)
+	for i := 0; i < n; i++ {
+		f := typ.Term(i)
+		if t, cvt := p.cvtType(f.Type()); cvt {
+			f = types.NewTerm(f.Tilde(), t)
+		}
+		terms[i] = f
+	}
+	return types.NewUnion(terms), true
 }
 
 // -----------------------------------------------------------------------------

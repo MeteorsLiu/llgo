@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2024 The GoPlus Authors (goplus.org). All rights reserved.
+ * Copyright (c) 2024 The XGo Authors (xgo.dev). All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -22,16 +22,23 @@ import (
 	"go/constant"
 	"go/token"
 	"go/types"
+	"io"
 	"log"
 	"os"
+	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 
-	"github.com/goplus/llgo/cl/blocks"
-	"github.com/goplus/llgo/internal/typepatch"
+	"github.com/xgo-dev/llgo/cl/blocks"
+	"github.com/xgo-dev/llgo/cl/ssawrap"
+	"github.com/xgo-dev/llgo/internal/directive"
+	"github.com/xgo-dev/llgo/internal/genmethod"
+	"github.com/xgo-dev/llgo/internal/goembed"
+	"github.com/xgo-dev/llgo/internal/typepatch"
 	"golang.org/x/tools/go/ssa"
 
-	llssa "github.com/goplus/llgo/ssa"
+	llssa "github.com/xgo-dev/llgo/ssa"
 )
 
 // -----------------------------------------------------------------------------
@@ -46,14 +53,25 @@ const (
 )
 
 var (
-	debugInstr bool
-	debugGoSSA bool
-
-	enableCallTracing bool
-	enableDbg         bool
-	enableDbgSyms     bool
-	disableInline     bool
+	debugInstr    bool
+	debugGoSSA    bool
+	disableInline bool
 )
+
+// Options contains frontend behavior for one package compilation.
+type Options struct {
+	Debug        bool
+	DebugSymbols bool
+	Trace        bool
+	ExportRename bool
+	// CExportWrappers keeps //export implementations under their Go symbols;
+	// the final-link module supplies the public C entry points.
+	CExportWrappers bool
+	ShadowStack     bool
+	// PreloadedSyntax means all Program-side source metadata was collected
+	// before lowering and is now shared read-only by backend Programs.
+	PreloadedSyntax bool
+}
 
 // SetDebug sets debug flags.
 func SetDebug(dbgFlags dbgFlags) {
@@ -61,16 +79,48 @@ func SetDebug(dbgFlags dbgFlags) {
 	debugGoSSA = (dbgFlags & DbgFlagGoSSA) != 0
 }
 
-func EnableDebug(b bool) {
-	enableDbg = b
+func dbgInstrf(format string, args ...any) {
+	if debugInstr {
+		log.Printf(format, args...)
+	}
 }
 
-func EnableDbgSyms(b bool) {
-	enableDbgSyms = b
+func dbgInstrln(args ...any) {
+	if debugInstr {
+		log.Println(args...)
+	}
 }
 
-func EnableTrace(b bool) {
-	enableCallTracing = b
+const maxDirectDerefSize = 1 << 20
+
+func (p *context) isLargeNonPointerValue(t llssa.Type) bool {
+	raw := types.Unalias(t.RawType())
+	if _, ok := raw.Underlying().(*types.Pointer); ok {
+		return false
+	}
+	// Very large values may be addressed far beyond the first guard page. Emit
+	// an explicit nil check instead of relying on the eventual load to fault.
+	ptrSize := int64(p.prog.PointerSize())
+	sizes := &types.StdSizes{WordSize: ptrSize, MaxAlign: ptrSize}
+	return sizes.Sizeof(raw) > maxDirectDerefSize
+}
+
+func (p *context) isZeroSizedValue(t llssa.Type) bool {
+	return p.prog.SizeOf(t) == 0
+}
+
+func dbgGoSSADump(f interface {
+	WriteTo(io.Writer) (int64, error)
+}) {
+	if debugGoSSA {
+		f.WriteTo(os.Stderr)
+	}
+}
+
+func dbgGoSSAln(args ...any) {
+	if debugGoSSA {
+		log.Println(args...)
+	}
 }
 
 // -----------------------------------------------------------------------------
@@ -98,21 +148,47 @@ type pkgInfo struct {
 type none = struct{}
 
 type context struct {
-	prog   llssa.Program
-	pkg    llssa.Package
-	fn     llssa.Function
-	fset   *token.FileSet
-	goProg *ssa.Program
-	goTyps *types.Package
-	goPkg  *ssa.Package
-	pyMod  string
-	skips  map[string]none
-	loaded map[*types.Package]*pkgInfo // loaded packages
-	bvals  map[ssa.Value]llssa.Expr    // block values
-	vargs  map[*ssa.Alloc][]llssa.Expr // varargs
+	prog                 llssa.Program
+	pkg                  llssa.Package
+	fn                   llssa.Function
+	goFn                 *ssa.Function
+	fset                 *token.FileSet
+	goProg               *ssa.Program
+	goTyps               *types.Package
+	goPkg                *ssa.Package
+	pyMod                string
+	skips                map[string]none
+	loaded               map[*types.Package]*pkgInfo // loaded packages
+	bvals                map[ssa.Value]llssa.Expr    // block values
+	methodNilDerefChecks map[*ssa.UnOp]none
+	vargs                map[*ssa.Alloc][]llssa.Expr // varargs
+	funcs                map[*ssa.Function]llssa.Function
+	linkOnceFns          map[*ssa.Function]none
+	stackDefers          map[*ssa.Function]bool
+	anonDefers           map[*ssa.Function]bool
+	recoverFacts         *recoverFacts
+	debugDIVars          map[*types.Var]llssa.DIVar
+	debugAllocVars       map[*ssa.Alloc]*types.Var
+	runtimeCallerFuncs   map[*ssa.Function]bool
+	panicSiteFuncs       map[*ssa.Function]bool
+	gcRoots              map[ssa.Value][]llssa.Expr
+	gcClosureRoot        llssa.Expr
+	safepointEntry       bool
+	safepoints           map[ssa.Instruction]struct{}
+	pcLineSeq            uint64
+	// The runtime PC-line table stores file and line, but not column. Keep the
+	// last emitted position within one SSA basic block so repeated checks for a
+	// single source line can share an anchor.
+	lastPCLineFile       string
+	lastPCLineLine       int
+	options              Options
+	recoverSlots         map[*ssa.Alloc]none
+	implicitDeferResults []llssa.Expr
 
-	patches  Patches
-	blkInfos []blocks.Info
+	patches          Patches
+	blkInfos         []blocks.Info
+	srcLines         map[string][]string
+	addrOfFieldAddrs map[token.Pos]none
 
 	inits     []func()
 	phis      []func()
@@ -125,8 +201,144 @@ type context struct {
 	cgoCalled  bool
 	cgoArgs    []llssa.Expr
 	cgoRet     llssa.Expr
+	cgoErrno   llssa.Expr
+	cgoErrnoTy types.Type
 	cgoSymbols []string
-	cgoExports map[string]string
+	rewrites   map[string]string
+	embedMap   goembed.VarMap
+	embedInits []embedInit
+
+	trackCallerFrames bool
+	callerFrameMark   llssa.Expr
+
+	staticGlobalInits map[*ssa.Global]llssa.Expr
+	staticInitStores  map[*ssa.Store]none
+	staticInitInstrs  map[ssa.Instruction]none
+	locality          localityLowering
+}
+
+func (p *context) rewriteValue(name string) (string, bool) {
+	if p.rewrites == nil {
+		return "", false
+	}
+	dot := strings.LastIndex(name, ".")
+	if dot < 0 || dot == len(name)-1 {
+		return "", false
+	}
+	varName := name[dot+1:]
+	val, ok := p.rewrites[varName]
+	return val, ok
+}
+
+func filesUseRuntimeCaller(files []*ast.File) bool {
+	for _, file := range files {
+		imports := make(map[string]string)
+		dotImports := make(map[string]bool)
+		for _, imp := range file.Imports {
+			path, err := strconv.Unquote(imp.Path.Value)
+			if err != nil {
+				continue
+			}
+			switch path {
+			case "runtime", "runtime/debug":
+			default:
+				continue
+			}
+			name := path[strings.LastIndex(path, "/")+1:]
+			if imp.Name != nil {
+				switch imp.Name.Name {
+				case ".":
+					dotImports[path] = true
+					continue
+				case "_":
+					continue
+				default:
+					name = imp.Name.Name
+				}
+			}
+			imports[name] = path
+		}
+		if len(imports) == 0 && len(dotImports) == 0 {
+			continue
+		}
+		found := false
+		ast.Inspect(file, func(n ast.Node) bool {
+			if found {
+				return false
+			}
+			switch n := n.(type) {
+			case *ast.SelectorExpr:
+				ident, ok := n.X.(*ast.Ident)
+				if !ok {
+					return true
+				}
+				if runtimeCallerSelector(imports[ident.Name], n.Sel.Name) {
+					found = true
+					return false
+				}
+			case *ast.Ident:
+				if (dotImports["runtime"] && isRuntimeCallerFrameName(n.Name)) ||
+					(dotImports["runtime/debug"] && n.Name == "Stack") {
+					found = true
+					return false
+				}
+			}
+			return true
+		})
+		if found {
+			return true
+		}
+	}
+	return false
+}
+
+func runtimeCallerSelector(path, name string) bool {
+	switch path {
+	case "runtime":
+		return isRuntimeCallerFrameName(name)
+	case "runtime/debug":
+		return name == "Stack"
+	default:
+		return false
+	}
+}
+
+// isStringPtrType checks if typ is a pointer to the basic string type (*string).
+// This is used to validate that -ldflags -X can only rewrite variables of type *string,
+// not derived string types like "type T string".
+func (p *context) isStringPtrType(typ types.Type) bool {
+	ptr, ok := typ.(*types.Pointer)
+	if !ok {
+		return false
+	}
+	basic, ok := ptr.Elem().(*types.Basic)
+	return ok && basic.Kind() == types.String
+}
+
+func (p *context) globalFullName(g *ssa.Global) string {
+	name, _, _ := p.varName(g.Pkg.Pkg, g)
+	return name
+}
+
+func (p *context) rewriteInitStore(store *ssa.Store, g *ssa.Global) (string, bool) {
+	if p.rewrites == nil {
+		return "", false
+	}
+	fn := store.Block().Parent()
+	if fn == nil || fn.Synthetic != "package initializer" {
+		return "", false
+	}
+	if _, ok := store.Val.(*ssa.Const); !ok {
+		return "", false
+	}
+	if !p.isStringPtrType(g.Type()) {
+		return "", false
+	}
+	value, ok := p.rewriteValue(p.globalFullName(g))
+	if !ok {
+		return "", false
+	}
+	return value, true
 }
 
 type pkgState byte
@@ -147,19 +359,33 @@ func (p *context) compileType(pkg llssa.Package, t *ssa.Type) {
 	tnName := tn.Name()
 	typ := tn.Type()
 	name := llssa.FullName(tn.Pkg(), tnName)
-	if debugInstr {
-		log.Println("==> NewType", name, typ)
-	}
+	dbgInstrln("==> NewType", name, typ)
 	p.compileMethods(pkg, typ)
 	p.compileMethods(pkg, types.NewPointer(typ))
 }
 
 func (p *context) compileMethods(pkg llssa.Package, typ types.Type) {
+	p.compileMethodsIf(pkg, typ, nil)
+}
+
+func (p *context) compileSyntheticMethods(pkg llssa.Package, typ types.Type) {
+	p.compileMethodsIf(pkg, typ, func(m *ssa.Function) bool {
+		return p.needsLinkOnce(m)
+	})
+}
+
+func (p *context) compileMethodsIf(pkg llssa.Package, typ types.Type, keep func(*ssa.Function) bool) {
 	prog := p.goProg
 	mthds := prog.MethodSets.MethodSet(typ)
 	for i, n := 0, mthds.Len(); i < n; i++ {
 		mthd := mthds.At(i)
-		if ssaMthd := prog.MethodValue(mthd); ssaMthd != nil {
+		if genmethod.SupportsGenericMethods && genmethod.IsGenericMethod(mthd.Type()) {
+			continue
+		}
+		if ssaMthd := p.methodValue(mthd); ssaMthd != nil {
+			if keep != nil && !keep(ssaMthd) {
+				continue
+			}
 			p.compileFuncDecl(pkg, ssaMthd)
 		}
 	}
@@ -172,28 +398,86 @@ func (p *context) compileGlobal(pkg llssa.Package, gbl *ssa.Global) {
 	if vtype == pyVar {
 		return
 	}
-	if debugInstr {
-		log.Println("==> NewVar", name, typ)
+	dbgInstrln("==> NewVar", name, typ)
+	g, skip := p.localityGlobalStorage(pkg, gbl, name, typ, llssa.Background(vtype))
+	if skip {
+		return
 	}
-	g := pkg.NewVar(name, typ, llssa.Background(vtype))
-	if define {
+	if p.tryEmbedGlobalInit(pkg, gbl, g, name) {
+		return
+	}
+	if value, ok := p.rewriteValue(name); ok {
+		if p.isStringPtrType(gbl.Type()) {
+			g.Init(pkg.ConstString(value))
+		} else {
+			log.Printf("warning: ignoring rewrite for non-string variable %s (type: %v)", name, gbl.Type())
+			if define {
+				g.InitNil()
+			}
+		}
+	} else if init, ok := p.staticGlobalInits[gbl]; ok {
+		g.Init(init)
+	} else if define {
 		g.InitNil()
 	}
 }
 
-func makeClosureCtx(pkg *types.Package, vars []*ssa.FreeVar) *types.Var {
+func (p *context) makeClosureCtx(fn *ssa.Function, pkg *types.Package, vars []*ssa.FreeVar) *types.Var {
+	oldGoFn := p.goFn
+	p.goFn = fn
+	defer func() {
+		p.goFn = oldGoFn
+	}()
+
 	n := len(vars)
 	flds := make([]*types.Var, n)
 	for i, v := range vars {
-		flds[i] = types.NewField(token.NoPos, pkg, v.Name(), v.Type(), false)
+		name := v.Name()
+		if name == "" {
+			name = "_"
+		}
+		flds[i] = types.NewField(token.NoPos, pkg, name, p.patchType(v.Type()), false)
 	}
 	t := types.NewPointer(types.NewStruct(flds, nil))
-	return types.NewParam(token.NoPos, pkg, "__llgo_ctx", t)
+	return types.NewParam(token.NoPos, pkg, "$env", t)
+}
+
+// canElideZeroSizedClosureEnv reports whether a source closure can recreate
+// all of its captured variables from the module's zero-sized sentinel. Go SSA
+// represents a lexical capture as a pointer to the captured variable. Captured
+// zero-sized variables are heap allocated, and LLGo already gives every such
+// allocation the same permitted non-nil sentinel address.
+//
+// A non-synthetic function with a lexical parent is a source closure.
+// Synthetic wrappers are deliberately excluded: a zero-sized method receiver
+// can still carry a semantically significant nil/non-nil pointer value.
+func (p *context) canElideZeroSizedClosureEnv(f *ssa.Function) bool {
+	if f == nil || f.Parent() == nil || f.Synthetic != "" || len(f.FreeVars) == 0 {
+		return false
+	}
+	for _, freeVar := range f.FreeVars {
+		if !p.isElidableZeroSizedFreeVar(freeVar) {
+			return false
+		}
+	}
+	return true
+}
+
+func (p *context) isElidableZeroSizedFreeVar(freeVar *ssa.FreeVar) bool {
+	ptr, ok := types.Unalias(p.patchType(freeVar.Type())).Underlying().(*types.Pointer)
+	return ok && p.prog.SizeOf(p.type_(ptr.Elem(), llssa.InGo)) == 0
+}
+
+func (p *context) elidedZeroSizedFreeVar(b llssa.Builder, freeVar *ssa.FreeVar) llssa.Expr {
+	typ := p.type_(freeVar.Type(), llssa.InGo)
+	ptr := types.Unalias(p.patchType(freeVar.Type())).Underlying().(*types.Pointer)
+	addr := b.Alloc(p.type_(ptr.Elem(), llssa.InGo), true)
+	return b.Convert(typ, addr)
 }
 
 func isCgoExternSymbol(f *ssa.Function) bool {
 	name := f.Name()
-	return isCgoCfunc(name) || isCgoCmacro(name)
+	return isCgoCfunc(name) || isCgoCmacro(name) || isCgoC2func(name)
 }
 
 func isCgoCfpvar(name string) bool {
@@ -204,12 +488,84 @@ func isCgoCfunc(name string) bool {
 	return strings.HasPrefix(name, "_Cfunc_")
 }
 
+func isCgoC2func(name string) bool {
+	return strings.HasPrefix(name, "_C2func_")
+}
+
 func isCgoCmacro(name string) bool {
 	return strings.HasPrefix(name, "_Cmacro_")
 }
 
 func isCgoVar(name string) bool {
+	return strings.HasPrefix(name, "_cgo_") || isCgoFuncPtrVar(name)
+}
+
+func isCgoFuncPtrVar(name string) bool {
 	return strings.HasPrefix(name, "__cgo_")
+}
+
+func (p *context) methodValue(sel *types.Selection) *ssa.Function {
+	f := p.goProg.MethodValue(sel)
+	if f != nil && f.Pkg == nil && hasGenericInstantiation(f) {
+		p.markLinkOnce(f)
+	}
+	return f
+}
+
+func (p *context) markLinkOnce(f *ssa.Function) {
+	if p.linkOnceFns == nil {
+		p.linkOnceFns = make(map[*ssa.Function]none)
+	}
+	p.linkOnceFns[f] = none{}
+}
+
+// needsLinkOnce reports whether f may be synthesized in multiple packages and
+// therefore needs linkonce linkage when emitted on demand.
+func (p *context) needsLinkOnce(f *ssa.Function) bool {
+	for ; f != nil; f = f.Parent() {
+		if _, ok := p.linkOnceFns[f]; ok {
+			return true
+		}
+		if hasGenericInstantiation(f) {
+			return true
+		}
+	}
+	return false
+}
+
+func hasGenericInstantiation(f *ssa.Function) bool {
+	if f.Origin() != nil || len(f.TypeArgs()) != 0 {
+		return true
+	}
+	if sig, ok := f.Type().(*types.Signature); ok && hasInstantiatedRecv(sig.Recv()) {
+		return true
+	}
+	return hasInstantiatedMethodObject(f)
+}
+
+func hasInstantiatedMethodObject(f *ssa.Function) bool {
+	obj, ok := f.Object().(*types.Func)
+	if !ok {
+		return false
+	}
+	if obj.Origin() != obj {
+		return true
+	}
+	sig, ok := obj.Type().(*types.Signature)
+	return ok && hasInstantiatedRecv(sig.Recv())
+}
+
+func hasInstantiatedRecv(recv *types.Var) bool {
+	if recv == nil {
+		return false
+	}
+	if recv.Origin() != recv {
+		return true
+	}
+	if named := recvNamedOk(recv.Type()); named != nil {
+		return hasTypeArgs(named)
+	}
+	return false
 }
 
 func (p *context) compileFuncDecl(pkg llssa.Package, f *ssa.Function) (llssa.Function, llssa.PyObjRef, int) {
@@ -217,7 +573,14 @@ func (p *context) compileFuncDecl(pkg llssa.Package, f *ssa.Function) (llssa.Fun
 	if ftype != goFunc {
 		return nil, nil, ignoredFunc
 	}
-	sig := p.patchType(f.Signature).(*types.Signature)
+	sig := func() *types.Signature {
+		oldGoFn := p.goFn
+		p.goFn = f
+		defer func() {
+			p.goFn = oldGoFn
+		}()
+		return p.patchType(f.Signature).(*types.Signature)
+	}()
 	state := p.state
 	isInit := (f.Name() == "init" && sig.Recv() == nil)
 	if isInit && state == pkgHasPatch {
@@ -228,34 +591,89 @@ func (p *context) compileFuncDecl(pkg llssa.Package, f *ssa.Function) (llssa.Fun
 	}
 
 	fn := pkg.FuncOf(name)
-	if fn != nil && fn.HasBody() {
-		return fn, nil, goFunc
+	hasFreeVars := len(f.FreeVars) > 0
+	elideFreeVarEnv := p.canElideZeroSizedClosureEnv(f)
+	hasExplicitEnv := false
+	// ParsePkgSyntax is the sole //llgo:env extractor. Lowering only consumes
+	// its source-declaration cache; imported env entries use NewEnvFunc.
+	if decl, ok := f.Syntax().(*ast.FuncDecl); ok {
+		fullName, _ := astFuncName(llssa.PathOf(pkgTypes), decl)
+		hasExplicitEnv = p.prog.HasClosureEnvDirective(p.goProg.Fset, fullName, decl.Pos())
 	}
-
-	var hasCtx = len(f.FreeVars) > 0
-	if hasCtx {
-		if debugInstr {
-			log.Println("==> NewClosure", name, "type:", sig)
-		}
-		ctx := makeClosureCtx(pkgTypes, f.FreeVars)
-		sig = llssa.FuncAddCtx(ctx, sig)
+	hasCtx := hasFreeVars && !elideFreeVarEnv || hasExplicitEnv
+	var ctx *types.Var
+	if elideFreeVarEnv {
+		dbgInstrln("==> NewZeroSizedClosure", name, "type:", sig)
+	} else if hasFreeVars {
+		dbgInstrln("==> NewClosure", name, "type:", sig)
+		ctx = p.makeClosureCtx(f, pkgTypes, f.FreeVars)
+	} else if hasExplicitEnv {
+		dbgInstrln("==> NewEnvFunc", name, "type:", sig)
+		ctx = types.NewVar(token.NoPos, nil, "$env", types.Typ[types.UnsafePointer])
 	} else {
-		if debugInstr {
-			log.Println("==> NewFunc", name, "type:", sig.Recv(), sig, "ftype:", ftype)
+		dbgInstrln("==> NewFunc", name, "type:", sig.Recv(), sig, "ftype:", ftype)
+	}
+	if fn != nil {
+		if fn.NeedsEnv() != hasCtx {
+			panic("conflicting closure environment ABI for " + name)
+		}
+		if fn.HasBody() {
+			return fn, nil, goFunc
 		}
 	}
 	if fn == nil {
-		fn = pkg.NewFuncEx(name, sig, llssa.Background(ftype), hasCtx, f.Origin() != nil)
-		if disableInline {
-			fn.Inline(llssa.NoInline)
+		if hasCtx {
+			fn = pkg.NewEnvFunc(name, sig, llssa.Background(ftype), ctx, p.needsLinkOnce(f))
+		} else {
+			fn = pkg.NewFuncEx(name, sig, llssa.Background(ftype), false, p.needsLinkOnce(f))
 		}
 	}
-	// set compiled to check generic function global instantiation
-	pkg.Prog.SetFuncCompiled(name)
+	if p.prog.Target().GOARCH == "wasm" {
+		if decl, ok := f.Syntax().(*ast.FuncDecl); ok {
+			fullName, _ := astFuncName(llssa.PathOf(pkgTypes), decl)
+			if module, importName, ok := p.prog.WasmImport(fullName); ok {
+				fn.SetWasmImport(module, importName)
+			}
+		}
+	}
+	noInlineDirective := hasNoInlineDirective(f)
+	runtimeStackNoInline := needsRuntimeStackNoInline(pkgTypes, f)
+	pcLineNoInline := p.needsPCLineNoInline(f)
+	usesRecover := p.functionUsesRecover(f)
+	if disableInline || noInlineDirective || runtimeStackNoInline || pcLineNoInline || usesRecover {
+		fn.Inline(llssa.NoInline)
+	}
+	if noInlineDirective || runtimeStackNoInline || pcLineNoInline || usesRecover {
+		fn.DisableTailCalls()
+	}
+	p.funcs[f] = fn
 	isCgo := isCgoExternSymbol(f)
 	if nblk := len(f.Blocks); nblk > 0 {
+		if p.prog.FuncInfoMetadataEnabled() {
+			goName := fn.Name()
+			if pkgTypes != nil {
+				goName = funcName(pkgTypes, f, false)
+			}
+			pos := p.funcInfoPosition(f)
+			if p.prog.Target().GOOS == "windows" && isRecoverTransparentWrapper(f) {
+				pkg.EmitFuncInfoFlags(fn.Name(), funcInfoDisplayName(goName), pos.Filename, pos.Line, pos.Column, llssa.FuncInfoFlagWrapper)
+			} else {
+				pkg.EmitFuncInfo(fn.Name(), funcInfoDisplayName(goName), pos.Filename, pos.Line, pos.Column)
+			}
+		}
+		var childInits []func()
+		if len(f.AnonFuncs) > 0 {
+			parentInits := p.inits
+			p.inits = nil
+			for _, af := range f.AnonFuncs {
+				p.compileFuncDecl(pkg, af)
+			}
+			childInits = append(childInits, p.inits...)
+			p.inits = parentInits
+		}
 		p.cgoCalled = false
 		p.cgoArgs = nil
+		p.cgoErrno = llssa.Nil
 		if isCgo {
 			fn.MakeBlocks(1)
 		} else {
@@ -264,26 +682,54 @@ func (p *context) compileFuncDecl(pkg llssa.Package, f *ssa.Function) (llssa.Fun
 		if f.Recover != nil { // set recover block
 			fn.SetRecover(fn.Block(f.Recover.Index))
 		}
+		dbgEnabled := p.options.Debug
+		dbgSymsEnabled := p.options.DebugSymbols && (f == nil || f.Origin() == nil)
 		p.inits = append(p.inits, func() {
+			oldFn, oldGoFn, oldMethodNilDerefChecks, oldCallerFrameMark := p.fn, p.goFn, p.methodNilDerefChecks, p.callerFrameMark
+			oldLocalityFunction := p.locality.function
+			oldRecoverSlots, oldImplicitDeferResults := p.recoverSlots, p.implicitDeferResults
+			oldGCRoots, oldGCClosureRoot := p.gcRoots, p.gcClosureRoot
+			oldSafepointEntry, oldSafepoints := p.safepointEntry, p.safepoints
 			p.fn = fn
+			p.goFn = f
+			p.callerFrameMark = llssa.Nil
+			p.locality.function = localityFunction{}
 			p.state = state // restore pkgState when compiling funcBody
+			if f.Recover != nil {
+				p.recoverSlots = make(map[*ssa.Alloc]none)
+			} else {
+				p.recoverSlots = nil
+			}
 			defer func() {
-				p.fn = nil
+				p.fn, p.goFn, p.methodNilDerefChecks, p.callerFrameMark = oldFn, oldGoFn, oldMethodNilDerefChecks, oldCallerFrameMark
+				p.locality.function = oldLocalityFunction
+				p.recoverSlots = oldRecoverSlots
+				p.implicitDeferResults = oldImplicitDeferResults
+				p.gcRoots, p.gcClosureRoot = oldGCRoots, oldGCClosureRoot
+				p.safepointEntry, p.safepoints = oldSafepointEntry, oldSafepoints
 			}()
 			p.phis = nil
-			if debugGoSSA {
-				f.WriteTo(os.Stderr)
+			if dbgSymsEnabled {
+				p.debugDIVars = make(map[*types.Var]llssa.DIVar)
+				p.debugAllocVars = collectDebugAllocVariables(f)
+			} else {
+				p.debugDIVars = nil
+				p.debugAllocVars = nil
 			}
-			if debugInstr {
-				log.Println("==> FuncBody", name)
-			}
+			dbgGoSSADump(f)
+			dbgInstrln("==> FuncBody", name)
 			b := fn.NewBuilder()
-			if enableDbg {
+			if dbgEnabled {
 				pos := p.goProg.Fset.Position(f.Pos())
 				bodyPos := p.getFuncBodyPos(f)
-				b.DebugFunction(fn, pos, bodyPos)
+				b.DebugFunction(fn, debugFunctionScope(f), pos, bodyPos)
 			}
+			p.prepareExportedLocalContext(f)
 			p.bvals = make(map[ssa.Value]llssa.Expr)
+			p.methodNilDerefChecks = collectMethodNilDerefChecks(f)
+			p.prepareCooperativeSafepoints(f, isCgo)
+			p.prepareGCRoots(f, hasCtx)
+			p.initGCRoots(b, f)
 			off := make([]int, len(f.Blocks))
 			if isCgo {
 				p.cgoArgs = make([]llssa.Expr, len(f.Params))
@@ -312,13 +758,63 @@ func (p *context) compileFuncDecl(pkg llssa.Package, f *ssa.Function) (llssa.Fun
 			for _, phi := range p.phis {
 				phi()
 			}
+			for _, childInit := range childInits {
+				childInit()
+			}
 			b.EndBuild()
 		})
-		for _, af := range f.AnonFuncs {
-			p.compileFuncDecl(pkg, af)
-		}
 	}
 	return fn, nil, goFunc
+}
+
+// funcInfoDisplayName normalizes anonymous functions to gc's pkg.fn.funcN
+// reporting convention (our linker symbols use $N). Linker symbols are not
+// affected.
+func funcInfoDisplayName(goName string) string {
+	return normalizeRuntimeAnonFuncName(goName)
+}
+
+func hasNoInlineDirective(f *ssa.Function) bool {
+	return hasFuncDirective(f, "go:noinline")
+}
+
+func hasFuncDirective(f *ssa.Function, name string) bool {
+	decl, _ := f.Syntax().(*ast.FuncDecl)
+	if decl == nil || decl.Doc == nil {
+		return false
+	}
+	for _, item := range directive.ParseGroup(decl.Doc) {
+		if item.Name == name {
+			return true
+		}
+	}
+	return false
+}
+
+func needsRuntimeStackNoInline(pkg *types.Package, f *ssa.Function) bool {
+	if pkg == nil || f == nil || f.Signature.Recv() != nil {
+		return false
+	}
+	switch pkg.Path() {
+	case "runtime", "github.com/xgo-dev/llgo/runtime/internal/lib/runtime":
+		switch f.Name() {
+		case "Caller", "Callers", "callers":
+			return true
+		}
+	case "github.com/xgo-dev/llgo/runtime/internal/clite/debug":
+		return f.Name() == "StackTrace"
+	}
+	return false
+}
+
+func (p *context) needsPCLineNoInline(f *ssa.Function) bool {
+	if p == nil || f == nil || !p.prog.FuncInfoSitesEnabled() || !p.trackCallerFrames || !p.runtimeCallerFuncs[f] {
+		return false
+	}
+	if !canEmitPCLineLabelsForTarget(p.prog.Target()) {
+		return false
+	}
+	return p.pkg != nil && canTrackCallerFramesForPackage(p.pkg.Path())
 }
 
 func (p *context) getFuncBodyPos(f *ssa.Function) token.Position {
@@ -328,6 +824,132 @@ func (p *context) getFuncBodyPos(f *ssa.Function) token.Position {
 		}
 	}
 	return p.goProg.Fset.Position(f.Pos())
+}
+
+func (p *context) funcInfoPosition(f *ssa.Function) token.Position {
+	if f == nil {
+		return token.Position{}
+	}
+	pos := f.Pos()
+	switch syntax := f.Syntax().(type) {
+	case *ast.FuncDecl:
+		if syntax.Body != nil && len(syntax.Body.List) != 0 {
+			pos = syntax.Body.List[0].Pos()
+		}
+	case *ast.FuncLit:
+		if syntax.Body != nil && len(syntax.Body.List) != 0 {
+			pos = syntax.Body.List[0].Pos()
+		}
+	}
+	position := p.goProg.Fset.Position(pos)
+	position.Filename = runtimeSourceFilename(
+		p.prog.Target(),
+		directiveFilename(p.goProg.Fset, pos, position.Filename, p.sourceLine),
+	)
+	return position
+}
+
+// runtimeSourceFilename uses the slash-separated spelling emitted by the Go
+// toolchain for Windows runtime metadata. In particular, log.Lshortfile strips
+// the last slash itself, so storing a native backslash path would expose the
+// full source path. Keep the conversion target-aware because a backslash is a
+// valid filename character on Unix.
+func runtimeSourceFilename(target *llssa.Target, filename string) string {
+	if target != nil && target.GOOS == "windows" {
+		return strings.ReplaceAll(filename, `\`, "/")
+	}
+	return filename
+}
+
+// directiveFilename normalizes a //line-directive-adjusted filename to the
+// Go runtime's spelling. The package loader expands a relative directive
+// (`//line relative.go:1`) to an absolute path under the declaring
+// file's directory, but gc reports the directive text verbatim; empty
+// directive filenames print as "??". Positions without a directive pass
+// through untouched.
+func directiveFilename(fset *token.FileSet, pos token.Pos, adjusted string, sourceLine func(string, int) (string, bool)) string {
+	if pos == token.NoPos || fset == nil {
+		return adjusted
+	}
+	originalPos := fset.PositionFor(pos, false)
+	original := originalPos.Filename
+	if original == "" || adjusted == original {
+		return adjusted
+	}
+	if adjusted == "" {
+		return "??"
+	}
+	// go/scanner expands a relative //line filename against the source
+	// directory. On Windows it also treats a leading slash as relative, even
+	// though cmd/compile and runtime.Caller preserve that rooted spelling.
+	// Recover the directive text before applying the path-based fallback.
+	// This is only needed for adjusted positions, so ordinary files do not pay
+	// for the backward source scan.
+	if filename, ok := precedingLineDirectiveFilename(originalPos, sourceLine); ok {
+		return filename
+	}
+	if rel, err := filepath.Rel(filepath.Dir(original), adjusted); err == nil &&
+		rel != "." && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return filepath.ToSlash(rel)
+	}
+	return adjusted
+}
+
+func precedingLineDirectiveFilename(pos token.Position, sourceLine func(string, int) (string, bool)) (string, bool) {
+	if sourceLine == nil || pos.Filename == "" || pos.Line <= 1 {
+		return "", false
+	}
+	for line := pos.Line - 1; line >= 1; line-- {
+		text, ok := sourceLine(pos.Filename, line)
+		if !ok {
+			return "", false
+		}
+		text = strings.TrimSuffix(text, "\r")
+		if !strings.HasPrefix(text, "//line ") {
+			continue
+		}
+		filename, previous, ok := parseLineDirectiveFilename(text[len("//line "):])
+		if !ok {
+			continue
+		}
+		if previous {
+			// //line :line:column inherits the previous adjusted filename;
+			// the FileSet already contains the correct value.
+			return "", false
+		}
+		if filename == "" {
+			return "??", true
+		}
+		// cmd/compile and runtime.Caller preserve the spelling in the //line
+		// directive. In particular, filepath.Clean would turn a rooted slash
+		// path into a backslash path on Windows.
+		return filename, true
+	}
+	return "", false
+}
+
+func parseLineDirectiveFilename(text string) (filename string, previous, ok bool) {
+	const maxLineColumn = 1 << 30
+	last := strings.LastIndexByte(text, ':')
+	if last < 0 {
+		return "", false, false
+	}
+	lineOrColumn, err := strconv.ParseUint(text[last+1:], 10, 32)
+	if err != nil || lineOrColumn == 0 || lineOrColumn > maxLineColumn {
+		return "", false, false
+	}
+
+	filename = text[:last]
+	if second := strings.LastIndexByte(filename, ':'); second >= 0 {
+		if line, err := strconv.ParseUint(filename[second+1:], 10, 32); err == nil {
+			if line == 0 || line > maxLineColumn {
+				return "", false, false
+			}
+			filename = filename[:second]
+			previous = filename == ""
+		}
+	}
+	return filename, previous, true
 }
 
 func isGlobal(v *types.Var) bool {
@@ -351,13 +973,23 @@ func (p *context) debugRef(b llssa.Builder, v *ssa.DebugRef) {
 		return
 	}
 	pos := p.goProg.Fset.Position(v.Pos())
-	value := p.compileValue(b, v.X)
+	var value llssa.Expr
+	if iv, ok := v.X.(instrOrValue); ok {
+		var exists bool
+		value, exists = p.bvals[iv]
+		if !exists {
+			// DebugRef is metadata-only. Do not rematerialize an SSA value that
+			// executable lowering deliberately omitted.
+			return
+		}
+	} else {
+		value = p.compileValue(b, v.X)
+	}
 	fn := v.Parent()
 	dbgVar := p.getLocalVariable(b, fn, variable)
 	scope := variable.Parent()
 	diScope := b.DIScope(p.fn, scope)
 	if v.IsAddr {
-		// *ssa.Alloc
 		b.DIDeclare(variable, value, dbgVar, diScope, pos, b.Func.Block(v.Block().Index))
 	} else {
 		b.DIValue(variable, value, dbgVar, diScope, pos, b.Func.Block(v.Block().Index))
@@ -367,16 +999,29 @@ func (p *context) debugRef(b llssa.Builder, v *ssa.DebugRef) {
 func (p *context) debugParams(b llssa.Builder, f *ssa.Function) {
 	for i, param := range f.Params {
 		variable := param.Object().(*types.Var)
+		if hasDebugAlloc(p.debugAllocVars, variable) {
+			continue
+		}
 		pos := p.goProg.Fset.Position(param.Pos())
 		v := p.compileValue(b, param)
 		ty := param.Type()
 		argNo := i + 1
 		div := b.DIVarParam(p.fn, pos, param.Name(), p.type_(ty, llssa.InGo), argNo)
+		if p.debugDIVars != nil {
+			p.debugDIVars[variable] = div
+		}
 		b.DIParam(variable, v, div, p.fn, pos, p.fn.Block(0))
 	}
 }
 
 func (p *context) compileBlock(b llssa.Builder, block *ssa.BasicBlock, n int, doModInit bool) llssa.BasicBlock {
+	// A control-flow edge can enter this block without executing the preceding
+	// block's anchor, so deduplication must never cross a block boundary.
+	p.lastPCLineFile = ""
+	p.lastPCLineLine = 0
+	oldLocalBlock := p.locality.function.block
+	p.locality.function.block = block
+	defer func() { p.locality.function.block = oldLocalBlock }()
 	var last int
 	var pyModInit bool
 	var prog = p.prog
@@ -385,14 +1030,34 @@ func (p *context) compileBlock(b llssa.Builder, block *ssa.BasicBlock, n int, do
 	var instrs = block.Instrs[n:]
 	var ret = fn.Block(block.Index)
 	b.SetBlock(ret)
-	if block.Index == 0 && enableCallTracing && !strings.HasPrefix(fn.Name(), "github.com/goplus/llgo/runtime/internal/runtime.Print") {
+	if block.Index == 0 {
+		p.prepareImplicitDeferResults(b, block.Parent())
+	}
+	if block.Index == 0 && p.functionUsesRecover(block.Parent()) {
+		b.BindRecoverFrame()
+	}
+	if block.Index == 0 {
+		p.enterExportedLocalContext(b)
+	}
+	if block.Index == 0 && p.shouldTrackCallerFrames() {
+		p.pushCallerLocationFrame(b, block.Parent())
+	}
+	if block.Index == 0 && p.options.Trace && !strings.HasPrefix(fn.Name(), "github.com/xgo-dev/llgo/runtime/internal/runtime.Print") {
 		b.Printf("call " + fn.Name() + "\n\x00")
 	}
 	// place here to avoid wrong current-block
-	if enableDbgSyms && block.Index == 0 {
+	if p.options.DebugSymbols && block.Parent().Origin() == nil && block.Index == 0 {
 		p.debugParams(b, block.Parent())
 	}
+	if block.Index == 0 && p.safepointEntry {
+		p.emitCooperativeSafepoint(b)
+	}
+
 	if doModInit {
+		p.initializeLocalGuards(b)
+		if p.state != pkgInPatch {
+			p.applyEmbedInits(b)
+		}
 		if pyModInit = p.pyMod != ""; pyModInit {
 			last = len(instrs) - 1
 			instrs = instrs[:last]
@@ -403,17 +1068,22 @@ func (p *context) compileBlock(b llssa.Builder, block *ssa.BasicBlock, n int, do
 			}
 		}
 	}
+
 	fnName := block.Parent().Name()
 	cgoReturned := false
 	isCgoCfunc := isCgoCfunc(fnName)
+	isCgoC2 := isCgoC2func(fnName)
 	isCgoCmacro := isCgoCmacro(fnName)
 	for i, instr := range instrs {
+		if p.isCooperativeSafepoint(instr) {
+			p.emitCooperativeSafepoint(b)
+		}
 		if i == 1 && doModInit && p.state == pkgInPatch { // in patch package but no pkgFNoOldInit
 			initFnNameOld := initFnNameOfHasPatch(p.fn.Name())
 			fnOld := pkg.NewFunc(initFnNameOld, llssa.NoArgsNoRet, llssa.InC)
 			b.Call(fnOld.Expr)
 		}
-		if isCgoCfunc || isCgoCmacro {
+		if isCgoCfunc || isCgoC2 || isCgoCmacro {
 			switch instr := instr.(type) {
 			case *ssa.Alloc:
 				// return value allocation
@@ -440,23 +1110,36 @@ func (p *context) compileBlock(b llssa.Builder, block *ssa.BasicBlock, n int, do
 					ty := p.type_(instr.Results[0].Type(), llssa.InGo)
 					p.cgoRet.Type = p.prog.Pointer(ty)
 					p.cgoRet = b.Load(p.cgoRet)
+				} else {
+					p.cgoReturn(b, isCgoC2)
+					cgoReturned = true
+					continue
 				}
 				b.Return(p.cgoRet)
 				cgoReturned = true
 			}
 		} else {
 			p.compileInstr(b, instr)
+			// llgo.unreachable is an LLVM terminator. Go SSA still appends a
+			// synthetic Return for a direct tail call, so do not lower that
+			// Return into the already-terminated LLVM block. Restrict this to
+			// the tail form; branching successors can carry phis and need a
+			// separate control-flow rewrite rather than silently dropping an
+			// edge here.
+			if p.isDirectTailUnreachableCall(instr, instrs[i+1:]) {
+				break
+			}
 		}
 	}
 	// is cgo cfunc but not return yet, some funcs has multiple blocks
-	if (isCgoCfunc || isCgoCmacro) && !cgoReturned {
+	if (isCgoCfunc || isCgoC2 || isCgoCmacro) && !cgoReturned {
 		if !p.cgoCalled {
 			panic("cgo cfunc not called")
 		}
 		for _, block := range block.Parent().Blocks {
 			for _, instr := range block.Instrs {
 				if _, ok := instr.(*ssa.Return); ok {
-					b.Return(p.cgoRet)
+					p.cgoReturn(b, isCgoC2)
 					goto end
 				}
 			}
@@ -480,6 +1163,37 @@ end:
 	return ret
 }
 
+func (p *context) isDirectTailUnreachableCall(instr ssa.Instruction, tail []ssa.Instruction) bool {
+	call, ok := instr.(*ssa.Call)
+	if !ok || call.Call.IsInvoke() {
+		return false
+	}
+	fn, ok := call.Call.Value.(*ssa.Function)
+	if !ok {
+		return false
+	}
+	_, name, kind := p.funcName(fn)
+	if kind != llgoInstr || llgoInstrs[name] != llgoUnreachable {
+		return false
+	}
+	sawRunDefers := false
+	for _, instr := range tail {
+		switch instr.(type) {
+		case *ssa.DebugRef:
+		case *ssa.RunDefers:
+			if sawRunDefers {
+				return false
+			}
+			sawRunDefers = true
+		case *ssa.Return:
+			return true
+		default:
+			return false
+		}
+	}
+	return false
+}
+
 const (
 	RuntimeInit = llssa.PkgRuntime + ".init"
 )
@@ -498,6 +1212,92 @@ func intVal(v ssa.Value) int64 {
 		}
 	}
 	panic("intVal: ssa.Value is not a const int")
+}
+
+func skipUnusedArrayDeref(v *ssa.UnOp) bool {
+	if v.Op != token.MUL {
+		return false
+	}
+	block := v.Block()
+	if block == nil || len(block.Succs) != 1 || !strings.HasPrefix(block.Succs[0].Comment, "rangeindex.") {
+		return false
+	}
+	refs, ok := nonDebugReferrers(v)
+	if !ok || len(refs) != 0 {
+		return false
+	}
+	if _, ok := v.Type().Underlying().(*types.Array); !ok {
+		return false
+	}
+	return true
+}
+
+func shouldAssertDirectNilDeref(v *ssa.UnOp) bool {
+	if v.Op != token.MUL {
+		return false
+	}
+	if _, ok := v.X.(*ssa.Parameter); !ok {
+		return false
+	}
+	switch types.Unalias(v.Type()).Underlying().(type) {
+	case *types.Basic, *types.Pointer, *types.Chan, *types.Map, *types.Slice, *types.Interface:
+		return true
+	}
+	return false
+}
+
+func (p *context) cgoErrnoType() types.Type {
+	if p.cgoErrnoTy != nil {
+		return p.cgoErrnoTy
+	}
+	if pkg := p.goProg.ImportedPackage("syscall"); pkg != nil {
+		if obj := pkg.Pkg.Scope().Lookup("Errno"); obj != nil {
+			p.cgoErrnoTy = obj.Type()
+			return p.cgoErrnoTy
+		}
+	}
+	p.cgoErrnoTy = types.Typ[types.Int32]
+	return p.cgoErrnoTy
+}
+
+func (p *context) cgoReturn(b llssa.Builder, isCgoC2 bool) {
+	if !isCgoC2 {
+		b.Return(p.cgoRet)
+		return
+	}
+	sig := p.fn.Type.RawType().(*types.Signature)
+	if sig.Results().Len() != 2 {
+		panic("cgo C2func should return (result, error)")
+	}
+	p.cgoC2Return(b, p.cgoRet, sig.Results().At(1).Type())
+}
+
+func (p *context) cgoC2Return(b llssa.Builder, ret llssa.Expr, errType types.Type) {
+	errTy := p.type_(errType, llssa.InGo)
+	nilSlot := b.AllocU(errTy)
+	b.Store(nilSlot, p.prog.Zero(errTy))
+	nilErr := b.Load(nilSlot)
+	if p.cgoErrno.IsNil() {
+		b.Return(ret, nilErr)
+		return
+	}
+	i32 := p.type_(types.Typ[types.Int32], llssa.InGo)
+	errno := p.cgoErrno
+	if !types.Identical(errno.RawType(), i32.RawType()) {
+		errno = b.Convert(i32, errno)
+	}
+	zero := p.prog.Zero(i32)
+	cond := b.BinOp(token.NEQ, errno, zero)
+	errnoVal := b.Convert(p.type_(p.cgoErrnoType(), llssa.InGo), errno)
+	errIface := b.MakeInterface(errTy, errnoVal)
+	fn := b.Func
+	errBlk := fn.MakeBlock()
+	okBlk := fn.MakeBlock()
+	b.If(cond, errBlk, okBlk)
+	b.SetBlockEx(errBlk, llssa.AtEnd, false)
+	b.Return(ret, errIface)
+	b.SetBlockEx(okBlk, llssa.AtEnd, false)
+	b.Return(ret, nilErr)
 }
 
 func (p *context) isVArgs(v ssa.Value) (ret []llssa.Expr, ok bool) {
@@ -520,12 +1320,82 @@ func (p *context) checkVArgs(v *ssa.Alloc, t *types.Pointer) bool {
 	return false
 }
 
+func (p *context) skipSyntheticMakeSliceAlloc(v *ssa.Alloc) bool {
+	refs, ok := nonDebugReferrers(v)
+	if !ok || len(refs) != 1 {
+		return false
+	}
+	slice, ok := refs[0].(*ssa.Slice)
+	if !ok {
+		return false
+	}
+	_, ok = p.syntheticMakeSliceCap(slice)
+	return ok
+}
+
+func (p *context) compileSyntheticMakeSlice(b llssa.Builder, v *ssa.Slice) (llssa.Expr, bool) {
+	capacity, ok := p.syntheticMakeSliceCap(v)
+	if !ok {
+		return llssa.Expr{}, false
+	}
+	t := p.type_(v.Type(), llssa.InGo)
+	length := p.compileValue(b, v.High)
+	return b.MakeSlice(t, length, capacity), true
+}
+
+func (p *context) syntheticMakeSliceCap(v *ssa.Slice) (llssa.Expr, bool) {
+	alloc, ok := v.X.(*ssa.Alloc)
+	if !ok || alloc.Comment != "makeslice" || v.Low != nil || v.High == nil || v.Max != nil {
+		return llssa.Expr{}, false
+	}
+	t, ok := alloc.Type().(*types.Pointer)
+	if !ok {
+		return llssa.Expr{}, false
+	}
+	arr, ok := t.Elem().(*types.Array)
+	if !ok {
+		return llssa.Expr{}, false
+	}
+	if high, ok := v.High.(*ssa.Const); ok {
+		if n, exact := constant.Int64Val(high.Value); exact && n >= 0 && n <= arr.Len() {
+			return llssa.Expr{}, false
+		}
+	}
+	return p.prog.IntVal(uint64(arr.Len()), p.prog.Int()), true
+}
+
+func (p *context) markRecoverSlot(v *ssa.Alloc) {
+	if p.recoverSlots == nil || v.Heap {
+		return
+	}
+	p.recoverSlots[v] = none{}
+}
+
+func (p *context) isRecoverSlotAddr(v ssa.Value) bool {
+	if p.recoverSlots == nil {
+		return false
+	}
+	switch v := v.(type) {
+	case *ssa.Alloc:
+		_, ok := p.recoverSlots[v]
+		return ok
+	case *ssa.FieldAddr:
+		return p.isRecoverSlotAddr(v.X)
+	case *ssa.IndexAddr:
+		return p.isRecoverSlotAddr(v.X)
+	}
+	return false
+}
+
 func isAllocVargs(ctx *context, v *ssa.Alloc) bool {
-	refs := *v.Referrers()
+	refs, ok := nonDebugReferrers(v)
+	if !ok || len(refs) == 0 {
+		return false
+	}
 	n := len(refs)
 	lastref := refs[n-1]
 	if i, ok := lastref.(*ssa.Slice); ok {
-		if refs = *i.Referrers(); len(refs) == 1 {
+		if refs, _ = nonDebugReferrers(i); len(refs) == 1 {
 			var call *ssa.CallCommon
 			switch ref := refs[0].(type) {
 			case *ssa.Call:
@@ -569,6 +1439,7 @@ func (p *context) compilePhis(b llssa.Builder, block *ssa.BasicBlock) int {
 			for i := 0; i < n; i++ {
 				iv := block.Instrs[i].(*ssa.Phi)
 				p.bvals[iv] = rets[i]
+				p.publishGCRoot(b, iv, rets[i])
 			}
 			return n
 		}
@@ -599,40 +1470,196 @@ func (p *context) compileInstrOrValue(b llssa.Builder, iv instrOrValue, asValue 
 		if v, ok := p.bvals[iv]; ok {
 			return v
 		}
-		log.Panicln("unreachable:", iv)
+		// Do not format iv through its String method here. An incomplete SSA
+		// instruction can panic while formatting, hiding this compiler error and,
+		// on affected Windows hosts, turning the diagnostic into a hardware fault.
+		log.Panicf("unreachable: %T\n", iv)
+	}
+	if _, ok := p.gcRoots[iv]; ok {
+		defer func() {
+			p.publishGCRoot(b, iv, ret)
+		}()
 	}
 	switch v := iv.(type) {
 	case *ssa.Call:
 		ret = p.call(b, llssa.Call, &v.Call)
+		if p.rangeFuncCallNeedsDeferDrain(&v.Call) {
+			b.DeferStackDrain()
+		}
 	case *ssa.BinOp:
-		x := p.compileValue(b, v.X)
-		y := p.compileValue(b, v.Y)
-		ret = b.BinOp(v.Op, x, y)
+		if value, ok := foldConstComparison(v); ok {
+			ret = p.prog.BoolVal(value)
+			break
+		}
+		if isUntypedNilConst(v.X) && isUntypedNilConst(v.Y) {
+			switch v.Op {
+			case token.EQL:
+				ret = p.prog.BoolVal(true)
+				break
+			case token.NEQ:
+				ret = p.prog.BoolVal(false)
+				break
+			}
+			if !ret.IsNil() {
+				break
+			}
+		}
+		if typ, ok := v.X.Type().Underlying().(*types.Array); ok && (v.Op == token.EQL || v.Op == token.NEQ) {
+			xaddr, yaddr := llssa.Nil, llssa.Nil
+			if !llssa.CanInlineArrayEqual(typ) {
+				xaddr = p.arrayCompareAddr(b, v.X)
+				yaddr = p.arrayCompareAddr(b, v.Y)
+			}
+			var x, y llssa.Expr
+			if !xaddr.IsNil() && !yaddr.IsNil() {
+				// The runtime helper consumes the proven-stable addresses. Keep
+				// typed placeholders for ArrayBinOp without materializing the
+				// otherwise unused aggregate loads.
+				x = p.prog.Zero(p.type_(v.X.Type(), llssa.InGo))
+				y = p.prog.Zero(p.type_(v.Y.Type(), llssa.InGo))
+			} else {
+				x = p.compileValueAs(b, v.X, v.Y.Type())
+				y = p.compileValueAs(b, v.Y, v.X.Type())
+			}
+			ret = b.ArrayBinOp(v.Op, x, y, xaddr, yaddr)
+		} else if typ, ok := v.X.Type().Underlying().(*types.Struct); ok && (v.Op == token.EQL || v.Op == token.NEQ) {
+			xaddr, yaddr := llssa.Nil, llssa.Nil
+			size := p.prog.SizeOf(p.type_(v.X.Type(), llssa.InGo))
+			if p.prog.IsRegularMemory(v.X.Type()) && !llssa.CanInlineStructEqual(typ, size, p.prog.PointerSize()) {
+				xaddr = p.structZeroCompareAddr(b, v.X, v.Y, v)
+				yaddr = p.structZeroCompareAddr(b, v.Y, v.X, v)
+			}
+			x := p.prog.Zero(p.type_(v.X.Type(), llssa.InGo))
+			if xaddr.IsNil() {
+				x = p.compileValueAs(b, v.X, v.Y.Type())
+			}
+			y := p.prog.Zero(p.type_(v.Y.Type(), llssa.InGo))
+			if yaddr.IsNil() {
+				y = p.compileValueAs(b, v.Y, v.X.Type())
+			}
+			ret = b.StructBinOp(v.Op, x, y, xaddr, yaddr)
+		} else {
+			x := p.compileValueAs(b, v.X, v.Y.Type())
+			y := p.compileValueAs(b, v.Y, v.X.Type())
+			ret = b.BinOp(v.Op, x, y)
+		}
 	case *ssa.UnOp:
+		if v.Op == token.MUL {
+			if _, ok := p.methodNilDerefChecks[v]; ok {
+				return p.compileCheckedDeref(b, v)
+			}
+			if canElideArrayCompareLoad(v) || p.canElideStructZeroCompareLoad(v) {
+				return
+			}
+			effectfulArrayDeref := isEffectfulArrayPointerDeref(v)
+			if refs, ok := nonDebugReferrers(v); ok && len(refs) == 0 {
+				if skipUnusedArrayDeref(v) {
+					x := p.compileValue(b, v.X)
+					if effectfulArrayDeref {
+						p.recordPanicSite(b, v.Pos())
+						b.AssertNilDeref(x)
+					}
+					return
+				}
+				// Elide the unused load, but keep an explicit nil check so the
+				// Go dereference still panics instead of relying on a trapping load.
+				x := p.compileValue(b, v.X)
+				p.recordPanicSite(b, v.Pos())
+				p.assertNilDerefBase(b, v.X)
+				b.AssertNilDeref(x)
+				return
+			}
+			if effectfulArrayDeref {
+				x := p.compileValue(b, v.X)
+				p.recordPanicSite(b, v.Pos())
+				b.AssertNilDeref(x)
+			}
+			if refs, ok := nonDebugReferrers(v); ok && len(refs) == 1 {
+				if _, ok := refs[0].(*ssa.MakeInterface); ok {
+					if t := p.type_(v.Type(), llssa.InGo); t.RawType() != nil {
+						if p.isLargeNonPointerValue(t) {
+							// Skip the load: the MakeInterface handler below copies
+							// from the original pointer and preserves the nil check.
+							return
+						}
+					}
+				}
+			}
+			// "libc_XXX_trampoline_addr" -> "XXX"
+			if strings.HasSuffix(v.X.Name(), "_trampoline_addr") {
+				name := v.X.Name()
+				if cname := strings.TrimPrefix(name[:len(name)-16], "libc_"); cname != "" {
+					cname = p.remapTrampolineCName(cname)
+					fnSig := p.syscallFnSig(0)
+					cfn := b.Pkg.NewFunc(cname, fnSig, llssa.InC)
+					ret = b.Convert(p.type_(types.Typ[types.Uintptr], llssa.InGo), cfn.Expr)
+					p.bvals[iv] = ret
+					return ret
+				}
+			}
+		}
 		x := p.compileValue(b, v.X)
+		if v.Op != token.ARROW {
+			p.recordPanicSite(b, v.Pos())
+		}
+		if shouldAssertDirectNilDeref(v) {
+			b.AssertNilDeref(x)
+		}
 		if v.Op == token.ARROW {
 			ret = b.Recv(x, v.CommaOk)
 		} else {
+			if v.Op == token.MUL {
+				if t := p.type_(v.Type(), llssa.InGo); t.RawType() != nil && p.prog.SizeOf(t) == 0 {
+					p.assertNilDerefBase(b, v.X)
+				}
+				if isInterfaceCompareDeref(v) {
+					p.assertNilDerefBase(b, v.X)
+					b.AssertNilDeref(x)
+				}
+			}
 			ret = b.UnOp(v.Op, x)
+			if v.Op == token.MUL && p.isRecoverSlotAddr(v.X) {
+				ret = ret.SetVolatile(true)
+			}
 		}
 	case *ssa.ChangeType:
 		t := v.Type()
+		if isUntypedNilConst(v.X) {
+			ret = p.nilOf(t)
+			break
+		}
 		x := p.compileValue(b, v.X)
 		ret = b.ChangeType(p.type_(t, llssa.InGo), x)
 	case *ssa.Convert:
 		t := v.Type()
+		if isUntypedNilConst(v.X) {
+			ret = p.nilOf(t)
+			break
+		}
 		x := p.compileValue(b, v.X)
 		ret = b.Convert(p.type_(t, llssa.InGo), x)
 	case *ssa.FieldAddr:
 		x := p.compileValue(b, v.X)
+		p.recordPanicSite(b, v.Pos())
+		if p.isAddressOfFieldAddr(v) {
+			b.AssertNilDeref(x)
+		}
 		ret = b.FieldAddr(x, v.Field)
 	case *ssa.Alloc:
 		t := v.Type().(*types.Pointer)
 		if p.checkVArgs(v, t) { // varargs: this maybe a varargs allocation
 			return
 		}
+		if p.skipSyntheticMakeSliceAlloc(v) {
+			return
+		}
 		elem := p.type_(t.Elem(), llssa.InGo)
 		ret = b.Alloc(elem, v.Heap)
+		p.debugAlloc(b, v, ret)
+		p.markRecoverSlot(v)
+		if p.isRecoverSlotAddr(v) {
+			b.Store(ret, p.prog.Zero(elem)).SetVolatile(true)
+		}
 	case *ssa.IndexAddr:
 		vx := v.X
 		if _, ok := p.isVArgs(vx); ok { // varargs: this is a varargs index
@@ -640,10 +1667,12 @@ func (p *context) compileInstrOrValue(b llssa.Builder, iv instrOrValue, asValue 
 		}
 		x := p.compileValue(b, vx)
 		idx := p.compileValue(b, v.Index)
+		p.recordPanicSite(b, v.Pos())
 		ret = b.IndexAddr(x, idx)
 	case *ssa.Index:
 		x := p.compileValue(b, v.X)
 		idx := p.compileValue(b, v.Index)
+		p.recordPanicSite(b, v.Pos())
 		ret = b.Index(x, idx, func() (addr llssa.Expr, zero bool) {
 			switch n := v.X.(type) {
 			case *ssa.Const:
@@ -658,6 +1687,10 @@ func (p *context) compileInstrOrValue(b llssa.Builder, iv instrOrValue, asValue 
 		idx := p.compileValue(b, v.Index)
 		ret = b.Lookup(x, idx, v.CommaOk)
 	case *ssa.Slice:
+		if makeSlice, ok := p.compileSyntheticMakeSlice(b, v); ok {
+			ret = makeSlice
+			break
+		}
 		vx := v.X
 		if _, ok := p.isVArgs(vx); ok { // varargs: this is a varargs slice
 			return
@@ -673,10 +1706,11 @@ func (p *context) compileInstrOrValue(b llssa.Builder, iv instrOrValue, asValue 
 		if v.Max != nil {
 			max = p.compileValue(b, v.Max)
 		}
+		p.recordPanicSite(b, v.Pos())
 		ret = b.Slice(x, low, high, max)
-		ret.Type = b.Prog.Type(v.Type(), llssa.InGo)
+		ret.Type = p.type_(v.Type(), llssa.InGo)
 	case *ssa.MakeInterface:
-		if refs := *v.Referrers(); len(refs) == 1 {
+		if refs, _ := nonDebugReferrers(v); len(refs) == 1 {
 			switch ref := refs[0].(type) {
 			case *ssa.Store:
 				if va, ok := ref.Addr.(*ssa.IndexAddr); ok {
@@ -686,13 +1720,28 @@ func (p *context) compileInstrOrValue(b llssa.Builder, iv instrOrValue, asValue 
 				}
 			case *ssa.Call:
 				if fn, ok := ref.Call.Value.(*ssa.Function); ok {
-					if _, _, ftype := p.funcOf(fn); ftype == llgoFuncAddr { // llgo.funcAddr
+					if _, _, ftype := p.funcOf(fn); ftype == llgoFuncAddr || ftype == llgoFuncPCABI0 { // llgo.funcAddr/funcPCABI0
 						return
 					}
 				}
 			}
 		}
 		t := p.type_(v.Type(), llssa.InGo)
+		if isUntypedNilConst(v.X) {
+			ret = p.prog.Nil(t)
+			break
+		}
+		if unop, ok := v.X.(*ssa.UnOp); ok && unop.Op == token.MUL {
+			if vt := p.type_(unop.Type(), llssa.InGo); vt.RawType() != nil {
+				if p.isLargeNonPointerValue(vt) || p.isZeroSizedValue(vt) {
+					if ptr := p.compileValue(b, unop.X); ptr.Type != nil {
+						p.assertNilDerefBase(b, unop.X)
+						ret = b.MakeInterfaceFromPtr(t, ptr)
+						break
+					}
+				}
+			}
+		}
 		x := p.compileValue(b, v.X)
 		ret = b.MakeInterface(t, x)
 	case *ssa.MakeSlice:
@@ -709,11 +1758,16 @@ func (p *context) compileInstrOrValue(b llssa.Builder, iv instrOrValue, asValue 
 		ret = b.MakeMap(t, nReserve)
 	case *ssa.MakeClosure:
 		fn := p.compileValue(b, v.Fn)
-		bindings := p.compileValues(b, v.Bindings, 0)
+		var bindings []llssa.Expr
+		goFn, _ := v.Fn.(*ssa.Function)
+		if !p.canElideZeroSizedClosureEnv(goFn) {
+			bindings = p.compileValues(b, v.Bindings, 0)
+		}
 		ret = b.MakeClosure(fn, bindings)
 	case *ssa.TypeAssert:
 		x := p.compileValue(b, v.X)
 		t := p.type_(v.AssertedType, llssa.InGo)
+		p.recordPanicSite(b, v.Pos())
 		ret = b.TypeAssert(x, t, v.CommaOk)
 	case *ssa.Extract:
 		x := p.compileValue(b, v.Tuple)
@@ -754,12 +1808,345 @@ func (p *context) compileInstrOrValue(b llssa.Builder, iv instrOrValue, asValue 
 	case *ssa.SliceToArrayPointer:
 		t := p.type_(v.Type(), llssa.InGo)
 		x := p.compileValue(b, v.X)
+		p.recordPanicSite(b, v.Pos())
 		ret = b.SliceToArrayPointer(x, t)
 	default:
 		panic(fmt.Sprintf("compileInstrAndValue: unknown instr - %T\n", iv))
 	}
 	p.bvals[iv] = ret
 	return ret
+}
+
+// isEffectfulArrayPointerDeref reports whether v is an array dereference that
+// must be evaluated even though range, len, or cap only needs the static array
+// length. The language specification requires evaluation when the operand
+// contains a function call or channel receive. See Go issue 72844.
+func isEffectfulArrayPointerDeref(v *ssa.UnOp) bool {
+	if v == nil || v.Op != token.MUL {
+		return false
+	}
+	if _, ok := types.Unalias(v.Type()).Underlying().(*types.Array); !ok {
+		return false
+	}
+	if !arrayPointerOperandHasEffectAfter(v.X, v.Pos(), nil) {
+		return false
+	}
+	refs, ok := nonDebugReferrers(v)
+	if !ok || len(refs) == 0 {
+		return ok
+	}
+	if len(refs) != 1 {
+		return false
+	}
+	call, ok := refs[0].(*ssa.Call)
+	if !ok {
+		return false
+	}
+	builtin, ok := call.Common().Value.(*ssa.Builtin)
+	return ok && (builtin.Name() == "len" || builtin.Name() == "cap")
+}
+
+func arrayPointerOperandHasEffectAfter(v ssa.Value, after token.Pos, seen map[ssa.Value]bool) bool {
+	if v == nil || seen[v] {
+		return false
+	}
+	if seen == nil {
+		seen = make(map[ssa.Value]bool)
+	}
+	seen[v] = true
+
+	instr, ok := v.(ssa.Instruction)
+	if !ok {
+		return false
+	}
+	if pos := instr.Pos(); after.IsValid() && pos.IsValid() && pos <= after {
+		// SSA eliminates local assignments. Do not mistake a call that produced
+		// the assigned value for a call contained in the len, cap, or range
+		// expression itself.
+		return false
+	}
+	switch v := v.(type) {
+	case *ssa.Call:
+		return true
+	case *ssa.UnOp:
+		if v.Op == token.ARROW {
+			return true
+		}
+	}
+	for _, operand := range instr.Operands(nil) {
+		if operand != nil && arrayPointerOperandHasEffectAfter(*operand, after, seen) {
+			return true
+		}
+	}
+	return false
+}
+
+func isInterfaceCompareDeref(v *ssa.UnOp) bool {
+	if _, ok := types.Unalias(v.Type()).Underlying().(*types.Interface); !ok {
+		return false
+	}
+	switch v.X.(type) {
+	case *ssa.Alloc, *ssa.Extract, *ssa.FieldAddr, *ssa.FreeVar, *ssa.Global, *ssa.IndexAddr:
+		return false
+	}
+	refs, ok := nonDebugReferrers(v)
+	if !ok || len(refs) != 1 {
+		return false
+	}
+	bin, ok := refs[0].(*ssa.BinOp)
+	return ok && (bin.Op == token.EQL || bin.Op == token.NEQ)
+}
+
+func isUntypedNilConst(v ssa.Value) bool {
+	c, ok := v.(*ssa.Const)
+	if !ok || c.Value != nil {
+		return false
+	}
+	basic, ok := c.Type().Underlying().(*types.Basic)
+	return ok && basic.Kind() == types.UntypedNil
+}
+
+func foldConstComparison(v *ssa.BinOp) (bool, bool) {
+	switch v.Op {
+	case token.EQL, token.NEQ, token.LSS, token.LEQ, token.GTR, token.GEQ:
+	default:
+		return false, false
+	}
+	x, xok := v.X.(*ssa.Const)
+	y, yok := v.Y.(*ssa.Const)
+	if !xok || !yok || x.Value == nil || y.Value == nil {
+		return false, false
+	}
+	return constant.Compare(x.Value, v.Op, y.Value), true
+}
+
+func (p *context) nilOf(typ types.Type) llssa.Expr {
+	return p.prog.Nil(p.type_(typ, llssa.InGo))
+}
+
+func (p *context) compileValueAs(b llssa.Builder, v ssa.Value, typ types.Type) llssa.Expr {
+	if isUntypedNilConst(v) {
+		return p.nilOf(typ)
+	}
+	return p.compileValue(b, v)
+}
+
+func (p *context) arrayCompareAddr(b llssa.Builder, v ssa.Value) llssa.Expr {
+	addr, ok := immutableLocalArrayLoadAddr(v)
+	if !ok {
+		return llssa.Nil
+	}
+	return p.compileValue(b, addr)
+}
+
+// structZeroCompareAddr reuses the source address for an immediately compared
+// aggregate load. The other operand is a zero constant, so there is no second
+// load, and structZeroCompareLoad has verified that no executable instruction
+// occurs before the comparison, so the address still holds the loaded value.
+func (p *context) structZeroCompareAddr(b llssa.Builder, value, other ssa.Value, comparison *ssa.BinOp) llssa.Expr {
+	load := structZeroCompareLoad(value, other, comparison)
+	if load == nil {
+		return llssa.Nil
+	}
+	addr := p.compileValue(b, load.X)
+	p.recordPanicSite(b, load.Pos())
+	p.assertNilDerefBase(b, load.X)
+	b.AssertNilDeref(addr)
+	return addr
+}
+
+func (p *context) canElideStructZeroCompareLoad(load *ssa.UnOp) bool {
+	if load == nil {
+		return false
+	}
+	refs, ok := nonDebugReferrers(load)
+	if !ok || len(refs) != 1 {
+		return false
+	}
+	comparison, ok := refs[0].(*ssa.BinOp)
+	if !ok || (comparison.Op != token.EQL && comparison.Op != token.NEQ) {
+		return false
+	}
+	typ, ok := load.Type().Underlying().(*types.Struct)
+	if !ok {
+		return false
+	}
+	if !p.prog.IsRegularMemory(load.Type()) {
+		return false
+	}
+	size := p.prog.SizeOf(p.type_(load.Type(), llssa.InGo))
+	if llssa.CanInlineStructEqual(typ, size, p.prog.PointerSize()) {
+		return false
+	}
+	other := comparison.X
+	if other == load {
+		other = comparison.Y
+	}
+	return structZeroCompareLoad(load, other, comparison) != nil
+}
+
+func structZeroCompareLoad(value, other ssa.Value, comparison *ssa.BinOp) *ssa.UnOp {
+	load, ok := value.(*ssa.UnOp)
+	if !ok || load.Op != token.MUL || load.Block() == nil || load.Block() != comparison.Block() {
+		return nil
+	}
+	zero, ok := other.(*ssa.Const)
+	if !ok || zero.Value != nil {
+		return nil
+	}
+	if _, ok := zero.Type().Underlying().(*types.Struct); !ok {
+		return nil
+	}
+	seenLoad := false
+	for _, instruction := range load.Block().Instrs {
+		switch instruction {
+		case load:
+			seenLoad = true
+		case comparison:
+			if seenLoad {
+				return load
+			}
+		default:
+			if seenLoad {
+				if _, ok := instruction.(*ssa.DebugRef); !ok {
+					return nil
+				}
+			}
+		}
+	}
+	return nil
+}
+
+// canElideArrayCompareLoad reports whether every executable use of load is a
+// non-inline equality comparison whose two operands can both be read from
+// proven-stable local storage. Such comparisons never consume the aggregate
+// value itself, so generating its load only increases the pre-optimization IR.
+func canElideArrayCompareLoad(load *ssa.UnOp) bool {
+	if load == nil || load.Op != token.MUL {
+		return false
+	}
+	typ, ok := load.Type().Underlying().(*types.Array)
+	if !ok || llssa.CanInlineArrayEqual(typ) {
+		return false
+	}
+	if _, ok := immutableLocalArrayLoadAddr(load); !ok {
+		return false
+	}
+	refs, available := nonDebugReferrers(load)
+	if !available || len(refs) == 0 {
+		return false
+	}
+	for _, ref := range refs {
+		bin, ok := ref.(*ssa.BinOp)
+		if !ok || (bin.Op != token.EQL && bin.Op != token.NEQ) {
+			return false
+		}
+		var other ssa.Value
+		switch {
+		case bin.X == load:
+			other = bin.Y
+		case bin.Y == load:
+			other = bin.X
+		default:
+			return false
+		}
+		if _, ok := immutableLocalArrayLoadAddr(other); !ok {
+			return false
+		}
+	}
+	return true
+}
+
+// immutableLocalArrayLoadAddr recognizes array values loaded from a local
+// allocation that cannot change after the load. Reusing the allocation lets
+// equality helpers read the value in place, as cmd/compile does for its
+// addressable comparison operands, and avoids scalarizing a copied array.
+func immutableLocalArrayLoadAddr(v ssa.Value) (ssa.Value, bool) {
+	load, ok := v.(*ssa.UnOp)
+	if !ok || load.Op != token.MUL {
+		return nil, false
+	}
+	if _, ok := load.Type().Underlying().(*types.Array); !ok {
+		return nil, false
+	}
+	alloc, ok := load.X.(*ssa.Alloc)
+	if !ok || alloc.Heap {
+		return nil, false
+	}
+	if !immutableArrayAddrUses(alloc, load, make(map[ssa.Value]bool)) {
+		return nil, false
+	}
+	return load.X, true
+}
+
+func immutableArrayAddrUses(ptr ssa.Value, load *ssa.UnOp, seen map[ssa.Value]bool) bool {
+	if seen[ptr] {
+		return true
+	}
+	seen[ptr] = true
+	refs, available := nonDebugReferrers(ptr)
+	if !available {
+		return false
+	}
+	for _, ref := range refs {
+		switch ref := ref.(type) {
+		case *ssa.IndexAddr:
+			if ref.X != ptr || !immutableArrayAddrUses(ref, load, seen) {
+				return false
+			}
+		case *ssa.FieldAddr:
+			if ref.X != ptr || !immutableArrayAddrUses(ref, load, seen) {
+				return false
+			}
+		case *ssa.UnOp:
+			if ref.X != ptr || ref.Op != token.MUL {
+				return false
+			}
+		case *ssa.Store:
+			if ref.Addr != ptr || !instructionPrecedes(ref, load) {
+				return false
+			}
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+func instructionPrecedes(before, after ssa.Instruction) bool {
+	block := before.Block()
+	if block == nil || block != after.Block() {
+		return false
+	}
+	for _, instr := range block.Instrs {
+		if instr == before {
+			return true
+		}
+		if instr == after {
+			break
+		}
+	}
+	return false
+}
+
+func (p *context) assertNilDerefBase(b llssa.Builder, addr ssa.Value) {
+	switch addr := addr.(type) {
+	case *ssa.UnOp:
+		if addr.Op != token.MUL || isKnownNonNilAddr(addr.X) || isWrapNilCheckCall(addr.X) {
+			return
+		}
+		p.compileCheckedDeref(b, addr)
+	case *ssa.FieldAddr:
+		if isKnownNonNilAddr(addr.X) || isWrapNilCheckCall(addr.X) {
+			return
+		}
+		p.assertNilDerefBase(b, addr.X)
+		base := p.compileValue(b, addr.X)
+		if isPointerGoType(addr.X.Type()) {
+			base = b.NilDerefCheck(base)
+		}
+		p.bvals[addr] = b.FieldAddr(base, addr.Field)
+	}
 }
 
 func (p *context) jumpTo(v *ssa.Jump) llssa.BasicBlock {
@@ -780,20 +2167,28 @@ func (p *context) getDebugLocScope(v *ssa.Function, pos token.Pos) *types.Scope 
 }
 
 func (p *context) compileInstr(b llssa.Builder, instr ssa.Instruction) {
+	if _, ok := p.staticInitInstrs[instr]; ok {
+		return
+	}
+	if p.options.Debug && instr.Parent().Origin() == nil {
+		if _, isDebugRef := instr.(*ssa.DebugRef); !isDebugRef {
+			scope := p.getDebugLocScope(instr.Parent(), instr.Pos())
+			if scope != nil {
+				diScope := b.DIScope(p.fn, scope)
+				pos := p.fset.Position(instr.Pos())
+				b.DISetCurrentDebugLocation(diScope, pos)
+			}
+		}
+	}
 	if iv, ok := instr.(instrOrValue); ok {
 		p.compileInstrOrValue(b, iv, false)
 		return
 	}
-	if enableDbg {
-		scope := p.getDebugLocScope(instr.Parent(), instr.Pos())
-		if scope != nil {
-			diScope := b.DIScope(p.fn, scope)
-			pos := p.fset.Position(instr.Pos())
-			b.DISetCurrentDebugLocation(diScope, pos)
-		}
-	}
 	switch v := instr.(type) {
 	case *ssa.Store:
+		if _, ok := p.staticInitStores[v]; ok {
+			return
+		}
 		va := v.Addr
 		if va, ok := va.(*ssa.IndexAddr); ok {
 			if args, ok := p.isVArgs(va.X); ok { // varargs: this is a varargs store
@@ -806,20 +2201,65 @@ func (p *context) compileInstr(b llssa.Builder, instr ssa.Instruction) {
 				return
 			}
 		}
+		if isBlankFieldStore(va) {
+			_ = p.compileValue(b, v.Val)
+			return
+		}
+		if p.rewrites != nil {
+			if g, ok := va.(*ssa.Global); ok {
+				if _, ok := p.rewriteInitStore(v, g); ok {
+					return
+				}
+			}
+		}
 		ptr := p.compileValue(b, va)
 		val := p.compileValue(b, v.Val)
-		b.Store(ptr, val)
+		// Windows access violations report the faulting store PC. Preserve that
+		// exact source site for the SEH fault bridge without adding one carrier
+		// record per potential pointer store to ELF and Mach-O binaries, whose
+		// existing fault paths do not require this Windows-specific metadata.
+		if p.prog.Target().GOOS == "windows" && !isKnownNonNilAddr(va) && !isWrapNilCheckCall(va) {
+			p.recordPanicSite(b, v.Pos())
+		}
+		store := b.Store(ptr, val)
+		if p.isRecoverSlotAddr(va) {
+			store.SetVolatile(true)
+		}
 	case *ssa.Jump:
 		jmpb := p.jumpTo(v)
 		b.Jump(jmpb)
 	case *ssa.Return:
+		runDefers := p.returnNeedsImplicitRunDefers(v)
+		if runDefers {
+			p.spillImplicitDeferResults(b, v)
+			p.recordPanicLocation(b, v.Pos())
+			p.emitPCLineLabel(b, p.deferRunPos(v.Pos()))
+			b.RunDefers()
+		}
 		var results []llssa.Expr
 		if n := len(v.Results); n > 0 {
 			results = make([]llssa.Expr, n)
 			for i, r := range v.Results {
+				// A deferred call may change a named result independently of the
+				// SSA value in Return.Results. An unnamed result, conversely,
+				// must retain its pre-defer SSA value even though that value may
+				// not dominate the shared RunDefers continuation. Reload either
+				// kind from its entry-block storage after RunDefers.
+				if runDefers {
+					if slot := p.namedResultSlot(i); slot != nil {
+						results[i] = b.Load(p.compileValue(b, slot))
+						continue
+					}
+					results[i] = b.Load(p.implicitDeferResultSlot(i))
+					continue
+				}
 				results[i] = p.compileValue(b, r)
 			}
 		}
+		if p.shouldTrackCallerFrames() {
+			p.popCallerLocationFrame(b)
+		}
+		p.leaveExportedLocalContext(b)
 		b.Return(results...)
 	case *ssa.If:
 		fn := p.fn
@@ -832,22 +2272,36 @@ func (p *context) compileInstr(b llssa.Builder, instr ssa.Instruction) {
 		m := p.compileValue(b, v.Map)
 		key := p.compileValue(b, v.Key)
 		val := p.compileValue(b, v.Value)
+		p.recordPanicSite(b, v.Pos())
 		b.MapUpdate(m, key, val)
 	case *ssa.Defer:
+		if v.DeferStack != nil {
+			p.callDeferStack(b, p.blkInfos[v.Block().Index].Kind, &v.Call, v.DeferStack, v.Parent())
+			return
+		}
 		p.call(b, p.blkInfos[v.Block().Index].Kind, &v.Call)
 	case *ssa.Go:
 		p.call(b, llssa.Go, &v.Call)
 	case *ssa.RunDefers:
+		p.recordPanicLocation(b, v.Pos())
+		p.emitPCLineLabel(b, p.deferRunPos(v.Pos()))
 		b.RunDefers()
 	case *ssa.Panic:
 		arg := p.compileValue(b, v.X)
+		p.recordPanicLocation(b, v.Pos())
+		// panic is not a Call instruction, so callEx's statement anchor
+		// does not cover it; the panic snapshot attributes the panicking
+		// frame to this pc (issue5856 wants the panic line, not the
+		// nearest call's).
+		p.emitPCLineLabel(b, v.Pos())
 		b.Panic(arg)
 	case *ssa.Send:
 		ch := p.compileValue(b, v.Chan)
 		x := p.compileValue(b, v.X)
+		p.recordPanicSite(b, v.Pos())
 		b.Send(ch, x)
 	case *ssa.DebugRef:
-		if enableDbgSyms {
+		if p.options.DebugSymbols && v.Parent().Origin() == nil {
 			p.debugRef(b, v)
 		}
 	default:
@@ -856,16 +2310,19 @@ func (p *context) compileInstr(b llssa.Builder, instr ssa.Instruction) {
 }
 
 func (p *context) getLocalVariable(b llssa.Builder, fn *ssa.Function, v *types.Var) llssa.DIVar {
-	pos := p.fset.Position(v.Pos())
-	t := p.type_(v.Type(), llssa.InGo)
-	for i, param := range fn.Params {
-		if param.Object().(*types.Var) == v {
-			argNo := i + 1
-			return b.DIVarParam(p.fn, pos, v.Name(), t, argNo)
+	if p.debugDIVars != nil {
+		if div, ok := p.debugDIVars[v]; ok {
+			return div
 		}
 	}
+	pos := p.fset.Position(v.Pos())
+	t := p.type_(v.Type(), llssa.InGo)
 	scope := b.DIScope(p.fn, v.Parent())
-	return b.DIVarAuto(scope, pos, v.Name(), t)
+	div := b.DIVarAuto(scope, pos, v.Name(), t)
+	if p.debugDIVars != nil {
+		p.debugDIVars[v] = div
+	}
+	return div
 }
 
 func (p *context) compileFunction(v *ssa.Function) (goFn llssa.Function, pyFn llssa.PyObjRef, kind int) {
@@ -893,6 +2350,9 @@ func (p *context) compileValue(b llssa.Builder, v ssa.Value) llssa.Expr {
 			}
 		}
 	case *ssa.Function:
+		if _, _, ftype := p.funcName(v); ftype == llgoInstr {
+			v = ssawrap.MakeCallWrapper(p.goProg, v)
+		}
 		aFn, pyFn, _ := p.compileFunction(v)
 		if aFn != nil {
 			return aFn.Expr
@@ -904,7 +2364,7 @@ func (p *context) compileValue(b llssa.Builder, v ssa.Value) llssa.Expr {
 		if isCgoVar(varName) {
 			p.cgoSymbols = append(p.cgoSymbols, val.Name())
 		}
-		if enableDbgSyms {
+		if p.options.DebugSymbols && p.localityAllowsGlobalDebug(v) {
 			pos := p.fset.Position(v.Pos())
 			b.DIGlobal(val, v.Name(), pos)
 		}
@@ -920,11 +2380,247 @@ func (p *context) compileValue(b llssa.Builder, v ssa.Value) llssa.Expr {
 		fn := v.Parent()
 		for idx, freeVar := range fn.FreeVars {
 			if freeVar == v {
+				if p.canElideZeroSizedClosureEnv(fn) {
+					return p.elidedZeroSizedFreeVar(b, v)
+				}
 				return p.fn.FreeVar(b, idx)
 			}
 		}
 	}
 	panic(fmt.Sprintf("compileValue: unknown value - %T\n", v))
+}
+
+// isBlankFieldStore also recognizes stores into descendants of an aggregate
+// blank field. IndexAddr is followed only through an array's in-place storage,
+// never through a slice header into its separately allocated backing array.
+// The caller still evaluates the stored value for side effects.
+func isBlankFieldStore(addr ssa.Value) bool {
+	for {
+		switch current := addr.(type) {
+		case *ssa.FieldAddr:
+			_, st, ok := fieldAddrStruct(current)
+			if !ok {
+				return false
+			}
+			if st.Field(current.Field).Name() == "_" {
+				return true
+			}
+			addr = current.X
+		case *ssa.IndexAddr:
+			if current.X == nil || current.X.Type() == nil {
+				return false
+			}
+			ptr, ok := current.X.Type().Underlying().(*types.Pointer)
+			if !ok {
+				return false
+			}
+			if _, ok := ptr.Elem().Underlying().(*types.Array); !ok {
+				return false
+			}
+			addr = current.X
+		default:
+			return false
+		}
+	}
+}
+
+const rangeOverFuncYieldSynthetic = "range-over-func yield"
+
+func (p *context) rangeFuncCallNeedsDeferDrain(call *ssa.CallCommon) bool {
+	for _, arg := range call.Args {
+		closure, ok := arg.(*ssa.MakeClosure)
+		if !ok {
+			continue
+		}
+		fn, ok := closure.Fn.(*ssa.Function)
+		if !ok || fn.Synthetic != rangeOverFuncYieldSynthetic {
+			continue
+		}
+		if p.functionHasExplicitStackDefer(fn) {
+			return true
+		}
+	}
+	return false
+}
+
+// Explicit defer stacks live in nested yield closures, but their drain point
+// belongs to the enclosing function immediately after the rangefunc call.
+func (p *context) functionHasExplicitStackDefer(fn *ssa.Function) bool {
+	if p.stackDefers == nil {
+		p.stackDefers = make(map[*ssa.Function]bool)
+	}
+	return p.functionHasExplicitStackDeferSeen(fn, make(map[*ssa.Function]bool))
+}
+
+func (p *context) functionHasExplicitStackDeferSeen(fn *ssa.Function, seen map[*ssa.Function]bool) bool {
+	if fn == nil || seen[fn] {
+		return false
+	}
+	if p.stackDefers == nil {
+		p.stackDefers = make(map[*ssa.Function]bool)
+	}
+	if has, ok := p.stackDefers[fn]; ok {
+		return has
+	}
+	seen[fn] = true
+	for _, block := range fn.Blocks {
+		for _, instr := range block.Instrs {
+			if d, ok := instr.(*ssa.Defer); ok && d.DeferStack != nil {
+				p.stackDefers[fn] = true
+				return true
+			}
+		}
+	}
+	for _, child := range fn.AnonFuncs {
+		if p.functionHasExplicitStackDeferSeen(child, seen) {
+			p.stackDefers[fn] = true
+			return true
+		}
+	}
+	p.stackDefers[fn] = false
+	return false
+}
+
+// deferRunPos is where gc attributes a deferred function's caller frame:
+// the function's closing brace — defers run at function exit, not at the
+// defer statement (goroot issue14646, issue5856).
+func (p *context) deferRunPos(fallback token.Pos) token.Pos {
+	if p.goFn != nil {
+		switch syntax := p.goFn.Syntax().(type) {
+		case *ast.FuncDecl:
+			if syntax.Body != nil && syntax.Body.Rbrace.IsValid() {
+				return syntax.Body.Rbrace
+			}
+		case *ast.FuncLit:
+			if syntax.Body != nil && syntax.Body.Rbrace.IsValid() {
+				return syntax.Body.Rbrace
+			}
+		}
+	}
+	return fallback
+}
+
+// prepareImplicitDeferResults reserves entry-block storage for unnamed return
+// values that must survive the shared range-defer dispatcher. Named results
+// already have source-level slots that deferred calls are allowed to update.
+func (p *context) prepareImplicitDeferResults(b llssa.Builder, fn *ssa.Function) {
+	p.implicitDeferResults = nil
+	if !p.functionHasExplicitStackDeferInAnon(fn) {
+		return
+	}
+	results := fn.Signature.Results()
+	p.implicitDeferResults = make([]llssa.Expr, results.Len())
+	for i := 0; i < results.Len(); i++ {
+		if p.namedResultSlot(i) == nil {
+			p.implicitDeferResults[i] = b.Alloc(p.type_(results.At(i).Type(), llssa.InGo), false)
+		}
+	}
+}
+
+// spillImplicitDeferResults stores unnamed return values before RunDefers so
+// its continuation can reload the pre-defer values from entry-block slots.
+func (p *context) spillImplicitDeferResults(b llssa.Builder, ret *ssa.Return) {
+	for i, result := range ret.Results {
+		if p.namedResultSlot(i) == nil {
+			b.Store(p.implicitDeferResultSlot(i), p.compileValue(b, result))
+		}
+	}
+}
+
+// implicitDeferResultSlot makes the entry-block preparation invariant explicit:
+// compileBlock visits block 0 before any return block and reserves every unnamed
+// result slot needed by the same memoized defer predicate used at the return.
+func (p *context) implicitDeferResultSlot(index int) llssa.Expr {
+	if index < 0 || index >= len(p.implicitDeferResults) {
+		panic(fmt.Sprintf("missing implicit defer result slot %d", index))
+	}
+	slot := p.implicitDeferResults[index]
+	if slot.IsNil() {
+		panic(fmt.Sprintf("missing implicit defer result slot %d", index))
+	}
+	return slot
+}
+
+func (p *context) returnNeedsImplicitRunDefers(ret *ssa.Return) bool {
+	fn := ret.Parent()
+	if fn == nil || fn.Synthetic != "" || ret.Block() == fn.Recover {
+		return false
+	}
+	if previousNonDebugInstrIsRunDefers(ret) {
+		return false
+	}
+	return p.functionHasExplicitStackDeferInAnon(fn)
+}
+
+// namedResultSlot returns the allocation for fn's named result at index.
+// The SSA Function API exposes result variables through their source-level
+// Alloc instructions, while Return.Results only exposes the values currently
+// used to form a particular return tuple.
+func (p *context) namedResultSlot(index int) *ssa.Alloc {
+	fn := p.goFn
+	if fn == nil || index < 0 || index >= fn.Signature.Results().Len() {
+		return nil
+	}
+	result := fn.Signature.Results().At(index)
+	if result.Name() == "" {
+		return nil
+	}
+	for _, block := range fn.Blocks {
+		for _, instr := range block.Instrs {
+			alloc, ok := instr.(*ssa.Alloc)
+			if ok && alloc.Comment == result.Name() && alloc.Pos() == result.Pos() {
+				return alloc
+			}
+		}
+	}
+	return nil
+}
+
+func previousNonDebugInstrIsRunDefers(ret *ssa.Return) bool {
+	block := ret.Block()
+	if block == nil {
+		return false
+	}
+	for i := len(block.Instrs) - 1; i >= 0; i-- {
+		instr := block.Instrs[i]
+		if instr == ret {
+			continue
+		}
+		if _, ok := instr.(*ssa.DebugRef); ok {
+			continue
+		}
+		_, ok := instr.(*ssa.RunDefers)
+		return ok
+	}
+	return false
+}
+
+func (p *context) functionHasExplicitStackDeferInAnon(fn *ssa.Function) bool {
+	if p.anonDefers == nil {
+		p.anonDefers = make(map[*ssa.Function]bool)
+	}
+	return p.functionHasExplicitStackDeferInAnonSeen(fn, make(map[*ssa.Function]bool))
+}
+
+func (p *context) functionHasExplicitStackDeferInAnonSeen(fn *ssa.Function, seen map[*ssa.Function]bool) bool {
+	if fn == nil || seen[fn] {
+		return false
+	}
+	if p.anonDefers == nil {
+		p.anonDefers = make(map[*ssa.Function]bool)
+	}
+	if has, ok := p.anonDefers[fn]; ok {
+		return has
+	}
+	seen[fn] = true
+	for _, child := range fn.AnonFuncs {
+		if p.functionHasExplicitStackDeferSeen(child, seen) {
+			p.anonDefers[fn] = true
+			return true
+		}
+	}
+	p.anonDefers[fn] = false
+	return false
 }
 
 func (p *context) compileVArg(ret []llssa.Expr, b llssa.Builder, v ssa.Value) []llssa.Expr {
@@ -970,13 +2666,57 @@ type Patch struct {
 type Patches = map[string]Patch
 
 // NewPackage compiles a Go package to LLVM IR package.
+// Deprecated: use NewPackageExWithEmbedMetaOptions with explicit Options.
 func NewPackage(prog llssa.Program, pkg *ssa.Package, files []*ast.File) (ret llssa.Package, err error) {
-	ret, _, err = NewPackageEx(prog, nil, pkg, files)
+	ret, _, err = NewPackageEx(prog, nil, nil, pkg, files)
 	return
 }
 
+// NewPackageEx and NewPackage compile as a one-shot compilation: each
+// call gets fresh caller-tracking memoization. Multi-package drivers
+// use NewPackageExWithEmbed with a shared CallerTracking instead.
+
 // NewPackageEx compiles a Go package to LLVM IR package.
-func NewPackageEx(prog llssa.Program, patches Patches, pkg *ssa.Package, files []*ast.File) (ret llssa.Package, externs []string, err error) {
+//
+// Parameters:
+//   - prog: target LLVM SSA program context
+//   - patches: optional package patches applied during compilation
+//   - rewrites: per-package string initializers rewritten at compile time
+//   - pkg: SSA package to compile
+//   - files: parsed AST files that belong to the package
+//
+// The rewrites map uses short variable names (without package qualifier) and
+// only affects string-typed globals defined in the current package.
+// Deprecated: use NewPackageExWithEmbedMetaOptions with explicit Options.
+func NewPackageEx(prog llssa.Program, patches Patches, rewrites map[string]string, pkg *ssa.Package, files []*ast.File) (ret llssa.Package, externs []string, err error) {
+	return newPackageEx(prog, nil, patches, rewrites, pkg, files, nil, false, Options{})
+}
+
+// NewPackageExWithEmbed compiles a package using pre-loaded go:embed metadata.
+//
+// This avoids re-scanning directives when the caller already loaded them.
+// ct carries the compilation-scoped caller-tracking memoization; drivers
+// compiling multiple packages pass the same instance for every package
+// of one compilation (like patches). nil means one-shot: a fresh
+// instance is created for this call.
+// Deprecated: use NewPackageExWithEmbedMetaOptions with explicit Options.
+func NewPackageExWithEmbed(prog llssa.Program, ct *CallerTracking, patches Patches, rewrites map[string]string, pkg *ssa.Package, files []*ast.File, embedMap goembed.VarMap) (ret llssa.Package, externs []string, err error) {
+	return newPackageEx(prog, ct, patches, rewrites, pkg, files, &embedMap, false, Options{})
+}
+
+// NewPackageExWithEmbedMeta compiles a package and optionally collects metadata.
+// Deprecated: use NewPackageExWithEmbedMetaOptions with explicit Options.
+func NewPackageExWithEmbedMeta(prog llssa.Program, ct *CallerTracking, patches Patches, rewrites map[string]string, pkg *ssa.Package, files []*ast.File, embedMap goembed.VarMap, metaCollect bool) (ret llssa.Package, externs []string, err error) {
+	return newPackageEx(prog, ct, patches, rewrites, pkg, files, &embedMap, metaCollect, Options{})
+}
+
+// NewPackageExWithEmbedMetaOptions is NewPackageExWithEmbedMeta with explicit
+// per-package frontend options.
+func NewPackageExWithEmbedMetaOptions(prog llssa.Program, ct *CallerTracking, patches Patches, rewrites map[string]string, pkg *ssa.Package, files []*ast.File, embedMap goembed.VarMap, metaCollect bool, options Options) (ret llssa.Package, externs []string, err error) {
+	return newPackageEx(prog, ct, patches, rewrites, pkg, files, &embedMap, metaCollect, options)
+}
+
+func newPackageEx(prog llssa.Program, ct *CallerTracking, patches Patches, rewrites map[string]string, pkg *ssa.Package, files []*ast.File, embedMap *goembed.VarMap, metaCollect bool, options Options) (ret llssa.Package, externs []string, err error) {
 	pkgProg := pkg.Prog
 	pkgTypes := pkg.Pkg
 	oldTypes := pkgTypes
@@ -987,34 +2727,66 @@ func NewPackageEx(prog llssa.Program, patches Patches, pkg *ssa.Package, files [
 		pkg.Pkg = pkgTypes
 		patch.Alt.Pkg = pkgTypes
 	}
+	if !options.PreloadedSyntax {
+		if err = ParsePkgSyntaxWithOptions(prog, pkgProg.Fset, pkgTypes, files, options); err != nil {
+			return nil, nil, err
+		}
+	}
+	if err = prog.ValidateLocalitiesFor(pkgTypes); err != nil {
+		return nil, nil, err
+	}
+	if err = validateLocalInitializers(prog, pkgTypes); err != nil {
+		return nil, nil, err
+	}
 	if pkgPath == llssa.PkgRuntime {
 		prog.SetRuntime(pkgTypes)
 	}
-	ret = prog.NewPackage(pkgName, pkgPath)
-	if enableDbg {
+	ret = prog.NewPackageEx(pkgName, pkgPath, metaCollect)
+	if options.Debug {
 		ret.InitDebug(pkgName, pkgPath, pkgProg.Fset)
+		defer ret.FinalizeDebug()
 	}
 
+	if ct == nil {
+		ct = NewCallerTracking()
+	}
 	ctx := &context{
-		prog:    prog,
-		pkg:     ret,
-		fset:    pkgProg.Fset,
-		goProg:  pkgProg,
-		goTyps:  pkgTypes,
-		goPkg:   pkg,
-		patches: patches,
-		skips:   make(map[string]none),
-		vargs:   make(map[*ssa.Alloc][]llssa.Expr),
+		prog:             prog,
+		pkg:              ret,
+		fset:             pkgProg.Fset,
+		goProg:           pkgProg,
+		goTyps:           pkgTypes,
+		goPkg:            pkg,
+		patches:          patches,
+		options:          options,
+		skips:            make(map[string]none),
+		vargs:            make(map[*ssa.Alloc][]llssa.Expr),
+		funcs:            make(map[*ssa.Function]llssa.Function),
+		linkOnceFns:      make(map[*ssa.Function]none),
+		recoverFacts:     ct.recoverAnalysis(),
+		addrOfFieldAddrs: collectAddrOfFieldSelectors(files),
 		loaded: map[*types.Package]*pkgInfo{
 			types.Unsafe: {kind: PkgDeclOnly}, // TODO(xsw): PkgNoInit or PkgDeclOnly?
 		},
-		cgoExports: make(map[string]string),
 		cgoSymbols: make([]string, 0, 128),
+		rewrites:   rewrites,
+
+		trackCallerFrames:  filesUseRuntimeCaller(files) || packageUsesRuntimeCaller(ct, pkg),
+		runtimeCallerFuncs: runtimeCallerFuncSet(ct, pkg),
+		panicSiteFuncs:     recoverPanicSiteFuncSet(ct, pkg),
+	}
+	if embedMap != nil {
+		ctx.embedMap = *embedMap
+	} else {
+		ctx.embedMap, err = goembed.LoadDirectives(ctx.fset, files)
+		if err != nil {
+			panic(err)
+		}
 	}
 	ctx.initPyModule()
 	ctx.initFiles(pkgPath, files, pkgName == "C")
 	ctx.prog.SetPatch(ctx.patchType)
-	ret.SetPatch(ctx.patchType)
+	ctx.prog.SetCompileMethods(ctx.checkCompileMethods)
 	ret.SetResolveLinkname(ctx.resolveLinkname)
 
 	if hasPatch {
@@ -1043,13 +2815,13 @@ func NewPackageEx(prog llssa.Program, patches Patches, pkg *ssa.Package, files [
 		ctx.initAfter = nil
 		fn()
 	}
-	externs = ctx.cgoSymbols
-	for fnName, exportName := range ctx.cgoExports {
-		fn := ret.FuncOf(fnName)
-		if fn != nil {
-			fn.SetName(exportName)
+	ret.MaterializePreserveSyms()
+	if metaCollect {
+		if err := ret.FinishMetaCollection(); err != nil {
+			return nil, nil, fmt.Errorf("build meta for %s: %w", pkgPath, err)
 		}
 	}
+	externs = ctx.cgoSymbols
 	return
 }
 
@@ -1063,6 +2835,8 @@ func processPkg(ctx *context, ret llssa.Package, pkg *ssa.Package) {
 		val  ssa.Member
 	}
 
+	ctx.collectStaticGlobalInits(pkg)
+
 	members := make([]*namedMember, 0, len(pkg.Members))
 	skips := ctx.skips
 	for name, v := range pkg.Members {
@@ -1073,11 +2847,25 @@ func processPkg(ctx *context, ret llssa.Package, pkg *ssa.Package) {
 	sort.Slice(members, func(i, j int) bool {
 		return members[i].name < members[j].name
 	})
+	localGlobals := make([]*ssa.Global, 0)
+	for _, m := range members {
+		global, ok := m.val.(*ssa.Global)
+		if !ok || isCgoFuncPtrVar(global.Name()) {
+			continue
+		}
+		localGlobals = append(localGlobals, global)
+	}
+	// Address accessors and replay guards must exist before any function body
+	// can reference a local package variable, regardless of member sort order.
+	ctx.prepareLocalVariables(ret, localGlobals)
 
 	for _, m := range members {
 		member := m.val
 		switch member := member.(type) {
 		case *ssa.Function:
+			if strings.HasSuffix(member.Name(), "_trampoline") {
+				continue
+			}
 			if member.TypeParams() != nil || member.TypeArgs() != nil {
 				// TODO(xsw): don't compile generic functions
 				// Do not try to build generic (non-instantiated) functions.
@@ -1087,25 +2875,10 @@ func processPkg(ctx *context, ret llssa.Package, pkg *ssa.Package) {
 		case *ssa.Type:
 			ctx.compileType(ret, member)
 		case *ssa.Global:
-			if !isCgoVar(member.Name()) {
+			if !isCgoFuncPtrVar(member.Name()) {
 				ctx.compileGlobal(ret, member)
 			}
 		}
-	}
-
-	// check instantiate named in RuntimeTypes
-	var typs []*types.Named
-	for _, T := range pkg.Prog.RuntimeTypes() {
-		if typ, ok := T.(*types.Named); ok && typ.TypeArgs() != nil && typ.Obj().Pkg() == pkg.Pkg {
-			typs = append(typs, typ)
-		}
-	}
-	sort.Slice(typs, func(i, j int) bool {
-		return typs[i].String() < typs[j].String()
-	})
-	for _, typ := range typs {
-		ctx.compileMethods(ret, typ)
-		ctx.compileMethods(ret, types.NewPointer(typ))
 	}
 }
 
@@ -1124,7 +2897,54 @@ func (p *context) _patchType(typ types.Type) (types.Type, bool) {
 		if t, ok := p._patchType(typ.Elem()); ok {
 			return types.NewPointer(t), true
 		}
+	case *types.Slice:
+		if t, ok := p._patchType(typ.Elem()); ok {
+			return types.NewSlice(t), true
+		}
+	case *types.Array:
+		if t, ok := p._patchType(typ.Elem()); ok {
+			return types.NewArray(t, typ.Len()), true
+		}
+	case *types.Map:
+		var patched bool
+		key := typ.Key()
+		elem := typ.Elem()
+		if t, ok := p._patchType(key); ok {
+			key = t
+			patched = true
+		}
+		if t, ok := p._patchType(elem); ok {
+			elem = t
+			patched = true
+		}
+		if patched {
+			return types.NewMap(key, elem), true
+		}
+	case *types.Chan:
+		if t, ok := p._patchType(typ.Elem()); ok {
+			return types.NewChan(typ.Dir(), t), true
+		}
+	case *types.Struct:
+		var patched bool
+		vars := make([]*types.Var, typ.NumFields())
+		tags := make([]string, typ.NumFields())
+		for i := 0; i < typ.NumFields(); i++ {
+			v := typ.Field(i)
+			if t, ok := p._patchType(v.Type()); ok {
+				vars[i] = types.NewField(v.Pos(), v.Pkg(), v.Name(), t, v.Anonymous())
+				patched = true
+			} else {
+				vars[i] = v
+			}
+			tags[i] = typ.Tag(i)
+		}
+		if patched {
+			return types.NewStruct(vars, tags), true
+		}
 	case *types.Named:
+		if t, ok := p.patchLocalGenericNamed(typ); ok {
+			return t, true
+		}
 		o := typ.Obj()
 		if pkg := o.Pkg(); typepatch.IsPatched(pkg) {
 			if patch, ok := p.patches[pkg.Path()]; ok {
@@ -1159,6 +2979,240 @@ func (p *context) _patchType(typ types.Type) (types.Type, bool) {
 	return typ, false
 }
 
+func (p *context) patchLocalGenericNamed(t *types.Named) (*types.Named, bool) {
+	if p.goFn == nil || len(p.goFn.TypeArgs()) == 0 || !p.isGenericLocalType(t.Obj()) {
+		return nil, false
+	}
+	if isPatchedLocalGenericName(t.Obj().Name()) {
+		return nil, false
+	}
+	// The generated name already carries the local type's complete identity.
+	// Keep this detached object positionless so ABI naming does not append a
+	// loader-relative token.Pos that changes between package-cache processes.
+	obj := types.NewTypeName(token.NoPos, t.Obj().Pkg(), p.localNamedName(t, false), nil)
+	return types.NewNamed(obj, t.Underlying(), nil), true
+}
+
+func isPatchedLocalGenericName(name string) bool {
+	// The patched name embeds type arguments in brackets. Go identifiers cannot
+	// contain '[', so this also prevents repeatedly expanding the generated name.
+	return strings.Contains(name, "[")
+}
+
+func (p *context) localNamedName(t *types.Named, suffix bool) string {
+	obj := t.Obj()
+	name := obj.Name()
+	if isPatchedLocalGenericName(name) {
+		return name
+	}
+	outer := p.localTypeOuterArgs(obj)
+	own := typeListArgs(t.TypeArgs(), p.typeArgName)
+	switch {
+	case len(outer) != 0 && len(own) != 0:
+		name += "[" + strings.Join(outer, ",") + ";" + strings.Join(own, ",") + "]"
+	case len(outer) != 0:
+		name += "[" + strings.Join(outer, ",") + "]"
+	case len(own) != 0:
+		name += "[" + strings.Join(own, ",") + "]"
+	}
+	if suffix {
+		if n := p.localTypeOrdinal(obj); n != 0 {
+			name += "·" + strconv.Itoa(n)
+		}
+	}
+	return name
+}
+
+func (p *context) localTypeOuterArgs(obj types.Object) []string {
+	// localNamedName is also used by non-local type arguments, so keep this
+	// guard here even though patchLocalGenericNamed has already checked it.
+	if p.goFn == nil || len(p.goFn.TypeArgs()) == 0 || !p.isGenericLocalType(obj) {
+		return nil
+	}
+	args := p.goFn.TypeArgs()
+	ret := make([]string, len(args))
+	for i, arg := range args {
+		ret[i] = p.typeArgName(arg)
+	}
+	return ret
+}
+
+func typeListArgs(list *types.TypeList, nameOf func(types.Type) string) []string {
+	if list == nil {
+		return nil
+	}
+	ret := make([]string, list.Len())
+	for i := 0; i < list.Len(); i++ {
+		ret[i] = nameOf(list.At(i))
+	}
+	return ret
+}
+
+func (p *context) typeArgName(t types.Type) string {
+	// Keep this formatter aligned with ssa/abi.typeArgString; this variant must
+	// additionally encode local generic type names while patching frontend types.
+	switch t := t.(type) {
+	case *types.Alias:
+		return p.typeArgName(types.Unalias(t))
+	case *types.Basic:
+		return t.String()
+	case *types.Named:
+		name := p.localNamedName(t, p.isLocalType(t.Obj()))
+		if pkg := t.Obj().Pkg(); pkg != nil {
+			return reflectTypeArgPkgPath(pkg) + "." + name
+		}
+		return name
+	case *types.Pointer:
+		return "*" + p.typeArgName(t.Elem())
+	case *types.Slice:
+		return "[]" + p.typeArgName(t.Elem())
+	case *types.Array:
+		return fmt.Sprintf("[%v]%s", t.Len(), p.typeArgName(t.Elem()))
+	case *types.Map:
+		return fmt.Sprintf("map[%s]%s", p.typeArgName(t.Key()), p.typeArgName(t.Elem()))
+	case *types.Chan:
+		s := chanDirName(t.Dir())
+		elem := p.typeArgName(t.Elem())
+		if t.Dir() == types.SendRecv {
+			if ch, ok := t.Elem().(*types.Chan); ok && ch.Dir() == types.RecvOnly {
+				elem = "(" + elem + ")"
+			}
+		}
+		return fmt.Sprintf("%s %s", s, elem)
+	default:
+		return types.TypeString(t, reflectTypeArgPkgPath)
+	}
+}
+
+func chanDirName(dir types.ChanDir) string {
+	switch dir {
+	case types.SendRecv:
+		return "chan"
+	case types.SendOnly:
+		return "chan<-"
+	case types.RecvOnly:
+		return "<-chan"
+	default:
+		panic("invalid channel direction")
+	}
+}
+
+func reflectTypeArgPkgPath(pkg *types.Package) string {
+	if pkg == nil {
+		return ""
+	}
+	if pkg.Path() == "command-line-arguments" && pkg.Name() != "" {
+		return pkg.Name()
+	}
+	return llssa.PathOf(pkg)
+}
+
+func (p *context) isGenericLocalType(obj types.Object) bool {
+	if !p.isLocalType(obj) {
+		return false
+	}
+	if obj.Parent() == nil {
+		return p.inCurrentFunction(obj.Pos())
+	}
+	for scope := obj.Parent(); scope != nil; scope = scope.Parent() {
+		if pkg := obj.Pkg(); pkg != nil && scope == pkg.Scope() {
+			return false
+		}
+		if scopeHasTypeParams(scope) {
+			return true
+		}
+	}
+	return false
+}
+
+func (p *context) isLocalType(obj types.Object) bool {
+	if obj == nil || obj.Pkg() == nil {
+		return false
+	}
+	parent := obj.Parent()
+	if parent == nil {
+		return obj.Pos().IsValid()
+	}
+	return parent != obj.Pkg().Scope()
+}
+
+func scopeHasTypeParams(scope *types.Scope) bool {
+	for _, name := range scope.Names() {
+		if isTypeParamObject(scope.Lookup(name)) {
+			return true
+		}
+	}
+	return false
+}
+
+func (p *context) localTypeOrdinal(obj types.Object) int {
+	scope := obj.Parent()
+	if scope == nil || !obj.Pos().IsValid() {
+		return p.localTypeOrdinalBySyntax(obj.Pos())
+	}
+	n := 0
+	for _, name := range scope.Names() {
+		o := scope.Lookup(name)
+		if _, ok := o.(*types.TypeName); !ok || isTypeParamObject(o) {
+			continue
+		}
+		if pos := o.Pos(); pos.IsValid() && pos <= obj.Pos() {
+			n++
+		}
+	}
+	return n
+}
+
+func (p *context) inCurrentFunction(pos token.Pos) bool {
+	return p.enclosingFunctionSyntax(pos) != nil
+}
+
+func (p *context) localTypeOrdinalBySyntax(pos token.Pos) int {
+	syntax := p.enclosingFunctionSyntax(pos)
+	if syntax == nil {
+		return 0
+	}
+	n := 0
+	ast.Inspect(syntax, func(node ast.Node) bool {
+		spec, ok := node.(*ast.TypeSpec)
+		if !ok {
+			return true
+		}
+		if spec.Name != nil && spec.Name.Pos().IsValid() && spec.Name.Pos() <= pos {
+			n++
+		}
+		return true
+	})
+	return n
+}
+
+func (p *context) enclosingFunctionSyntax(pos token.Pos) ast.Node {
+	if !pos.IsValid() {
+		return nil
+	}
+	// Instantiated local types may lose their scope parent while a nested
+	// closure still refers to a declaration in its enclosing generic function.
+	for fn := p.goFn; fn != nil; fn = fn.Parent() {
+		syntaxFn := fn
+		if origin := fn.Origin(); origin != nil {
+			syntaxFn = origin
+		}
+		if syntax := syntaxFn.Syntax(); syntax != nil && syntax.Pos() <= pos && pos <= syntax.End() {
+			return syntax
+		}
+	}
+	return nil
+}
+
+func isTypeParamObject(obj types.Object) bool {
+	tn, ok := obj.(*types.TypeName)
+	if !ok {
+		return false
+	}
+	_, ok = tn.Type().(*types.TypeParam)
+	return ok
+}
+
 func instantiate(orig types.Type, t *types.Named) (typ types.Type) {
 	typ, _ = llssa.Instantiate(orig, t)
 	return
@@ -1173,6 +3227,34 @@ func (p *context) resolveLinkname(name string) string {
 		return ltarget
 	}
 	return name
+}
+
+// checkCompileMethods ensures that methods referenced from ABI method tables
+// are available to the linker. Generic instances and anonymous structural
+// types are emitted in the current SSA package. Package-level non-generic
+// named types normally have source methods emitted by their defining package,
+// but promoted wrappers can be synthesized only when a use-site asks for a
+// method table, so emit those wrappers on demand.
+func (p *context) checkCompileMethods(pkg llssa.Package, typ types.Type) {
+	nt := typ
+retry:
+	switch t := types.Unalias(nt).(type) {
+	case *types.Named:
+		if t.TypeArgs() == nil {
+			obj := t.Obj()
+			// skip package-level type
+			if obj.Parent() == obj.Pkg().Scope() {
+				p.compileSyntheticMethods(pkg, typ)
+				return
+			}
+		}
+		p.compileMethods(pkg, typ)
+	case *types.Struct:
+		p.compileMethods(pkg, typ)
+	case *types.Pointer:
+		nt = t.Elem()
+		goto retry
+	}
 }
 
 // -----------------------------------------------------------------------------

@@ -1,0 +1,4 @@
+list = 10 1 1
+nested = 1 1
+tuple = 2
+str = 1 true

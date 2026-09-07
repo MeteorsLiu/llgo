@@ -1,6 +1,6 @@
 // Copyright 2015 The Go Authors. All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Use of this source code is governed by a BSD-style license.
+// See LICENSES/Go-BSD-3-Clause.txt at this module root for license terms.
 
 // Garbage collector: write barriers.
 //
@@ -16,7 +16,7 @@ package runtime
 import (
 	"unsafe"
 
-	c "github.com/goplus/llgo/runtime/internal/clite"
+	c "github.com/xgo-dev/llgo/runtime/internal/clite"
 )
 
 // Go uses a hybrid barrier that combines a Yuasa-style deletion
@@ -158,6 +158,27 @@ func Typedmemmove(typ *Type, dst, src unsafe.Pointer) {
 	// barrier, so at worst we've unnecessarily greyed the old
 	// pointer that was in src.
 	c.Memmove(dst, src, typ.Size_)
+}
+
+// typedSliceCopy keeps only the minimal copy semantics needed by llgo reflect.Copy.
+func typedSliceCopy(typ *_type, dstPtr unsafe.Pointer, dstLen int, srcPtr unsafe.Pointer, srcLen int) int {
+	n := dstLen
+	if n > srcLen {
+		n = srcLen
+	}
+	if n == 0 || dstPtr == srcPtr {
+		return n
+	}
+	c.Memmove(dstPtr, srcPtr, uintptr(n)*typ.Size_)
+	return n
+}
+
+// Typedslicecopy is the runtime entry used by reflect.Copy via linkname.
+func Typedslicecopy(elemType *Type, dst, src Slice) int {
+	if !elemType.Pointers() {
+		return SliceCopy(dst, src.data, src.len, int(elemType.Size_))
+	}
+	return typedSliceCopy(elemType, dst.data, dst.len, src.data, src.len)
 }
 
 /*

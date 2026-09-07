@@ -6,19 +6,21 @@ package env
 import (
 	"os"
 	"path/filepath"
+	"runtime"
+	"strings"
 	"testing"
 )
 
 func TestGOROOT(t *testing.T) {
 	// Test with GOROOT environment variable set
-	t.Run("with GOROOT env", func(t *testing.T) {
+	t.Run("with GOROOT bad env", func(t *testing.T) {
 		origGoRoot := os.Getenv("GOROOT")
 		defer os.Setenv("GOROOT", origGoRoot)
 
-		expected := "/custom/goroot"
-		os.Setenv("GOROOT", expected)
-		if got := GOROOT(); got != expected {
-			t.Errorf("GOROOT() = %v, want %v", got, expected)
+		bad := "/custom/badgoroot"
+		os.Setenv("GOROOT", bad)
+		if got, err := GOROOT(); got == bad || err == nil {
+			t.Fatal("bad GOROOT")
 		}
 	})
 
@@ -28,8 +30,82 @@ func TestGOROOT(t *testing.T) {
 		defer os.Setenv("GOROOT", origGoRoot)
 
 		os.Setenv("GOROOT", "")
-		if got := GOROOT(); got == "" {
+		if got, _ := GOROOT(); got == "" {
 			t.Error("GOROOT() should not return empty when using go env")
+		}
+	})
+}
+
+func TestGOROOTWithEnv(t *testing.T) {
+	t.Run("with bad explicit env", func(t *testing.T) {
+		env := appendEnv(os.Environ(), "GOROOT=/custom/badgoroot")
+		if got, err := GOROOTWithEnv(env); got == "/custom/badgoroot" || err == nil {
+			t.Fatal("GOROOTWithEnv should reject bad explicit GOROOT")
+		}
+	})
+
+	t.Run("with explicit inherited env", func(t *testing.T) {
+		got, err := GOROOTWithEnv(os.Environ())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got == "" {
+			t.Fatal("GOROOTWithEnv should not return empty")
+		}
+	})
+}
+
+func TestGOVERSIONWithEnv(t *testing.T) {
+	t.Run("with explicit inherited env", func(t *testing.T) {
+		got, err := GOVERSIONWithEnv(os.Environ())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.HasPrefix(got, "go1.") {
+			t.Fatalf("GOVERSIONWithEnv() = %q, want go1.x", got)
+		}
+	})
+
+	t.Run("with go env failure", func(t *testing.T) {
+		prependFakeGo(t, "echo bad goversion >&2\nexit 2\n")
+		if got, err := GOVERSIONWithEnv(nil); err == nil || got != "" {
+			t.Fatalf("GOVERSIONWithEnv() = %q, %v, want error", got, err)
+		}
+	})
+}
+
+func TestGOROOTAndGOVERSIONWithEnv(t *testing.T) {
+	goroot, goversion, err := GOROOTAndGOVERSIONWithEnv(os.Environ())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if goroot == "" {
+		t.Fatal("GOROOTAndGOVERSIONWithEnv should not return empty GOROOT")
+	}
+	if !strings.HasPrefix(goversion, "go1.") {
+		t.Fatalf("GOROOTAndGOVERSIONWithEnv goversion = %q, want go1.x", goversion)
+	}
+
+	t.Run("with go env failure", func(t *testing.T) {
+		prependFakeGo(t, "echo bad go env >&2\nexit 2\n")
+		goroot, goversion, err := GOROOTAndGOVERSIONWithEnv(nil)
+		if err == nil || goroot != "" || goversion != "" {
+			t.Fatalf("GOROOTAndGOVERSIONWithEnv() = %q, %q, %v, want error", goroot, goversion, err)
+		}
+	})
+}
+
+func TestGoEnvWithEnvErrors(t *testing.T) {
+	t.Run("without variables", func(t *testing.T) {
+		if got, err := GoEnvWithEnv(nil); err == nil || got != nil {
+			t.Fatalf("GoEnvWithEnv() = %v, %v, want error", got, err)
+		}
+	})
+
+	t.Run("wrong output count", func(t *testing.T) {
+		prependFakeGo(t, "echo only-one\n")
+		if got, err := GoEnvWithEnv(nil, "GOROOT", "GOVERSION"); err == nil || got != nil {
+			t.Fatalf("GoEnvWithEnv() = %v, %v, want output count error", got, err)
 		}
 	})
 }
@@ -43,7 +119,7 @@ func TestLLGoRuntimeDir(t *testing.T) {
 		tmpDir := t.TempDir()
 		runtimeDir := filepath.Join(tmpDir, "runtime")
 		os.MkdirAll(runtimeDir, 0755)
-		goModContent := []byte("module github.com/goplus/llgo/runtime\n")
+		goModContent := []byte("module github.com/xgo-dev/llgo/runtime\n")
 		if err := os.WriteFile(filepath.Join(runtimeDir, "go.mod"), goModContent, 0644); err != nil {
 			t.Fatal(err)
 		}
@@ -96,7 +172,7 @@ func TestLLGoROOT(t *testing.T) {
 		tmpDir := t.TempDir()
 		runtimeDir := filepath.Join(tmpDir, "runtime")
 		os.MkdirAll(runtimeDir, 0755)
-		goModContent := []byte("module github.com/goplus/llgo/runtime\n")
+		goModContent := []byte("module github.com/xgo-dev/llgo/runtime\n")
 		if err := os.WriteFile(filepath.Join(runtimeDir, "go.mod"), goModContent, 0644); err != nil {
 			t.Fatal(err)
 		}
@@ -171,19 +247,63 @@ func TestIsLLGoRoot(t *testing.T) {
 		}
 	})
 
-	// Test with valid path and valid go.mod
-	t.Run("valid path and go.mod", func(t *testing.T) {
-		tmpDir := t.TempDir()
-		runtimeDir := filepath.Join(tmpDir, "runtime")
-		os.MkdirAll(runtimeDir, 0755)
-		goModContent := []byte("module github.com/goplus/llgo/runtime\n")
-		if err := os.WriteFile(filepath.Join(runtimeDir, "go.mod"), goModContent, 0644); err != nil {
-			t.Fatal(err)
-		}
+	for _, test := range []struct {
+		name      string
+		lineBreak string
+	}{
+		{name: "LF", lineBreak: "\n"},
+		{name: "CRLF", lineBreak: "\r\n"},
+	} {
+		t.Run("valid path and go.mod "+test.name, func(t *testing.T) {
+			tmpDir := t.TempDir()
+			runtimeDir := filepath.Join(tmpDir, "runtime")
+			os.MkdirAll(runtimeDir, 0755)
+			goModContent := []byte("module github.com/xgo-dev/llgo/runtime" + test.lineBreak)
+			if err := os.WriteFile(filepath.Join(runtimeDir, "go.mod"), goModContent, 0644); err != nil {
+				t.Fatal(err)
+			}
 
-		absPath, _ := filepath.Abs(tmpDir)
-		if root, ok := isLLGoRoot(tmpDir); !ok || root != absPath {
-			t.Errorf("isLLGoRoot(valid) = %v, %v, want %v, true", root, ok, absPath)
+			absPath, _ := filepath.Abs(tmpDir)
+			if root, ok := isLLGoRoot(tmpDir); !ok || root != absPath {
+				t.Errorf("isLLGoRoot(valid) = %v, %v, want %v, true", root, ok, absPath)
+			}
+		})
+	}
+}
+
+func appendEnv(base []string, overrides ...string) []string {
+	out := append([]string(nil), base...)
+	for _, override := range overrides {
+		key, _, ok := strings.Cut(override, "=")
+		if !ok {
+			out = append(out, override)
+			continue
 		}
-	})
+		replaced := false
+		prefix := key + "="
+		for i, entry := range out {
+			if strings.HasPrefix(entry, prefix) {
+				out[i] = override
+				replaced = true
+				break
+			}
+		}
+		if !replaced {
+			out = append(out, override)
+		}
+	}
+	return out
+}
+
+func prependFakeGo(t *testing.T, script string) {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("fake go shell script is Unix-only")
+	}
+	dir := t.TempDir()
+	path := filepath.Join(dir, "go")
+	if err := os.WriteFile(path, []byte("#!/bin/sh\n"+script), 0755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
 }

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2024 The GoPlus Authors (goplus.org). All rights reserved.
+ * Copyright (c) 2024 The XGo Authors (xgo.dev). All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -23,10 +23,11 @@ import (
 	"go/types"
 	"hash"
 	"log"
+	"strconv"
 	"strings"
 
-	"github.com/goplus/llgo/internal/env"
-	"github.com/goplus/llgo/runtime/abi"
+	"github.com/xgo-dev/llgo/internal/env"
+	"github.com/xgo-dev/llgo/runtime/abi"
 )
 
 // -----------------------------------------------------------------------------
@@ -71,11 +72,11 @@ func ChanDir(dir types.ChanDir) (abi.ChanDir, string) {
 	case types.SendRecv:
 		return abi.BothDir, "chan"
 	case types.SendOnly:
-		return abi.SendDir, "chan->"
+		return abi.SendDir, "chan<-"
 	case types.RecvOnly:
 		return abi.RecvDir, "<-chan"
 	}
-	panic("invlid chan dir")
+	panic("invalid chan dir")
 }
 
 // -----------------------------------------------------------------------------
@@ -131,20 +132,22 @@ func DataKindOf(raw types.Type, lvl int, is32Bits bool) (DataKind, types.Type, i
 
 // Builder is a helper for constructing ABI types.
 type Builder struct {
-	buf []byte
-	Pkg string
+	buf     []byte
+	PtrSize uintptr
+	Sizes   types.Sizes
 }
 
 // New creates a new ABI type Builder.
-func New(pkg string) *Builder {
+func New(ptrSize uintptr, sizes types.Sizes) *Builder {
 	ret := new(Builder)
-	ret.Init(pkg)
+	ret.Init(ptrSize, sizes)
 	return ret
 }
 
-func (b *Builder) Init(pkg string) {
-	b.Pkg = pkg
+func (b *Builder) Init(ptrSize uintptr, sizes types.Sizes) {
 	b.buf = make([]byte, sha256.Size)
+	b.PtrSize = ptrSize
+	b.Sizes = sizes
 }
 
 // TypeName returns the ABI type name for the specified type.
@@ -168,7 +171,8 @@ func (b *Builder) TypeName(t types.Type) (ret string, pub bool) {
 	case *types.Named:
 		o := t.Obj()
 		pkg := o.Pkg()
-		return "_llgo_" + FullName(pkg, NamedName(t)), (pkg == nil || o.Exported())
+		ids := scopeIndices(o)
+		return "_llgo_" + FullName(pkg, NamedName(t)+ids), (pkg == nil || o.Exported() && ids == "")
 	case *types.Interface:
 		if t.Empty() {
 			return "_llgo_any", true
@@ -202,7 +206,7 @@ func NamedName(t *types.Named) string {
 		n := targs.Len()
 		infos := make([]string, n)
 		for i := 0; i < n; i++ {
-			infos[i] = types.TypeString(targs.At(i), PathOf)
+			infos[i] = typeArgString(targs.At(i))
 		}
 		return t.Obj().Name() + "[" + strings.Join(infos, ",") + "]"
 	}
@@ -212,19 +216,86 @@ func NamedName(t *types.Named) string {
 func TypeArgs(typeArgs []types.Type) string {
 	targs := make([]string, len(typeArgs))
 	for i, t := range typeArgs {
-		targs[i] = types.TypeString(t, PathOf)
+		targs[i] = typeArgString(t)
 	}
 	return "[" + strings.Join(targs, ",") + "]"
 }
 
+func namedLikeTypeArgString(obj types.Object, targs *types.TypeList) string {
+	name := obj.Name()
+	if targs != nil {
+		n := targs.Len()
+		infos := make([]string, n)
+		for i := 0; i < n; i++ {
+			infos[i] = typeArgString(targs.At(i))
+		}
+		name += "[" + strings.Join(infos, ",") + "]"
+	}
+	// Distinct local types may share the same object name (e.g. in stdlib
+	// tests). Disambiguate them in symbol names using stable scope indices.
+	name += scopeIndices(obj)
+	if pkg := obj.Pkg(); pkg != nil {
+		return PathOf(pkg) + "." + name
+	}
+	return name
+}
+
+func typeArgString(t types.Type) string {
+	switch t := t.(type) {
+	case *types.Alias:
+		return typeArgString(types.Unalias(t))
+	case *types.Basic:
+		// byte and rune are aliases for uint8 and int32. go/types may cache a
+		// generic instance using either spelling, so ABI symbols must not
+		// depend on which spelling was instantiated first.
+		switch t.Kind() {
+		case types.Byte:
+			return types.Typ[types.Uint8].String()
+		case types.Rune:
+			return types.Typ[types.Int32].String()
+		}
+		return t.String()
+	case *types.Named:
+		return namedLikeTypeArgString(t.Obj(), t.TypeArgs())
+	case *types.Pointer:
+		return "*" + typeArgString(t.Elem())
+	case *types.Slice:
+		return "[]" + typeArgString(t.Elem())
+	case *types.Array:
+		return fmt.Sprintf("[%v]%s", t.Len(), typeArgString(t.Elem()))
+	case *types.Map:
+		return fmt.Sprintf("map[%s]%s", typeArgString(t.Key()), typeArgString(t.Elem()))
+	case *types.Chan:
+		_, s := ChanDir(t.Dir())
+		elem := t.Elem()
+		elemStr := typeArgString(elem)
+		// Keep canonical channel formatting for nested directional channels.
+		// Example: chan (<-chan int), not "chan <-chan int" (ambiguous).
+		if t.Dir() == types.SendRecv {
+			if ch, ok := elem.(*types.Chan); ok && ch.Dir() == types.RecvOnly {
+				elemStr = "(" + elemStr + ")"
+			}
+		}
+		return fmt.Sprintf("%s %s", s, elemStr)
+	default:
+		// Fallback for rare type arguments (e.g. signature/interface/struct).
+		// Collisions are mainly caused by local named types, handled above.
+		return types.TypeString(t, PathOf)
+	}
+}
+
 const (
 	PatchPathPrefix = env.LLGoRuntimePkg + "/internal/lib/"
+	ForTestMarker   = "@ForTest"
 )
 
 // PathOf returns the package path of the specified package.
 func PathOf(pkg *types.Package) string {
 	if pkg == nil {
 		return ""
+	}
+	if pkg.Name() == "main" && pkg.Scope().Lookup(ForTestMarker) == nil {
+		return "main"
 	}
 	return strings.TrimPrefix(pkg.Path(), PatchPathPrefix)
 }
@@ -240,8 +311,11 @@ func FullName(pkg *types.Package, name string) string {
 // BasicName returns the ABI type name for the specified basic type.
 func BasicName(t *types.Basic) string {
 	name := t.Name()
-	if name == "byte" {
+	switch name {
+	case "byte":
 		name = "uint8"
+	case "rune":
+		name = "int32"
 	}
 	return "_llgo_" + name
 }
@@ -266,29 +340,29 @@ func (b *Builder) tuple(h hash.Hash, t *types.Tuple) {
 	n := t.Len()
 	for i := 0; i < n; i++ {
 		v := t.At(i)
-		ft, _ := b.TypeName(v.Type())
+		ft, _ := b.TypeName(PublicType(v.Type()))
 		fmt.Fprintln(h, ft)
 	}
 }
 
 // InterfaceName returns the ABI type name for the specified interface type.
 func (b *Builder) InterfaceName(t *types.Interface) (ret string, pub bool) {
-	hash, private := b.interfaceHash(t)
+	hash, pkg := b.interfaceHash(t)
 	hashStr := base64.RawURLEncoding.EncodeToString(hash)
-	if private {
-		return b.Pkg + ".iface$" + hashStr, false
+	if pkg != "" {
+		return pkg + ".iface$" + hashStr, false
 	}
 	return "_llgo_iface$" + hashStr, true
 }
 
-func (b *Builder) interfaceHash(t *types.Interface) (ret []byte, private bool) {
+func (b *Builder) interfaceHash(t *types.Interface) (ret []byte, pkg string) {
 	h := sha256.New()
 	n := t.NumMethods()
 	fmt.Fprintln(h, "interface", n)
 	for i := 0; i < n; i++ {
 		m := t.Method(i)
-		if !m.Exported() {
-			private = true
+		if !m.Exported() && pkg == "" {
+			pkg = m.Pkg().Path()
 		}
 		ft := b.FuncName(m.Type().(*types.Signature))
 		fmt.Fprintln(h, m.Name(), ft)
@@ -299,35 +373,96 @@ func (b *Builder) interfaceHash(t *types.Interface) (ret []byte, private bool) {
 
 // StructName returns the ABI type name for the specified struct type.
 func (b *Builder) StructName(t *types.Struct) (ret string, pub bool) {
-	hash, private := b.structHash(t)
+	hash, pkg := b.structHash(t)
 	hashStr := base64.RawURLEncoding.EncodeToString(hash)
-	if private {
-		return b.Pkg + ".struct$" + hashStr, false
+	if IsClosure(t) {
+		return "_llgo_closure$" + hashStr, true
+	}
+	if pkg != "" {
+		return pkg + ".struct$" + hashStr, false
 	}
 	return "_llgo_struct$" + hashStr, false
 }
 
-func (b *Builder) structHash(t *types.Struct) (ret []byte, private bool) {
+func IsClosure(raw *types.Struct) bool {
+	n := raw.NumFields()
+	if n == 2 {
+		f1, f2 := raw.Field(0), raw.Field(1)
+		if _, ok := f1.Type().(*types.Signature); ok && f1.Name() == "$f" {
+			return f2.Type() == types.Typ[types.UnsafePointer] && f2.Name() == "$data"
+		}
+	}
+	return false
+}
+
+func IsClosureFields(fields []*types.Var) bool {
+	if len(fields) == 2 {
+		f1, f2 := fields[0], fields[1]
+		if _, ok := f1.Type().(*types.Signature); ok && f1.Name() == "$f" {
+			return f2.Type() == types.Typ[types.UnsafePointer] && f2.Name() == "$data"
+		}
+	}
+	return false
+}
+
+func (b *Builder) structHash(t *types.Struct) (ret []byte, pkg string) {
 	h := sha256.New()
 	n := t.NumFields()
 	fmt.Fprintln(h, "struct", n)
 	for i := 0; i < n; i++ {
 		f := t.Field(i)
-		if !f.Exported() {
-			private = true
+		if pkg == "" && !f.Exported() && f.Pkg() != nil {
+			pkg = f.Pkg().Path()
 		}
 		name := f.Name()
 		if f.Embedded() {
 			name = "-"
 		}
-		ft, pub := b.TypeName(f.Type())
+		ft, _ := b.TypeName(f.Type())
 		fmt.Fprintln(h, name, ft)
-		if !pub {
-			private = true
+		if tag := t.Tag(i); tag != "" {
+			fmt.Fprintln(h, "tag", tag)
 		}
 	}
 	ret = h.Sum(b.buf[:0])
 	return
+}
+
+func scopeIndex(scope, root *types.Scope, id string) (string, bool) {
+	if scope == nil || root == nil {
+		return "", false
+	}
+	parent := scope.Parent()
+	if parent == nil {
+		return "", false
+	}
+	n := parent.NumChildren()
+	for i := 0; i < n; i++ {
+		if parent.Child(i) == scope {
+			id += "." + strconv.Itoa(i)
+			break
+		}
+	}
+	if parent == root {
+		return id, true
+	}
+	return scopeIndex(parent, root, id)
+}
+
+func scopeIndices(obj types.Object) string {
+	pkg := obj.Pkg()
+	if pkg == nil {
+		return ""
+	}
+	if obj.Parent() != pkg.Scope() {
+		if ids, ok := scopeIndex(obj.Parent(), pkg.Scope(), ""); ok {
+			return ids
+		}
+		if pos := obj.Pos(); pos.IsValid() {
+			return ".p" + strconv.Itoa(int(pos))
+		}
+	}
+	return ""
 }
 
 // -----------------------------------------------------------------------------

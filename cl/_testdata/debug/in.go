@@ -1,6 +1,54 @@
+// LITTEST
 package main
 
 import "errors"
+
+// This fixture protects debug-info relationships rather than metadata volume:
+// representative rich fields must belong to the same composite type, function
+// parameters to the same DISubprogram, and lexical variables to the correct
+// nested scope.
+// CHECK: ![[RICH:[0-9]+]] = !DICompositeType(tag: DW_TAG_structure_type, name: "struct{i8 int8; i16 int16; i32 int32; i64 int64; i int;{{.*}}",{{.*}}elements: ![[RICH_FIELDS:[0-9]+]])
+// CHECK: ![[RICH_FIELDS]] = !{!{{[0-9]+}}{{.*}}}
+// CHECK: !{{[0-9]+}} = !DIDerivedType(tag: DW_TAG_member, name: "i8", scope: ![[RICH]],
+// CHECK: !{{[0-9]+}} = !DIDerivedType(tag: DW_TAG_member, name: "slice", scope: ![[RICH]],
+// CHECK: !{{[0-9]+}} = !DIDerivedType(tag: DW_TAG_member, name: "fn", scope: ![[RICH]],
+// CHECK: !{{[0-9]+}} = !DIDerivedType(tag: DW_TAG_member, name: "pad2", scope: ![[RICH]],
+
+// CHECK: ![[ALL_PARAMS:[0-9]+]] = distinct !DISubprogram(name: "main.FuncWithAllTypeParams",
+// CHECK-DAG: !{{[0-9]+}} = !DILocalVariable(name: "i8", arg: 1, scope: ![[ALL_PARAMS]],
+// CHECK-DAG: !{{[0-9]+}} = !DILocalVariable(name: "slice", arg: 16, scope: ![[ALL_PARAMS]],
+// CHECK-DAG: !{{[0-9]+}} = !DILocalVariable(name: "arr", arg: 17, scope: ![[ALL_PARAMS]],
+// CHECK-DAG: !{{[0-9]+}} = !DILocalVariable(name: "fn", arg: 28, scope: ![[ALL_PARAMS]],
+
+// A for-loop variable lives in the loop block, while a switch case nested in
+// the loop has a three-level lexical chain back to the function.
+// CHECK: ![[SCOPE_FOR:[0-9]+]] = distinct !DISubprogram(name: "main.ScopeFor",
+// CHECK: !{{[0-9]+}} = !DILocalVariable(name: "i", scope: ![[FOR_LOOP:[0-9]+]],
+// CHECK: ![[FOR_LOOP]] = distinct !DILexicalBlock(scope: ![[SCOPE_FOR]],
+// CHECK: ![[CASE_ZERO:[0-9]+]] = distinct !DILexicalBlock(scope: ![[FOR_SWITCH:[0-9]+]],
+// CHECK: ![[FOR_SWITCH]] = distinct !DILexicalBlock(scope: ![[FOR_BODY:[0-9]+]],
+// CHECK: ![[FOR_BODY]] = distinct !DILexicalBlock(scope: ![[FOR_LOOP]],
+
+// The if/else branches share the condition scope but own distinct lexical
+// blocks; same-named c variables must therefore have different scopes.
+// CHECK: ![[SCOPE_IF:[0-9]+]] = distinct !DISubprogram(name: "main.ScopeIf",
+// CHECK: !{{[0-9]+}} = !DILocalVariable(name: "b", scope: ![[IF_THEN:[0-9]+]],
+// CHECK: ![[IF_THEN]] = distinct !DILexicalBlock(scope: ![[IF_CHAIN:[0-9]+]],
+// CHECK: ![[IF_CHAIN]] = distinct !DILexicalBlock(scope: ![[SCOPE_IF]],
+// CHECK: !{{[0-9]+}} = !DILocalVariable(name: "c", scope: ![[IF_THEN]],
+// CHECK: !{{[0-9]+}} = !DILocalVariable(name: "c", scope: ![[IF_ELSE:[0-9]+]],
+// CHECK: ![[IF_ELSE]] = distinct !DILexicalBlock(scope: ![[IF_CHAIN]],
+// CHECK: !{{[0-9]+}} = !DILocalVariable(name: "d", scope: ![[IF_ELSE]],
+
+// Every switch arm has its own scope under one switch lexical block.
+// CHECK: ![[SCOPE_SWITCH:[0-9]+]] = distinct !DISubprogram(name: "main.ScopeSwitch",
+// CHECK: !{{[0-9]+}} = !DILocalVariable(name: "b", scope: ![[SWITCH_ONE:[0-9]+]],
+// CHECK: ![[SWITCH_ONE]] = distinct !DILexicalBlock(scope: ![[SWITCH_BODY:[0-9]+]],
+// CHECK: ![[SWITCH_BODY]] = distinct !DILexicalBlock(scope: ![[SCOPE_SWITCH]],
+// CHECK: !{{[0-9]+}} = !DILocalVariable(name: "c", scope: ![[SWITCH_TWO:[0-9]+]],
+// CHECK: ![[SWITCH_TWO]] = distinct !DILexicalBlock(scope: ![[SWITCH_BODY]],
+// CHECK: !{{[0-9]+}} = !DILocalVariable(name: "d", scope: ![[SWITCH_DEFAULT:[0-9]+]],
+// CHECK: ![[SWITCH_DEFAULT]] = distinct !DILexicalBlock(scope: ![[SWITCH_BODY]],
 
 type Base struct {
 	name string
@@ -73,9 +121,9 @@ func FuncWithAllTypeStructParam(s StructWithAllTypeFields) {
 	//   s.c128: complex128{real = 15, imag = 16}
 	//   s.slice: []int{21, 22, 23}
 	//   s.arr: [3]int{24, 25, 26}
-	//   s.arr2: [3]github.com/goplus/llgo/cl/_testdata/debug.E{{i = 27}, {i = 28}, {i = 29}}
+	//   s.arr2: [3]github.com/xgo-dev/llgo/cl/_testdata/debug.E{{i = 27}, {i = 28}, {i = 29}}
 	//   s.s: "hello"
-	//   s.e: github.com/goplus/llgo/cl/_testdata/debug.E{i = 30}
+	//   s.e: github.com/xgo-dev/llgo/cl/_testdata/debug.E{i = 30}
 	//   s.pad1: 100
 	//   s.pad2: 200
 	s.i8 = '\b'
@@ -128,7 +176,7 @@ func FuncWithAllTypeParams(
 	//   f64: 12
 	//   slice: []int{21, 22, 23}
 	//   arr: [3]int{24, 25, 26}
-	//   arr2: [3]github.com/goplus/llgo/cl/_testdata/debug.E{{i = 27}, {i = 28}, {i = 29}}
+	//   arr2: [3]github.com/xgo-dev/llgo/cl/_testdata/debug.E{{i = 27}, {i = 28}, {i = 29}}
 	//   slice[0]: 21
 	//   slice[1]: 22
 	//   slice[2]: 23
@@ -138,7 +186,7 @@ func FuncWithAllTypeParams(
 	//   arr2[0].i: 27
 	//   arr2[1].i: 28
 	//   arr2[2].i: 29
-	//   e: github.com/goplus/llgo/cl/_testdata/debug.E{i = 30}
+	//   e: github.com/xgo-dev/llgo/cl/_testdata/debug.E{i = 30}
 
 	// Expected(skip):
 	//   i8: '\b'
@@ -207,9 +255,9 @@ func FuncWithAllTypeParams(
 	//   c64: complex64{real = 21, imag = 22}
 	//   c128: complex128{real = 23, imag = 24}
 	//   slice: []int{31, 32, 33}
-	//   arr2: [3]github.com/goplus/llgo/cl/_testdata/debug.E{{i = 37}, {i = 38}, {i = 39}}
+	//   arr2: [3]github.com/xgo-dev/llgo/cl/_testdata/debug.E{{i = 37}, {i = 38}, {i = 39}}
 	//   s: "world"
-	//   e: github.com/goplus/llgo/cl/_testdata/debug.E{i = 40}
+	//   e: github.com/xgo-dev/llgo/cl/_testdata/debug.E{i = 40}
 
 	// Expected(skip):
 	//   arr: [3]int{34, 35, 36}
@@ -512,9 +560,9 @@ func main() {
 	//   s.c128: complex128{real = 15, imag = 16}
 	//   s.slice: []int{21, 22, 23}
 	//   s.arr: [3]int{24, 25, 26}
-	//   s.arr2: [3]github.com/goplus/llgo/cl/_testdata/debug.E{{i = 27}, {i = 28}, {i = 29}}
+	//   s.arr2: [3]github.com/xgo-dev/llgo/cl/_testdata/debug.E{{i = 27}, {i = 28}, {i = 29}}
 	//   s.s: "hello"
-	//   s.e: github.com/goplus/llgo/cl/_testdata/debug.E{i = 30}
+	//   s.e: github.com/xgo-dev/llgo/cl/_testdata/debug.E{i = 30}
 	//   s.pf.i16: 100
 	//   *(s.pf).i16: 100
 	//   *(s.pi): 100

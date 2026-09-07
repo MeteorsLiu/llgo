@@ -1,0 +1,128 @@
+package test
+
+import (
+	"testing"
+	"time"
+)
+
+// These tests may run alongside CPU-intensive package builds. Their deadline
+// detects a lost wakeup, so leave enough headroom for a loaded CI scheduler.
+const selectProgressTimeout = 5 * time.Second
+
+func TestSelectRecvWakesForBlockedUnbufferedSend(t *testing.T) {
+	for i := 0; i < 50; i++ {
+		res := make(chan struct{})
+		done := make(chan struct{})
+		started := make(chan struct{})
+		received := make(chan struct{})
+		sendDone := make(chan struct{})
+
+		go func() {
+			close(started)
+			select {
+			case <-res:
+				close(received)
+			case <-done:
+			}
+		}()
+
+		<-started
+		// Give the goroutine a brief chance to reach the blocking select path so
+		// this regression exercises select wakeups rather than a direct recv fast path.
+		time.Sleep(time.Millisecond)
+
+		go func() {
+			select {
+			case res <- struct{}{}:
+				close(sendDone)
+			case <-done:
+			}
+		}()
+
+		select {
+		case <-sendDone:
+		case <-time.After(selectProgressTimeout):
+			close(done)
+			t.Fatalf("iteration %d: unbuffered send did not wake select receiver", i)
+		}
+
+		select {
+		case <-received:
+		case <-time.After(selectProgressTimeout):
+			close(done)
+			t.Fatalf("iteration %d: select receiver did not receive sent value", i)
+		}
+
+		close(done)
+	}
+}
+
+func TestSelectMixedUnbufferedPeersMakeProgress(t *testing.T) {
+	for i := 0; i < 50; i++ {
+		a := make(chan struct{})
+		b := make(chan struct{})
+		done := make(chan struct{}, 2)
+
+		go func() {
+			select {
+			case <-a:
+			case b <- struct{}{}:
+			}
+			done <- struct{}{}
+		}()
+		go func() {
+			select {
+			case <-b:
+			case a <- struct{}{}:
+			}
+			done <- struct{}{}
+		}()
+
+		for j := 0; j < 2; j++ {
+			select {
+			case <-done:
+			case <-time.After(selectProgressTimeout):
+				t.Fatalf("iteration %d: mixed unbuffered select peers did not make progress", i)
+			}
+		}
+	}
+}
+
+func TestSelectRecvCompletionNotOverwrittenByNextRecv(t *testing.T) {
+	for i := 0; i < 1000; i++ {
+		ch := make(chan struct{})
+		done := make(chan struct{})
+		recvDone := make(chan struct{})
+
+		go func() {
+			defer close(done)
+			defer close(ch)
+			for {
+				select {
+				case <-ch:
+					return
+				default:
+				}
+			}
+		}()
+
+		ch <- struct{}{}
+
+		go func() {
+			<-ch
+			close(recvDone)
+		}()
+
+		select {
+		case <-recvDone:
+		case <-time.After(time.Second):
+			t.Fatalf("iteration %d: receive completion was overwritten by a later receive", i)
+		}
+
+		select {
+		case <-done:
+		case <-time.After(time.Second):
+			t.Fatalf("iteration %d: select receiver did not exit", i)
+		}
+	}
+}

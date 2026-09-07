@@ -1,0 +1,401 @@
+name: Baseline benchmarks
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches: ["**"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  benchmark:
+    name: benchmark (${{ matrix.display }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            runner: ${{ github.repository == 'xgo-dev/llgo' && fromJSON('["qiniu", "ubuntu-24.04-large"]') || 'ubuntu-latest' }}
+            id: linux
+            display: Linux
+            timeout: 20
+          - os: macos-latest
+            id: macos
+            display: macOS
+            timeout: 20
+          - os: windows-2022
+            id: windows-msvc
+            display: Windows MSVC
+            windows_abi: msvc
+            windows_arch: amd64
+            host_go_arch: x64
+            timeout: 30
+          - os: windows-2022
+            id: windows-mingw
+            display: Windows MinGW
+            windows_abi: mingw
+            windows_arch: amd64
+            host_go_arch: x64
+            timeout: 30
+          - os: windows-11-arm
+            id: windows-msvc-arm64
+            display: Windows MSVC ARM64
+            windows_abi: msvc
+            windows_arch: arm64
+            host_go_arch: x64
+            timeout: 120
+          - os: windows-11-arm
+            id: windows-mingw-arm64
+            display: Windows MinGW ARM64
+            windows_abi: mingw
+            windows_arch: arm64
+            host_go_arch: arm64
+            timeout: 120
+          - os: windows-2022
+            id: windows-msvc-386
+            display: Windows MSVC 386
+            windows_abi: msvc
+            windows_arch: "386"
+            host_go_arch: x64
+            timeout: 90
+          - os: windows-2022
+            id: windows-mingw-386
+            display: Windows MinGW 386
+            windows_abi: mingw
+            windows_arch: "386"
+            host_go_arch: x64
+            timeout: 90
+    runs-on: ${{ matrix.runner || matrix.os }}
+    timeout-minutes: ${{ matrix.timeout }}
+    env:
+      GOMAXPROCS: "2"
+      LLGO_ROOT: ${{ github.workspace }}
+      GOFLAGS: -tags=llvm22
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Determine pull request merge-base
+        if: github.event_name == 'pull_request'
+        id: merge-base
+        shell: bash
+        run: |
+          git fetch https://github.com/${{ github.event.pull_request.base.repo.full_name }}.git ${{ github.event.pull_request.base.ref }}
+          base_sha=$(git merge-base FETCH_HEAD ${{ github.event.pull_request.head.sha }})
+          mkdir -p .benchmark
+          git show "${{ github.event.pull_request.base.sha }}:.github/llgo-benchmark.yml" > .benchmark/base-benchmark.yml
+          echo "sha=$base_sha" >> "$GITHUB_OUTPUT"
+          echo "Computed pull request merge-base: $base_sha (head: ${{ github.event.pull_request.head.sha }})"
+
+      - name: Check out pull request base benchmark source
+        if: github.event_name == 'pull_request'
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ github.event.pull_request.base.repo.full_name }}
+          ref: ${{ steps.merge-base.outputs.sha }}
+          path: .benchmark/base-source
+          persist-credentials: false
+
+      - name: Check out pull request head benchmark source
+        if: github.event_name == 'pull_request'
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ github.event.pull_request.head.repo.full_name }}
+          ref: ${{ github.event.pull_request.head.sha }}
+          path: .benchmark/head-source
+          persist-credentials: false
+
+      - name: Install dependencies
+        uses: ./.github/actions/setup-deps
+        with:
+          llvm-version: 22
+          windows-abi: ${{ matrix.windows_abi || 'msvc' }}
+          windows-arch: ${{ matrix.windows_arch || 'amd64' }}
+
+      - name: Set up Go
+        uses: ./.github/actions/setup-go
+        with:
+          architecture: ${{ matrix.host_go_arch || '' }}
+
+      - name: Build host compilers for a cross-architecture benchmark
+        if: runner.os == 'Windows' && matrix.windows_arch != 'amd64'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$GITHUB_WORKSPACE/.benchmark"
+
+          build_host_compiler() {
+            local source_root="$1"
+            local output="$2"
+            (
+              cd "$source_root"
+              LLGO_ROOT="$PWD" go build -p=1 -o "$GITHUB_WORKSPACE/$output" ./cmd/llgo
+            )
+          }
+
+          if [[ "$GITHUB_EVENT_NAME" == pull_request ]]; then
+            build_host_compiler .benchmark/base-source .benchmark/base-llgo.exe || true
+            build_host_compiler .benchmark/head-source .benchmark/llgo.exe
+          else
+            build_host_compiler . .benchmark/llgo.exe
+          fi
+
+      - name: Bundle MinGW host compiler runtime
+        if: runner.os == 'Windows' && matrix.windows_abi == 'mingw' && matrix.windows_arch == '386'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $hostBin = Join-Path $env:LLGO_MINGW_HOST_ROOT "bin"
+          $objdump = Join-Path $hostBin "llvm-objdump.exe"
+          if (-not (Test-Path $objdump)) {
+            throw "The MinGW host llvm-objdump is unavailable: $objdump"
+          }
+
+          # Target DLL directories must remain first on PATH when benchmark
+          # programs run. Keep the host compiler architecture-safe without
+          # changing that target environment by placing its DLL closure beside
+          # the prebuilt compiler, which Windows searches before PATH.
+          $queue = [Collections.Generic.Queue[string]]::new()
+          Get-ChildItem "$env:GITHUB_WORKSPACE\.benchmark\*.exe" |
+            ForEach-Object { $queue.Enqueue($_.FullName) }
+          $copied = @{}
+          while ($queue.Count -ne 0) {
+            $binary = $queue.Dequeue()
+            foreach ($line in (& $objdump -p $binary)) {
+              if ($line -notmatch '^\s*DLL Name:\s*(\S+)\s*$') {
+                continue
+              }
+              $name = $Matches[1]
+              if ($copied.ContainsKey($name)) {
+                continue
+              }
+              $source = Join-Path $hostBin $name
+              if (-not (Test-Path $source)) {
+                continue
+              }
+              $destination = Join-Path "$env:GITHUB_WORKSPACE\.benchmark" $name
+              Copy-Item -LiteralPath $source -Destination $destination
+              $copied[$name] = $true
+              $queue.Enqueue($destination)
+            }
+          }
+          if ($copied.Count -eq 0) {
+            throw "No MinGW host runtime DLLs were discovered"
+          }
+
+      - name: Activate native Windows target
+        if: runner.os == 'Windows' && matrix.windows_arch != 'amd64'
+        uses: ./.github/actions/activate-windows-target
+        with:
+          windows-abi: ${{ matrix.windows_abi }}
+          windows-arch: ${{ matrix.windows_arch }}
+
+      - name: Measure pull request base
+        if: github.event_name == 'pull_request'
+        id: measure-base
+        # The first integrated Windows revision may have a base that cannot
+        # build on Windows. Still collect the head; comparisons start once the
+        # base contains Windows support.
+        continue-on-error: ${{ startsWith(matrix.id, 'windows-') }}
+        shell: bash
+        env:
+          LLGO_BENCHMARK_PREBUILT_LLGO: ${{ matrix.windows_arch && matrix.windows_arch != 'amd64' && '.benchmark/base-llgo.exe' || '' }}
+        run: |
+          benchmark/baseline/run.sh \
+            .benchmark/base-source \
+            .benchmark/base-llgo \
+            .benchmark/base-results
+
+      - name: Note unavailable Windows baseline
+        if: >-
+          github.event_name == 'pull_request' &&
+          startsWith(matrix.id, 'windows-') &&
+          steps.measure-base.outcome == 'failure'
+        shell: bash
+        run: |
+          echo '### Windows benchmark baseline' >> "$GITHUB_STEP_SUMMARY"
+          echo 'The pull request base does not yet build on Windows. The current revision is measured as new; same-runner comparisons begin when the base supports Windows.' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Measure current revision
+        shell: bash
+        env:
+          LLGO_BENCHMARK_PREBUILT_LLGO: ${{ matrix.windows_arch && matrix.windows_arch != 'amd64' && '.benchmark/llgo.exe' || '' }}
+        run: |
+          source_root=.
+          if [[ "$GITHUB_EVENT_NAME" == pull_request ]]; then
+            source_root=.benchmark/head-source
+          fi
+          benchmark/baseline/run.sh \
+            "$source_root" \
+            .benchmark/llgo \
+            .benchmark/results
+
+      - name: Record benchmark result
+        uses: xgo-dev/setup-benchmark-go-action@v1.0.6
+        with:
+          # workflow_run trusts the target branch configuration. Use the same
+          # snapshot for pull request artifacts so selector changes take effect
+          # after merge without invalidating the introducing pull request.
+          config: >-
+            ${{ github.event_name == 'pull_request' &&
+                '.benchmark/base-benchmark.yml' ||
+                '.github/llgo-benchmark.yml' }}
+          benchmark-file: .benchmark/results/benchmark.txt
+          baseline-benchmark-file: >-
+            ${{ github.event_name == 'pull_request' &&
+                steps.measure-base.outcome == 'success' &&
+                '.benchmark/base-results/benchmark.txt' || '' }}
+          platform-id: ${{ matrix.id }}
+          platform-label: ${{ matrix.display }}
+
+  wasm-benchmark:
+    name: benchmark (WebAssembly)
+    runs-on: ${{ github.repository == 'xgo-dev/llgo' && fromJSON('["qiniu", "ubuntu-24.04-large"]') || 'ubuntu-latest' }}
+    timeout-minutes: 30
+    env:
+      GOMAXPROCS: "2"
+      LLGO_ROOT: ${{ github.workspace }}
+      GOFLAGS: -tags=llvm22
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Determine pull request merge-base
+        if: github.event_name == 'pull_request'
+        id: wasm-merge-base
+        shell: bash
+        run: |
+          git fetch https://github.com/${{ github.event.pull_request.base.repo.full_name }}.git ${{ github.event.pull_request.base.ref }}
+          base_sha=$(git merge-base FETCH_HEAD ${{ github.event.pull_request.head.sha }})
+          mkdir -p .benchmark
+          if git show "${{ github.event.pull_request.base.sha }}:.github/llgo-wasm-benchmark.yml" > .benchmark/wasm-base-benchmark.yml; then
+            echo 'trusted-config=true' >> "$GITHUB_OUTPUT"
+          else
+            rm -f .benchmark/wasm-base-benchmark.yml
+            echo 'trusted-config=false' >> "$GITHUB_OUTPUT"
+          fi
+          if git cat-file -e "$base_sha:targets/emscripten.json" 2>/dev/null &&
+             git cat-file -e "$base_sha:targets/emscripten-memory64.json" 2>/dev/null &&
+             git cat-file -e "$base_sha:targets/wasi.json" 2>/dev/null; then
+            echo 'compatible-base=true' >> "$GITHUB_OUTPUT"
+          else
+            echo 'compatible-base=false' >> "$GITHUB_OUTPUT"
+          fi
+          echo "sha=$base_sha" >> "$GITHUB_OUTPUT"
+          echo "Computed pull request merge-base: $base_sha (head: ${{ github.event.pull_request.head.sha }})"
+
+      - name: Check out pull request base source
+        if: github.event_name == 'pull_request'
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ github.event.pull_request.base.repo.full_name }}
+          ref: ${{ steps.wasm-merge-base.outputs.sha }}
+          path: .benchmark/wasm-base-source
+          persist-credentials: false
+
+      - name: Check out pull request head source
+        if: github.event_name == 'pull_request'
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ github.event.pull_request.head.repo.full_name }}
+          ref: ${{ github.event.pull_request.head.sha }}
+          path: .benchmark/wasm-head-source
+          persist-credentials: false
+
+      - name: Install dependencies
+        uses: ./.github/actions/setup-deps
+        with:
+          llvm-version: 22
+
+      - name: Set up Emscripten
+        uses: emscripten-core/setup-emsdk@v15
+        with:
+          version: "4.0.21"
+
+      - name: Set up Binaryen
+        uses: ./.github/actions/setup-binaryen
+
+      - name: Set up Go
+        uses: ./.github/actions/setup-go
+
+      - name: Measure pull request base
+        if: >-
+          github.event_name == 'pull_request' &&
+          steps.wasm-merge-base.outputs.compatible-base == 'true'
+        id: measure-wasm-base
+        shell: bash
+        run: |
+          benchmark/wasm/run.sh \
+            .benchmark/wasm-base-source \
+            .benchmark/wasm-base-llgo \
+            .benchmark/wasm-base-results
+
+      - name: Measure current revision
+        shell: bash
+        run: |
+          source_root=.
+          if [[ "$GITHUB_EVENT_NAME" == pull_request ]]; then
+            source_root=.benchmark/wasm-head-source
+          fi
+          benchmark/wasm/run.sh \
+            "$source_root" \
+            .benchmark/wasm-llgo \
+            .benchmark/wasm-results
+
+      - name: Summarize pull request WebAssembly measurements
+        if: github.event_name == 'pull_request'
+        shell: bash
+        run: |
+          {
+            echo '### WebAssembly build benchmark'
+            echo
+            if [[ '${{ steps.measure-wasm-base.outcome }}' == success ]]; then
+              echo 'The base and pull request revision were measured sequentially on this runner.'
+            else
+              echo 'The merge-base predates the WebAssembly target profiles, so only the pull request revision was measured.'
+            fi
+            echo
+            echo '<details><summary>Raw benchmark data</summary>'
+            echo
+            echo '```text'
+            if [[ '${{ steps.measure-wasm-base.outcome }}' == success ]]; then
+              echo 'base:'
+              cat .benchmark/wasm-base-results/benchmark.txt
+              echo
+            fi
+            echo 'pull request:'
+            cat .benchmark/wasm-results/benchmark.txt
+            echo '```'
+            echo '</details>'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Record WebAssembly benchmark result
+        # A pull request may introduce this suite before the trusted target
+        # branch knows its configuration. Its paired measurements remain in
+        # the job summary; artifact publication begins after the configuration
+        # lands, without letting pull request code select publisher rules.
+        if: >-
+          github.event_name != 'pull_request' ||
+          steps.wasm-merge-base.outputs.trusted-config == 'true'
+        uses: xgo-dev/setup-benchmark-go-action@v1.0.6
+        with:
+          config: >-
+            ${{ github.event_name == 'pull_request' &&
+                '.benchmark/wasm-base-benchmark.yml' ||
+                '.github/llgo-wasm-benchmark.yml' }}
+          benchmark-file: .benchmark/wasm-results/benchmark.txt
+          baseline-benchmark-file: >-
+            ${{ github.event_name == 'pull_request' &&
+                steps.measure-wasm-base.outcome == 'success' &&
+                '.benchmark/wasm-base-results/benchmark.txt' || '' }}
+          baseline-repository: ${{ github.event.pull_request.base.repo.full_name || '' }}
+          baseline-sha: ${{ steps.wasm-merge-base.outputs.sha || '' }}
+          baseline-ref: ${{ github.event.pull_request.base.ref || '' }}
+          platform-id: wasm-linux
+          platform-label: WebAssembly

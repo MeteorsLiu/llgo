@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2024 The GoPlus Authors (goplus.org). All rights reserved.
+ * Copyright (c) 2024 The XGo Authors (xgo.dev). All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -24,7 +24,7 @@ import (
 	"log"
 	"strings"
 
-	"github.com/goplus/llvm"
+	"github.com/xgo-dev/llvm"
 )
 
 // -----------------------------------------------------------------------------
@@ -57,11 +57,6 @@ func (p BasicBlock) Addr() Expr {
 
 // -----------------------------------------------------------------------------
 
-type dbgExpr struct {
-	ptr Expr
-	val Expr
-}
-
 type aBuilder struct {
 	impl llvm.Builder
 	blk  BasicBlock
@@ -69,8 +64,8 @@ type aBuilder struct {
 	Pkg  Package
 	Prog Program
 
-	dbgVars      map[Expr]dbgExpr         // save copied address and values for debug info
 	diScopeCache map[*types.Scope]DIScope // avoid duplicated DILexicalBlock(s)
+	diFuncScope  *types.Scope
 }
 
 // Builder represents a builder for creating instructions in a function.
@@ -78,7 +73,11 @@ type Builder = *aBuilder
 
 // EndBuild ends the build process of a function.
 func (b Builder) EndBuild() {
+	if b.Prog.enableGoGlobalDCE {
+		b.Func.emitFakeUsesInlineAsm(b)
+	}
 	b.Func.endDefer(b)
+	b.Func.endGCRoots(b)
 }
 
 // Dispose disposes of the builder.
@@ -88,9 +87,7 @@ func (b Builder) Dispose() {
 
 // SetBlock means SetBlockEx(blk, AtEnd, true).
 func (b Builder) SetBlock(blk BasicBlock) Builder {
-	if debugInstr {
-		log.Printf("Block _llgo_%v:\n", blk.idx)
-	}
+	dbgInstrf("Block _llgo_%v:\n", blk.idx)
 	b.SetBlockEx(blk, AtEnd, true)
 	return b
 }
@@ -156,7 +153,9 @@ func notInit(instr llvm.Value) bool {
 	case llvm.Call:
 		if n := instr.OperandsCount(); n == 1 {
 			fn := instr.Operand(0)
-			return !strings.HasSuffix(fn.Name(), ".init")
+			name := fn.Name()
+			// Skip .init calls
+			return !strings.HasSuffix(name, ".init")
 		}
 	}
 	return true
@@ -166,17 +165,7 @@ func notInit(instr llvm.Value) bool {
 
 // Return emits a return instruction.
 func (b Builder) Return(results ...Expr) {
-	if debugInstr {
-		var b bytes.Buffer
-		fmt.Fprint(&b, "Return ")
-		for i, arg := range results {
-			if i > 0 {
-				fmt.Fprint(&b, ", ")
-			}
-			fmt.Fprint(&b, arg.impl)
-		}
-		log.Println(b.String())
-	}
+	dbgInstrReturn(results)
 	switch n := len(results); n {
 	case 0:
 		b.impl.CreateRetVoid()
@@ -207,9 +196,7 @@ func (b Builder) Return(results ...Expr) {
 //
 //	t1 = extract t0 #1
 func (b Builder) Extract(x Expr, i int) (ret Expr) {
-	if debugInstr {
-		log.Printf("Extract %v, %d\n", x.impl, i)
-	}
+	dbgInstrf("Extract %v, %d\n", x.impl, i)
 	return b.getField(x, i)
 }
 
@@ -218,17 +205,13 @@ func (b Builder) Jump(jmpb BasicBlock) {
 	if b.Func != jmpb.fn {
 		panic("mismatched function")
 	}
-	if debugInstr {
-		log.Printf("Jump _llgo_%v\n", jmpb.idx)
-	}
+	dbgInstrf("Jump _llgo_%v\n", jmpb.idx)
 	b.impl.CreateBr(jmpb.first)
 }
 
 // IndirectJump emits an indirect jump instruction.
 func (b Builder) IndirectJump(addr Expr, dests []BasicBlock) {
-	if debugInstr {
-		log.Printf("IndirectJump %v\n", addr.impl)
-	}
+	dbgInstrf("IndirectJump %v\n", addr.impl)
 	ibr := b.impl.CreateIndirectBr(addr.impl, len(dests))
 	for _, dest := range dests {
 		ibr.AddDest(dest.first)
@@ -240,9 +223,7 @@ func (b Builder) If(cond Expr, thenb, elseb BasicBlock) {
 	if b.Func != thenb.fn || b.Func != elseb.fn {
 		panic("mismatched function")
 	}
-	if debugInstr {
-		log.Printf("If %v, _llgo_%v, _llgo_%v\n", cond.impl, thenb.idx, elseb.idx)
-	}
+	dbgInstrf("If %v, _llgo_%v, _llgo_%v\n", cond.impl, thenb.idx, elseb.idx)
 	b.impl.CreateCondBr(cond.impl, thenb.first, elseb.first)
 }
 
@@ -252,7 +233,10 @@ func (b Builder) IfThen(cond Expr, then func()) {
 	b.If(cond, blks[0], blks[1])
 	b.SetBlockEx(blks[0], AtEnd, false)
 	then()
-	b.Jump(blks[1])
+	lastInst := b.impl.GetInsertBlock().LastInstruction()
+	if lastInst.IsNil() || lastInst.IsAUnreachableInst().IsNil() {
+		b.Jump(blks[1])
+	}
 	b.SetBlockEx(blks[1], AtEnd, false)
 	b.blk.last = blks[1].last
 }
@@ -281,17 +265,19 @@ func (b Builder) Times(n Expr, loop func(i Expr)) {
 	typ := n.Type
 	phi := b.Phi(typ)
 	b.If(b.BinOp(token.LSS, phi.Expr, n), blks[1], blks[2])
-	b.SetBlockEx(blks[1], AtEnd, false)
+	b.SetBlockEx(blks[1], AtEnd, true)
 	loop(phi.Expr)
 	post := b.BinOp(token.ADD, phi.Expr, b.Prog.IntVal(1, typ))
+	body := b.blk
 	b.Jump(blks[0])
-	phi.AddIncoming(b, []BasicBlock{at, blks[1]}, func(i int, blk BasicBlock) Expr {
+	phi.AddIncoming(b, []BasicBlock{at, body}, func(i int, blk BasicBlock) Expr {
 		if i == 0 {
 			return b.Prog.IntVal(0, typ)
 		}
 		return post
 	})
 	b.SetBlockEx(blks[2], AtEnd, false)
+	b.blk = at
 	b.blk.last = blks[2].last
 }
 
@@ -313,9 +299,7 @@ type Switch = *aSwitch
 
 // Case emits a case instruction.
 func (p Switch) Case(v Expr, blk BasicBlock) {
-	if debugInstr {
-		log.Printf("Case %v, _llgo_%v\n", v.impl, blk.idx)
-	}
+	dbgInstrf("Case %v, _llgo_%v\n", v.impl, blk.idx)
 	p.cases = append(p.cases, caseStmt{v.impl, blk.first})
 }
 
@@ -329,9 +313,7 @@ func (p Switch) End(b Builder) {
 
 // Switch starts a switch statement.
 func (b Builder) Switch(v Expr, defb BasicBlock) Switch {
-	if debugInstr {
-		log.Printf("Switch %v, _llgo_%v\n", v.impl, defb.idx)
-	}
+	dbgInstrf("Switch %v, _llgo_%v\n", v.impl, defb.idx)
 	return &aSwitch{v.impl, defb.first, nil}
 }
 */
@@ -345,12 +327,12 @@ type Phi struct {
 // AddIncoming adds incoming values to a phi node.
 func (p Phi) AddIncoming(b Builder, preds []BasicBlock, f func(i int, blk BasicBlock) Expr) {
 	raw := p.raw.Type
-	bs := llvmPredBlocks(preds)
 	vals := make([]llvm.Value, len(preds))
 	for iblk, blk := range preds {
 		val := f(iblk, blk)
 		vals[iblk] = checkExpr(val, raw, b).impl
 	}
+	bs := llvmPredBlocks(preds)
 	p.impl.AddIncoming(vals, bs)
 }
 
@@ -369,3 +351,17 @@ func (b Builder) Phi(t Type) Phi {
 }
 
 // -----------------------------------------------------------------------------
+
+func dbgInstrReturn(results []Expr) {
+	if debugInstr {
+		var b bytes.Buffer
+		fmt.Fprint(&b, "Return ")
+		for i, arg := range results {
+			if i > 0 {
+				fmt.Fprint(&b, ", ")
+			}
+			fmt.Fprint(&b, arg.impl)
+		}
+		log.Println(b.String())
+	}
+}

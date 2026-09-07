@@ -1,27 +1,9 @@
-__stack = ORIGIN(dram_seg) + LENGTH(dram_seg);
-__MIN_STACK_SIZE = 0x2000;
+_heapEnd = ORIGIN(dram_seg) + LENGTH(dram_seg);
 
 ENTRY(_start)
 SECTIONS
 {
   . = SEGMENT_START("iram_seg", 0);
-  .vectors    :
-  {
-    _vector_table = ABSOLUTE(.);
-    KEEP(*(.WindowVectors.text));
-    KEEP(*(.Level2InterruptVector.text));
-    KEEP(*(.Level3InterruptVector.text));
-    KEEP(*(.Level4InterruptVector.text));
-    KEEP(*(.Level5InterruptVector.text));
-    KEEP(*(.DebugExceptionVector.text));
-    KEEP(*(.NMIExceptionVector.text));
-    KEEP(*(.KernelExceptionVector.text));
-    KEEP(*(.UserExceptionVector.text));
-    KEEP(*(.DoubleExceptionVector.text));
-    KEEP(*(.ResetVector.text));
-    *(.*Vector.literal)
-    . = ALIGN (16);
-  } > iram_seg
 
   text    :
   {
@@ -42,6 +24,14 @@ SECTIONS
   /* Adjust the address for the data segment.  We want to adjust up to
      the same address within the page on the next page up.  */
   . = ALIGN (CONSTANT (MAXPAGESIZE)) - ((CONSTANT (MAXPAGESIZE) - .) & (CONSTANT (MAXPAGESIZE) - 1)); . = DATA_SEGMENT_ALIGN (CONSTANT (MAXPAGESIZE), CONSTANT (COMMONPAGESIZE));
+
+  .stack (NOLOAD) :
+  {
+    _stack_end = .;
+    . = ALIGN(16);
+    . += 16K;
+    __stack = .;
+  }
 
 
   .rodata    :
@@ -133,7 +123,7 @@ SECTIONS
   . = DATA_SEGMENT_END (.);
 
   /* Check if data + heap + stack exceeds RAM limit */
-  ASSERT(. <= __stack - __MIN_STACK_SIZE, "region DRAM overflowed by .data and .bss sections")
+  ASSERT(. <= _heapEnd, "region DRAM overflowed by .data and .bss sections")
 
   /* Stabs debugging sections.  */
   .stab          0 : { *(.stab) }
@@ -182,4 +172,7 @@ SECTIONS
 
 _sbss = __bss_start;
 _ebss = _end;
-
+_globals_start = ALIGN(_data_start, 4);
+_globals_end = ALIGN(_end, 4);
+_heapStart = _end;
+_stack_top = __stack;

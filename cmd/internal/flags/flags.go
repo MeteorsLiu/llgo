@@ -2,9 +2,15 @@ package flags
 
 import (
 	"flag"
+	"fmt"
+	"strconv"
+	"strings"
 
-	"github.com/goplus/llgo/internal/build"
-	"github.com/goplus/llgo/internal/buildenv"
+	"github.com/xgo-dev/llgo/cmd/internal/compilerhash"
+	"github.com/xgo-dev/llgo/internal/build"
+	"github.com/xgo-dev/llgo/internal/buildenv"
+	"github.com/xgo-dev/llgo/internal/lto"
+	"github.com/xgo-dev/llgo/internal/optlevel"
 )
 
 var OutputFile string
@@ -24,38 +30,312 @@ func AddOutputFlags(fs *flag.FlagSet) {
 }
 
 var Verbose bool
+var CompilerVerbose bool
 var BuildEnv string
+var BuildMode string
 var Tags string
 var Target string
 var Emulator bool
 var Port string
 var BaudRate int
-var AbiMode int
 var CheckLinkArgs bool
 var CheckLLFiles bool
 var GenLLFiles bool
 var ForceEspClang bool
+var SizeReport bool
+var SizeFormat string
+var SizeLevel string
+var ForceRebuild bool
+var PrintCommands bool
+var BuildTrace string
+var DeadcodeDrop bool
+var PthreadStackSize byteSizeFlag
+var OptLevel optlevel.Level
+
+type byteSizeFlag int64
+
+func (p *byteSizeFlag) String() string {
+	if p == nil {
+		return "0"
+	}
+	return strconv.FormatInt(int64(*p), 10)
+}
+
+func (p *byteSizeFlag) Set(v string) error {
+	n, err := parseByteSize(v)
+	if err != nil {
+		return err
+	}
+	*p = byteSizeFlag(n)
+	return nil
+}
+
+func parseByteSize(v string) (int64, error) {
+	s := strings.TrimSpace(v)
+	if s == "" {
+		return 0, fmt.Errorf("empty size")
+	}
+	if strings.HasPrefix(s, "-") {
+		return 0, fmt.Errorf("size must be >= 0")
+	}
+	i := 0
+	for i < len(s) && s[i] >= '0' && s[i] <= '9' {
+		i++
+	}
+	if i == 0 {
+		return 0, fmt.Errorf("invalid size %q", v)
+	}
+	n, err := strconv.ParseUint(s[:i], 10, 63)
+	if err != nil {
+		return 0, err
+	}
+	unit := strings.ToUpper(strings.TrimSpace(s[i:]))
+	mul, ok := map[string]uint64{
+		"":    1,
+		"B":   1,
+		"K":   1024,
+		"KB":  1024,
+		"KIB": 1024,
+		"M":   1024 * 1024,
+		"MB":  1024 * 1024,
+		"MIB": 1024 * 1024,
+		"G":   1024 * 1024 * 1024,
+		"GB":  1024 * 1024 * 1024,
+		"GIB": 1024 * 1024 * 1024,
+	}[unit]
+	if !ok {
+		return 0, fmt.Errorf("invalid size unit %q", strings.TrimSpace(s[i:]))
+	}
+	if n > uint64(^uint64(0)>>1)/mul {
+		return 0, fmt.Errorf("size %q overflows int64", v)
+	}
+	return int64(n * mul), nil
+}
+
+type ltoFlag struct {
+	Specified bool
+	Mode      lto.Mode
+}
+
+func (o *ltoFlag) String() string {
+	return o.Mode.String()
+}
+
+func (o *ltoFlag) Set(v string) error {
+	mode, err := lto.Parse(v)
+	if err != nil {
+		return err
+	}
+	o.Specified = true
+	o.Mode = mode
+	return nil
+}
+
+var LTO ltoFlag
+var LTOPluginPath string
+
+func AddLTOFlag(fs *flag.FlagSet) {
+	LTO = ltoFlag{Mode: lto.Off}
+	LTOPluginPath = ""
+	fs.Var(&LTO, "lto", "Enable LTO optimization: thin or full (default: off)")
+	fs.StringVar(&LTOPluginPath, "lto-pass-plugin", "", "Load an LLVM LTO pass plugin during full LTO (ELF lld or Mach-O ld64.lld)")
+}
+
+var GoGlobalDCE *bool
+
+func AddGlobalDCEFlag(fs *flag.FlagSet) {
+	GoGlobalDCE = nil
+	if !buildenv.Dev {
+		return
+	}
+	fs.BoolFunc("globaldce", "Enable Go global DCE with full LTO (default: true when -lto=full)", func(v string) error {
+		enabled, err := strconv.ParseBool(v)
+		if err != nil {
+			return err
+		}
+		GoGlobalDCE = &enabled
+		return nil
+	})
+}
+
+func ResolveLTOMode(defaultValue lto.Mode) lto.Mode {
+	if LTO.Specified {
+		return LTO.Mode
+	}
+	return defaultValue
+}
+
+const DefaultTestTimeout = "10m" // Matches Go's default test timeout
 
 func AddCommonFlags(fs *flag.FlagSet) {
 	fs.BoolVar(&Verbose, "v", false, "Verbose output")
 }
 
+func AddCompilerVerboseFlag(fs *flag.FlagSet) {
+	fs.BoolVar(&CompilerVerbose, "compiler-verbose", false, "Print verbose compiler output")
+	fs.BoolVar(&CompilerVerbose, "cv", false, "Print verbose compiler output (shorthand for -compiler-verbose)")
+}
+
+func AddOptLevelFlags(fs *flag.FlagSet) {
+	OptLevel = optlevel.Unset
+	var optSource string
+	setOptLevel := func(level optlevel.Level, source string) error {
+		if optSource != "" {
+			return fmt.Errorf("optimization flags are mutually exclusive: %s and %s", optSource, source)
+		}
+		OptLevel = level
+		optSource = source
+		return nil
+	}
+	optLevelBoolFunc := func(level optlevel.Level, source string) func(string) error {
+		return func(string) error {
+			return setOptLevel(level, source)
+		}
+	}
+
+	fs.BoolFunc("O0", "Disable optimizations", optLevelBoolFunc(optlevel.O0, "-O0"))
+	fs.BoolFunc("O1", "Optimize lightly", optLevelBoolFunc(optlevel.O1, "-O1"))
+	fs.BoolFunc("O2", "Optimize for performance", optLevelBoolFunc(optlevel.O2, "-O2"))
+	fs.BoolFunc("O3", "Optimize aggressively", optLevelBoolFunc(optlevel.O3, "-O3"))
+	fs.BoolFunc("Os", "Optimize for size", optLevelBoolFunc(optlevel.Os, "-Os"))
+	fs.BoolFunc("Oz", "Optimize aggressively for size", optLevelBoolFunc(optlevel.Oz, "-Oz"))
+	fs.Func("O", "Optimization level (0,1,2,3,s,z; default s for host, z for targets)", func(val string) error {
+		level, err := optlevel.Parse(val)
+		if err != nil {
+			return err
+		}
+		return setOptLevel(level, "-O="+val)
+	})
+}
+
 func AddBuildFlags(fs *flag.FlagSet) {
+	DeadcodeDrop = false
+	PthreadStackSize = 0
+	fs.BoolVar(&ForceRebuild, "a", false, "Force rebuilding of packages that are already up-to-date")
+	fs.BoolVar(&PrintCommands, "x", false, "Print the commands")
+	if buildenv.Dev {
+		fs.BoolVar(&DeadcodeDrop, "deadcodedrop", false, "Enable Go dead code drop")
+	}
+	AddOptLevelFlags(fs)
+	AddLTOFlag(fs)
+	AddGlobalDCEFlag(fs)
+	addPCLNFlag(fs)
 	fs.StringVar(&Tags, "tags", "", "Build tags")
 	fs.StringVar(&BuildEnv, "buildenv", "", "Build environment")
+	fs.Var(&PthreadStackSize, "pthread-stack-size", "Stack size for pthread-backed goroutines, e.g. 32MB or 1024KB (0 uses the platform default)")
 	if buildenv.Dev {
-		fs.IntVar(&AbiMode, "abi", 2, "ABI mode (default 2). 0 = none, 1 = cfunc, 2 = allfunc.")
 		fs.BoolVar(&CheckLinkArgs, "check-linkargs", false, "check link args valid")
 		fs.BoolVar(&CheckLLFiles, "check-llfiles", false, "check .ll files valid")
 		fs.BoolVar(&GenLLFiles, "gen-llfiles", false, "generate .ll files for pkg export")
 		fs.BoolVar(&ForceEspClang, "force-espclang", false, "force to use esp-clang")
 	}
+
+	fs.BoolVar(&SizeReport, "size", false, "Print size report after build (default format=text, level=module)")
+	fs.StringVar(&SizeFormat, "size-format", "", "Size report format (text,json). Default text.")
+	fs.StringVar(&SizeLevel, "size-level", "", "Size report aggregation level (full,module,package). Default module.")
+}
+
+// AddBuildTraceFlag adds the build-scheduler trace flag. It is intentionally
+// separate from AddBuildFlags for commands that execute one traced build
+// invocation, currently "llgo build" and "llgo test".
+func AddBuildTraceFlag(fs *flag.FlagSet) {
+	BuildTrace = ""
+	fs.StringVar(&BuildTrace, "debug-trace", "", "Write a Chrome/Perfetto build-scheduler trace to file")
+}
+
+func AddBuildModeFlags(fs *flag.FlagSet) {
+	fs.StringVar(&BuildMode, "buildmode", "exe", "Build mode (exe, c-archive, c-shared)")
 }
 
 var Gen bool
+var CompileOnly bool
+
+// Test binary flags
+var (
+	TestRun              string
+	TestBench            string
+	TestTimeout          string
+	TestShort            bool
+	TestCount            int
+	TestCPU              string
+	TestCover            bool
+	TestCoverMode        string
+	TestCoverProfile     string
+	TestCoverPkg         string
+	TestParallel         int
+	TestFailfast         bool
+	TestJSON             bool
+	TestList             string
+	TestSkip             string
+	TestShuffle          string
+	TestFullpath         bool
+	TestBenchmem         bool
+	TestBenchtime        string
+	TestBlockProfileRate int
+	TestCPUProfile       string
+	TestMemProfile       string
+	TestMemProfileRate   int
+	TestBlockProfile     string
+	TestMutexProfile     string
+	TestMutexProfileFrac int
+	TestTrace            string
+	TestOutputDir        string
+	TestPaniconexit0     bool
+	TestTestLogFile      string
+	TestGoCoverDir       string
+	TestFuzzWorker       bool
+	TestFuzzCacheDir     string
+	TestFuzz             string
+	TestFuzzTime         string
+	TestFuzzMinimizeTime string
+)
+
+func AddTestBinaryFlags(fs *flag.FlagSet) {
+	fs.StringVar(&TestRun, "run", "", "Run only tests matching the regular expression")
+	fs.StringVar(&TestBench, "bench", "", "Run benchmarks matching the regular expression")
+	fs.StringVar(&TestTimeout, "timeout", DefaultTestTimeout, "Test timeout duration (e.g., 10m, 30s)")
+	fs.BoolVar(&TestShort, "short", false, "Tell long-running tests to shorten their run time")
+	fs.IntVar(&TestCount, "count", 1, "Run each test and benchmark n times")
+	fs.StringVar(&TestCPU, "cpu", "", "Comma-separated list of GOMAXPROCS values for which the tests or benchmarks should be executed")
+	fs.BoolVar(&TestCover, "cover", false, "Enable coverage analysis")
+	fs.StringVar(&TestCoverMode, "covermode", "", "Coverage mode: set, count, atomic")
+	fs.StringVar(&TestCoverProfile, "coverprofile", "", "Write coverage profile to file")
+	fs.StringVar(&TestCoverPkg, "coverpkg", "", "Apply coverage analysis to packages matching the patterns")
+	fs.IntVar(&TestParallel, "parallel", 0, "Maximum number of tests to run simultaneously")
+	fs.BoolVar(&TestFailfast, "failfast", false, "Do not start new tests after the first test failure")
+	fs.BoolVar(&TestJSON, "json", false, "Log verbose output in JSON format")
+	fs.StringVar(&TestList, "list", "", "List tests, benchmarks, or examples matching the regular expression")
+	fs.StringVar(&TestSkip, "skip", "", "Skip tests matching the regular expression")
+	fs.StringVar(&TestShuffle, "shuffle", "", "Randomize the execution order of tests and benchmarks")
+	fs.BoolVar(&TestFullpath, "fullpath", false, "Show full file names in error messages")
+	fs.BoolVar(&TestBenchmem, "benchmem", false, "Print memory allocation statistics for benchmarks")
+	fs.StringVar(&TestBenchtime, "benchtime", "", "Run benchmarks for duration d (e.g., 1s, 100x)")
+	fs.IntVar(&TestBlockProfileRate, "blockprofilerate", 0, "Control the detail provided in goroutine blocking profiles by calling runtime.SetBlockProfileRate")
+	fs.StringVar(&TestCPUProfile, "cpuprofile", "", "Write a CPU profile to the specified file")
+	fs.StringVar(&TestMemProfile, "memprofile", "", "Write an allocation profile to the file")
+	fs.IntVar(&TestMemProfileRate, "memprofilerate", 0, "Enable more precise (and expensive) memory allocation profiles by setting runtime.MemProfileRate")
+	fs.StringVar(&TestBlockProfile, "blockprofile", "", "Write a goroutine blocking profile to the specified file")
+	fs.StringVar(&TestMutexProfile, "mutexprofile", "", "Write a mutex contention profile to the specified file")
+	fs.IntVar(&TestMutexProfileFrac, "mutexprofilefraction", 0, "Sample 1 in n stack traces of goroutines holding a contended mutex")
+	fs.StringVar(&TestTrace, "trace", "", "Write an execution trace to the specified file")
+	fs.StringVar(&TestOutputDir, "outputdir", "", "Write output files to the specified directory")
+	fs.BoolVar(&TestPaniconexit0, "paniconexit0", false, "Panic on call to os.Exit(0)")
+	fs.StringVar(&TestTestLogFile, "testlogfile", "", "Write test action log to file")
+	fs.StringVar(&TestGoCoverDir, "gocoverdir", "", "Directory where intermediate coverage files are written")
+	fs.BoolVar(&TestFuzzWorker, "fuzzworker", false, "Coordinate with the parent process to fuzz random values (for use only by cmd/go)")
+	fs.StringVar(&TestFuzzCacheDir, "fuzzcachedir", "", "Directory where interesting fuzzing inputs are stored (for use only by cmd/go)")
+	fs.StringVar(&TestFuzz, "fuzz", "", "Run the fuzz test matching the regular expression")
+	fs.StringVar(&TestFuzzTime, "fuzztime", "", "Run fuzzing for the specified duration (e.g., 10s, 1m)")
+	fs.StringVar(&TestFuzzMinimizeTime, "fuzzminimizetime", "", "Time to spend minimizing a value after finding a crash (default: 60s)")
+}
 
 func AddEmulatorFlags(fs *flag.FlagSet) {
 	fs.BoolVar(&Emulator, "emulator", false, "Run in emulator mode")
+}
+
+func AddTestFlags(fs *flag.FlagSet) {
+	fs.StringVar(&OutputFile, "o", "", "Compile test binary to the named file")
+	fs.BoolVar(&CompileOnly, "c", false, "Compile test binary but do not run it")
 }
 
 func AddEmbeddedFlags(fs *flag.FlagSet) {
@@ -68,12 +348,60 @@ func AddCmpTestFlags(fs *flag.FlagSet) {
 	fs.BoolVar(&Gen, "gen", false, "Generate llgo.expect file")
 }
 
-func UpdateConfig(conf *build.Config) {
+func UpdateConfig(conf *build.Config) error {
+	conf.CompilerHash = compilerhash.Value()
 	conf.Tags = Tags
 	conf.Verbose = Verbose
+	conf.PrintPackages = false
+	switch conf.Mode {
+	case build.ModeBuild:
+		// Keep go build -v's package-only output, but report packages only after
+		// successful compilation. The legacy LLGo compiler output is available
+		// through -compiler-verbose.
+		conf.Verbose = CompilerVerbose
+		conf.PrintPackages = Verbose
+	case build.ModeTest:
+		// For go test, -v controls the test binary only. buildTestArgs forwards
+		// it as -test.v.
+		conf.Verbose = CompilerVerbose
+	}
+	conf.PrintCommands = PrintCommands
+	conf.DeadcodeDrop = DeadcodeDrop
+	conf.OptLevel = OptLevel
 	conf.Target = Target
 	conf.Port = Port
 	conf.BaudRate = BaudRate
+	conf.ForceRebuild = ForceRebuild
+	conf.PthreadStackSize = int64(PthreadStackSize)
+	if LTO.Specified {
+		conf.LTO = LTO.Mode
+	}
+	if PCLN.Specified {
+		conf.PCLNMode = PCLN.Mode
+		conf.PCLNModeSet = true
+	}
+	if LTOPluginPath != "" {
+		if conf.LTO != lto.Full {
+			return fmt.Errorf("lto pass plugin can only be enabled with full LTO (-lto=full)")
+		}
+		conf.LTOPlugin = lto.PassPlugin{Path: LTOPluginPath}
+	}
+	if GoGlobalDCE != nil {
+		if *GoGlobalDCE && conf.LTO != lto.Full {
+			return fmt.Errorf("globaldce can only be enabled with full LTO (-lto=full)")
+		}
+		conf.DisableGoGlobalDCE = !*GoGlobalDCE
+	}
+	if SizeReport || SizeFormat != "" || SizeLevel != "" {
+		conf.SizeReport = true
+		if SizeFormat != "" {
+			conf.SizeFormat = SizeFormat
+		}
+		if SizeLevel != "" {
+			conf.SizeLevel = SizeLevel
+		}
+	}
+
 	switch conf.Mode {
 	case build.ModeBuild:
 		conf.OutFile = OutputFile
@@ -84,7 +412,11 @@ func UpdateConfig(conf *build.Config) {
 			Uf2: OutUf2,
 			Zip: OutZip,
 		}
-	case build.ModeRun, build.ModeTest:
+	case build.ModeRun:
+		conf.Emulator = Emulator
+	case build.ModeTest:
+		conf.OutFile = OutputFile
+		conf.CompileOnly = CompileOnly
 		conf.Emulator = Emulator
 	case build.ModeInstall:
 
@@ -93,10 +425,23 @@ func UpdateConfig(conf *build.Config) {
 		conf.GenExpect = Gen
 	}
 	if buildenv.Dev {
-		conf.AbiMode = build.AbiMode(AbiMode)
 		conf.CheckLinkArgs = CheckLinkArgs
 		conf.CheckLLFiles = CheckLLFiles
 		conf.GenLL = GenLLFiles
 		conf.ForceEspClang = ForceEspClang
 	}
+	return nil
+}
+
+func UpdateBuildConfig(conf *build.Config) error {
+	// First apply common config
+	if err := UpdateConfig(conf); err != nil {
+		return err
+	}
+	if err := build.ValidateBuildMode(BuildMode); err != nil {
+		return err
+	}
+	conf.BuildMode = build.BuildMode(BuildMode)
+
+	return nil
 }

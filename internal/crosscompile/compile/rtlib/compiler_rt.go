@@ -5,19 +5,23 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/goplus/llgo/internal/crosscompile/compile"
+	"github.com/xgo-dev/llgo/internal/crosscompile/compile"
 )
 
 func platformSpecifiedFiles(builtinsDir, target string) []string {
 	switch {
 	case strings.Contains(target, "riscv32"):
-		return []string{
+		files := []string{
 			filepath.Join(builtinsDir, "riscv", "mulsi3.S"),
 			filepath.Join(builtinsDir, "riscv", "fp_mode.c"),
 			filepath.Join(builtinsDir, "riscv", "save.S"),
 			filepath.Join(builtinsDir, "riscv", "restore.S"),
-			filepath.Join(builtinsDir, "atomic.c"),
 		}
+		// Only add atomic.c for non-ESP targets (ESP doesn't support A extension)
+		if target != "riscv32-esp-elf" {
+			files = append(files, filepath.Join(builtinsDir, "atomic.c"))
+		}
+		return files
 	case strings.Contains(target, "riscv64"):
 		return []string{
 			filepath.Join(builtinsDir, "addtf3.c"),
@@ -100,10 +104,18 @@ func withPlatformSpecifiedFiles(baseDir, target string, files []string) []string
 	return append(files, platformSpecifiedFiles(builtinsDir, target)...)
 }
 
-func GetCompilerRTConfig(baseDir, target string) *compile.CompileConfig {
-	return &compile.CompileConfig{
-		Url:           "https://github.com/goplus/compiler-rt/archive/refs/tags/v0.1.0.tar.gz",
-		ArchiveSrcDir: "compiler-rt-0.1.0",
+func GetCompilerRTConfig() compile.LibConfig {
+	const version = "xtensa_release_22.1.4_20260903"
+	return compile.LibConfig{
+		Name:           "compiler-rt",
+		Url:            "https://github.com/goplus/compiler-rt/archive/refs/tags/" + version + ".tar.gz",
+		Version:        version,
+		ResourceSubDir: "compiler-rt-" + version,
+	}
+}
+
+func GetCompilerRTCompileConfig(baseDir, target string) compile.CompileConfig {
+	return compile.CompileConfig{
 		Groups: []compile.CompileGroup{
 			{
 				OutputFileName: fmt.Sprintf("libclang_builtins-%s.a", target),
@@ -277,7 +289,8 @@ func GetCompilerRTConfig(baseDir, target string) *compile.CompileConfig {
 					"-Werror=return-stack-address",
 					"-Werror=sizeof-array-decay",
 					"-Werror=format-insufficient-args",
-					"-Wformat -std=c11",
+					"-Wformat",
+					"-std=c11",
 					"-fno-builtin",
 					"-fvisibility=hidden",
 					"-fomit-frame-pointer",

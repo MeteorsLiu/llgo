@@ -6,6 +6,8 @@ const (
 	LLGoFiles = "../wrap/struct_int32.c"
 )
 
+type pointer = *int8
+
 //go:linkname printf C.printf
 func printf(format *byte, __llgo_va_list ...any) int32
 
@@ -234,16 +236,16 @@ func init() {
 }
 
 type point11 struct {
-	x0 int32
-	x1 int32
-	x2 int32
-	x3 int32
-	x4 int32
-	x5 int32
-	x6 int32
-	x7 int32
-	x8 int32
-	x9 int32
+	x0  int32
+	x1  int32
+	x2  int32
+	x3  int32
+	x4  int32
+	x5  int32
+	x6  int32
+	x7  int32
+	x8  int32
+	x9  int32
 	x10 int32
 }
 
@@ -261,16 +263,16 @@ func init() {
 }
 
 type point12 struct {
-	x0 int32
-	x1 int32
-	x2 int32
-	x3 int32
-	x4 int32
-	x5 int32
-	x6 int32
-	x7 int32
-	x8 int32
-	x9 int32
+	x0  int32
+	x1  int32
+	x2  int32
+	x3  int32
+	x4  int32
+	x5  int32
+	x6  int32
+	x7  int32
+	x8  int32
+	x9  int32
 	x10 int32
 	x11 int32
 }
@@ -289,16 +291,16 @@ func init() {
 }
 
 type point13 struct {
-	x0 int32
-	x1 int32
-	x2 int32
-	x3 int32
-	x4 int32
-	x5 int32
-	x6 int32
-	x7 int32
-	x8 int32
-	x9 int32
+	x0  int32
+	x1  int32
+	x2  int32
+	x3  int32
+	x4  int32
+	x5  int32
+	x6  int32
+	x7  int32
+	x8  int32
+	x9  int32
 	x10 int32
 	x11 int32
 	x12 int32
@@ -318,16 +320,16 @@ func init() {
 }
 
 type point14 struct {
-	x0 int32
-	x1 int32
-	x2 int32
-	x3 int32
-	x4 int32
-	x5 int32
-	x6 int32
-	x7 int32
-	x8 int32
-	x9 int32
+	x0  int32
+	x1  int32
+	x2  int32
+	x3  int32
+	x4  int32
+	x5  int32
+	x6  int32
+	x7  int32
+	x8  int32
+	x9  int32
 	x10 int32
 	x11 int32
 	x12 int32
@@ -348,16 +350,16 @@ func init() {
 }
 
 type point15 struct {
-	x0 int32
-	x1 int32
-	x2 int32
-	x3 int32
-	x4 int32
-	x5 int32
-	x6 int32
-	x7 int32
-	x8 int32
-	x9 int32
+	x0  int32
+	x1  int32
+	x2  int32
+	x3  int32
+	x4  int32
+	x5  int32
+	x6  int32
+	x7  int32
+	x8  int32
+	x9  int32
 	x10 int32
 	x11 int32
 	x12 int32
@@ -379,16 +381,16 @@ func init() {
 }
 
 type point16 struct {
-	x0 int32
-	x1 int32
-	x2 int32
-	x3 int32
-	x4 int32
-	x5 int32
-	x6 int32
-	x7 int32
-	x8 int32
-	x9 int32
+	x0  int32
+	x1  int32
+	x2  int32
+	x3  int32
+	x4  int32
+	x5  int32
+	x6  int32
+	x7  int32
+	x8  int32
+	x9  int32
 	x10 int32
 	x11 int32
 	x12 int32
@@ -411,16 +413,16 @@ func init() {
 }
 
 type point17 struct {
-	x0 int32
-	x1 int32
-	x2 int32
-	x3 int32
-	x4 int32
-	x5 int32
-	x6 int32
-	x7 int32
-	x8 int32
-	x9 int32
+	x0  int32
+	x1  int32
+	x2  int32
+	x3  int32
+	x4  int32
+	x5  int32
+	x6  int32
+	x7  int32
+	x8  int32
+	x9  int32
 	x10 int32
 	x11 int32
 	x12 int32
@@ -444,16 +446,16 @@ func init() {
 }
 
 type point18 struct {
-	x0 int32
-	x1 int32
-	x2 int32
-	x3 int32
-	x4 int32
-	x5 int32
-	x6 int32
-	x7 int32
-	x8 int32
-	x9 int32
+	x0  int32
+	x1  int32
+	x2  int32
+	x3  int32
+	x4  int32
+	x5  int32
+	x6  int32
+	x7  int32
+	x8  int32
+	x9  int32
 	x10 int32
 	x11 int32
 	x12 int32
@@ -478,16 +480,16 @@ func init() {
 }
 
 type point19 struct {
-	x0 int32
-	x1 int32
-	x2 int32
-	x3 int32
-	x4 int32
-	x5 int32
-	x6 int32
-	x7 int32
-	x8 int32
-	x9 int32
+	x0  int32
+	x1  int32
+	x2  int32
+	x3  int32
+	x4  int32
+	x5  int32
+	x6  int32
+	x7  int32
+	x8  int32
+	x9  int32
 	x10 int32
 	x11 int32
 	x12 int32
@@ -513,16 +515,16 @@ func init() {
 }
 
 type point20 struct {
-	x0 int32
-	x1 int32
-	x2 int32
-	x3 int32
-	x4 int32
-	x5 int32
-	x6 int32
-	x7 int32
-	x8 int32
-	x9 int32
+	x0  int32
+	x1  int32
+	x2  int32
+	x3  int32
+	x4  int32
+	x5  int32
+	x6  int32
+	x7  int32
+	x8  int32
+	x9  int32
 	x10 int32
 	x11 int32
 	x12 int32

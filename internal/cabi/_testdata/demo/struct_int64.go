@@ -6,6 +6,8 @@ const (
 	LLGoFiles = "../wrap/struct_int64.c"
 )
 
+type pointer = *int8
+
 //go:linkname printf C.printf
 func printf(format *byte, __llgo_va_list ...any) int32
 
@@ -234,16 +236,16 @@ func init() {
 }
 
 type point11 struct {
-	x0 int64
-	x1 int64
-	x2 int64
-	x3 int64
-	x4 int64
-	x5 int64
-	x6 int64
-	x7 int64
-	x8 int64
-	x9 int64
+	x0  int64
+	x1  int64
+	x2  int64
+	x3  int64
+	x4  int64
+	x5  int64
+	x6  int64
+	x7  int64
+	x8  int64
+	x9  int64
 	x10 int64
 }
 
@@ -261,16 +263,16 @@ func init() {
 }
 
 type point12 struct {
-	x0 int64
-	x1 int64
-	x2 int64
-	x3 int64
-	x4 int64
-	x5 int64
-	x6 int64
-	x7 int64
-	x8 int64
-	x9 int64
+	x0  int64
+	x1  int64
+	x2  int64
+	x3  int64
+	x4  int64
+	x5  int64
+	x6  int64
+	x7  int64
+	x8  int64
+	x9  int64
 	x10 int64
 	x11 int64
 }
@@ -289,16 +291,16 @@ func init() {
 }
 
 type point13 struct {
-	x0 int64
-	x1 int64
-	x2 int64
-	x3 int64
-	x4 int64
-	x5 int64
-	x6 int64
-	x7 int64
-	x8 int64
-	x9 int64
+	x0  int64
+	x1  int64
+	x2  int64
+	x3  int64
+	x4  int64
+	x5  int64
+	x6  int64
+	x7  int64
+	x8  int64
+	x9  int64
 	x10 int64
 	x11 int64
 	x12 int64
@@ -318,16 +320,16 @@ func init() {
 }
 
 type point14 struct {
-	x0 int64
-	x1 int64
-	x2 int64
-	x3 int64
-	x4 int64
-	x5 int64
-	x6 int64
-	x7 int64
-	x8 int64
-	x9 int64
+	x0  int64
+	x1  int64
+	x2  int64
+	x3  int64
+	x4  int64
+	x5  int64
+	x6  int64
+	x7  int64
+	x8  int64
+	x9  int64
 	x10 int64
 	x11 int64
 	x12 int64
@@ -348,16 +350,16 @@ func init() {
 }
 
 type point15 struct {
-	x0 int64
-	x1 int64
-	x2 int64
-	x3 int64
-	x4 int64
-	x5 int64
-	x6 int64
-	x7 int64
-	x8 int64
-	x9 int64
+	x0  int64
+	x1  int64
+	x2  int64
+	x3  int64
+	x4  int64
+	x5  int64
+	x6  int64
+	x7  int64
+	x8  int64
+	x9  int64
 	x10 int64
 	x11 int64
 	x12 int64
@@ -379,16 +381,16 @@ func init() {
 }
 
 type point16 struct {
-	x0 int64
-	x1 int64
-	x2 int64
-	x3 int64
-	x4 int64
-	x5 int64
-	x6 int64
-	x7 int64
-	x8 int64
-	x9 int64
+	x0  int64
+	x1  int64
+	x2  int64
+	x3  int64
+	x4  int64
+	x5  int64
+	x6  int64
+	x7  int64
+	x8  int64
+	x9  int64
 	x10 int64
 	x11 int64
 	x12 int64
@@ -411,16 +413,16 @@ func init() {
 }
 
 type point17 struct {
-	x0 int64
-	x1 int64
-	x2 int64
-	x3 int64
-	x4 int64
-	x5 int64
-	x6 int64
-	x7 int64
-	x8 int64
-	x9 int64
+	x0  int64
+	x1  int64
+	x2  int64
+	x3  int64
+	x4  int64
+	x5  int64
+	x6  int64
+	x7  int64
+	x8  int64
+	x9  int64
 	x10 int64
 	x11 int64
 	x12 int64
@@ -444,16 +446,16 @@ func init() {
 }
 
 type point18 struct {
-	x0 int64
-	x1 int64
-	x2 int64
-	x3 int64
-	x4 int64
-	x5 int64
-	x6 int64
-	x7 int64
-	x8 int64
-	x9 int64
+	x0  int64
+	x1  int64
+	x2  int64
+	x3  int64
+	x4  int64
+	x5  int64
+	x6  int64
+	x7  int64
+	x8  int64
+	x9  int64
 	x10 int64
 	x11 int64
 	x12 int64
@@ -478,16 +480,16 @@ func init() {
 }
 
 type point19 struct {
-	x0 int64
-	x1 int64
-	x2 int64
-	x3 int64
-	x4 int64
-	x5 int64
-	x6 int64
-	x7 int64
-	x8 int64
-	x9 int64
+	x0  int64
+	x1  int64
+	x2  int64
+	x3  int64
+	x4  int64
+	x5  int64
+	x6  int64
+	x7  int64
+	x8  int64
+	x9  int64
 	x10 int64
 	x11 int64
 	x12 int64
@@ -513,16 +515,16 @@ func init() {
 }
 
 type point20 struct {
-	x0 int64
-	x1 int64
-	x2 int64
-	x3 int64
-	x4 int64
-	x5 int64
-	x6 int64
-	x7 int64
-	x8 int64
-	x9 int64
+	x0  int64
+	x1  int64
+	x2  int64
+	x3  int64
+	x4  int64
+	x5  int64
+	x6  int64
+	x7  int64
+	x8  int64
+	x9  int64
 	x10 int64
 	x11 int64
 	x12 int64

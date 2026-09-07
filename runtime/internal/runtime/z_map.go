@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2024 The GoPlus Authors (goplus.org). All rights reserved.
+ * Copyright (c) 2024 The XGo Authors (xgo.dev). All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -19,7 +19,7 @@ package runtime
 import (
 	"unsafe"
 
-	"github.com/goplus/llgo/runtime/abi"
+	"github.com/xgo-dev/llgo/runtime/abi"
 )
 
 // Map represents a Go map.
@@ -59,27 +59,109 @@ func MapAccess2(t *maptype, h *hmap, key unsafe.Pointer) (unsafe.Pointer, bool) 
 	return mapaccess2(t, h, key)
 }
 
+func MapAccess1Fat(t *maptype, h *hmap, key, zero unsafe.Pointer) unsafe.Pointer {
+	return mapaccess1_fat(t, h, key, zero)
+}
+
+func MapAccess2Fat(t *maptype, h *hmap, key, zero unsafe.Pointer) (unsafe.Pointer, bool) {
+	return mapaccess2_fat(t, h, key, zero)
+}
+
 func MapDelete(t *maptype, h *hmap, key unsafe.Pointer) {
 	mapdelete(t, h, key)
+}
+
+func MapAccess1Fast32(t *maptype, h *hmap, key uint32) unsafe.Pointer {
+	return mapaccess1_fast32(t, h, key)
+}
+
+func MapAccess2Fast32(t *maptype, h *hmap, key uint32) (unsafe.Pointer, bool) {
+	return mapaccess2_fast32(t, h, key)
+}
+
+func MapAssignFast32(t *maptype, h *hmap, key uint32) unsafe.Pointer {
+	return mapassign_fast32(t, h, key)
+}
+
+func MapAssignFast32Ptr(t *maptype, h *hmap, key unsafe.Pointer) unsafe.Pointer {
+	return mapassign_fast32ptr(t, h, key)
+}
+
+func MapDeleteFast32(t *maptype, h *hmap, key uint32) {
+	mapdelete_fast32(t, h, key)
+}
+
+func MapAccess1Fast64(t *maptype, h *hmap, key uint64) unsafe.Pointer {
+	return mapaccess1_fast64(t, h, key)
+}
+
+func MapAccess2Fast64(t *maptype, h *hmap, key uint64) (unsafe.Pointer, bool) {
+	return mapaccess2_fast64(t, h, key)
+}
+
+func MapAssignFast64(t *maptype, h *hmap, key uint64) unsafe.Pointer {
+	return mapassign_fast64(t, h, key)
+}
+
+func MapAssignFast64Ptr(t *maptype, h *hmap, key unsafe.Pointer) unsafe.Pointer {
+	return mapassign_fast64ptr(t, h, key)
+}
+
+func MapDeleteFast64(t *maptype, h *hmap, key uint64) {
+	mapdelete_fast64(t, h, key)
+}
+
+func MapAccess1FastStr(t *maptype, h *hmap, key string) unsafe.Pointer {
+	return mapaccess1_faststr(t, h, key)
+}
+
+func MapAccess2FastStr(t *maptype, h *hmap, key string) (unsafe.Pointer, bool) {
+	return mapaccess2_faststr(t, h, key)
+}
+
+func MapAssignFastStr(t *maptype, h *hmap, key string) unsafe.Pointer {
+	return mapassign_faststr(t, h, key)
+}
+
+func MapDeleteFastStr(t *maptype, h *hmap, key string) {
+	mapdelete_faststr(t, h, key)
 }
 
 func MapClear(t *maptype, h *hmap) {
 	mapclear(t, h)
 }
 
-func NewMapIter(t *maptype, h *hmap) *hiter {
-	var it hiter
-	mapiterinit(t, h, &it)
+type llgoMapIter struct {
+	hiter
+	// ready reports whether hiter.key/elem is still waiting to be yielded.
+	// Advancing is delayed until the next call so mutation after yield can stop
+	// iteration before mapiternext touches cleared map state.
+	ready bool
+}
+
+func NewMapIter(t *maptype, h *hmap) *llgoMapIter {
+	var it llgoMapIter
+	mapiterinit(t, h, &it.hiter)
+	it.ready = true
 	return &it
 }
 
-func MapIterNext(it *hiter) (ok bool, k unsafe.Pointer, v unsafe.Pointer) {
+func MapIterNext(it *llgoMapIter) (ok bool, k unsafe.Pointer, v unsafe.Pointer) {
+	if it.h == nil || it.h.count == 0 {
+		it.key = nil
+		it.elem = nil
+		return
+	}
+	if !it.ready {
+		mapiternext(&it.hiter)
+		it.ready = true
+	}
 	if it.key == nil {
 		return
 	}
 	ok = true
 	k, v = it.key, it.elem
-	mapiternext(it)
+	it.ready = false
 	return
 }
 

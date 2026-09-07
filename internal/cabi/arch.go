@@ -1,7 +1,9 @@
 package cabi
 
 import (
-	"github.com/goplus/llvm"
+	"slices"
+
+	"github.com/xgo-dev/llvm"
 )
 
 func elementTypesCount(typ llvm.Type) int {
@@ -28,13 +30,17 @@ func elementTypes(td llvm.TargetData, typ llvm.Type) (types []llvm.Type) {
 			types = append(types, elementTypes(td, t)...)
 		}
 	case llvm.ArrayTypeKind:
-		sub := elementTypes(td, typ.ElementType())
 		n := typ.ArrayLength()
-		for i := 0; i < n; i++ {
-			types = append(types, sub...)
+		switch n {
+		case 0:
+		case 1:
+			return elementTypes(td, typ.ElementType())
+		default:
+			sub := elementTypes(td, typ.ElementType())
+			return slices.Repeat(sub, n)
 		}
 	default:
-		types = append(types, typ)
+		return []llvm.Type{typ}
 	}
 	return
 }
@@ -48,9 +54,27 @@ func checkTypes(typs []llvm.Type, typ llvm.Type) bool {
 	return true
 }
 
-func hasTypes(typs []llvm.Type, typ llvm.Type) bool {
+func containsType(typs []llvm.Type, typ llvm.Type) bool {
 	for _, t := range typs {
 		if t == typ {
+			return true
+		}
+	}
+	return false
+}
+
+func containsTypeAny(typs []llvm.Type, typ1, typ2 llvm.Type) bool {
+	for _, t := range typs {
+		if t == typ1 || t == typ2 {
+			return true
+		}
+	}
+	return false
+}
+
+func hasTypesKind(typs []llvm.Type, kind llvm.TypeKind) bool {
+	for _, t := range typs {
+		if t.TypeKind() == kind {
 			return true
 		}
 	}
@@ -183,19 +207,17 @@ func (p *TypeInfoArm64) GetTypeInfo(ctx llvm.Context, ftyp llvm.Type, typ llvm.T
 	info.Align = p.Alignof(typ)
 	switch kind {
 	case llvm.StructTypeKind, llvm.ArrayTypeKind:
-		types := elementTypes(p.td, typ)
-		n := len(types)
+		n := elementTypesCount(typ)
 		if bret && n == 1 {
 			return info
 		}
-		if n == 2 {
+		if n <= 4 {
+			types := elementTypes(p.td, typ)
 			// skip (i64/ptr,i64/ptr)
-			if (types[0].TypeKind() == llvm.PointerTypeKind || types[0] == ctx.Int64Type()) &&
+			if n == 2 && (types[0].TypeKind() == llvm.PointerTypeKind || types[0] == ctx.Int64Type()) &&
 				(types[1].TypeKind() == llvm.PointerTypeKind || types[1] == ctx.Int64Type()) {
 				return info
 			}
-		}
-		if n <= 4 {
 			if checkTypes(types, ctx.FloatType()) || checkTypes(types, ctx.DoubleType()) {
 				return info
 			}
@@ -254,9 +276,10 @@ func (p *TypeInfoArm) GetTypeInfo(ctx llvm.Context, ftyp llvm.Type, typ llvm.Typ
 	info.Align = p.Alignof(typ)
 	switch kind {
 	case llvm.StructTypeKind, llvm.ArrayTypeKind:
-		types := elementTypes(p.td, typ)
-		n := len(types)
+		n := elementTypesCount(typ)
+		var types []llvm.Type
 		if n <= 4 {
+			types = elementTypes(p.td, typ)
 			if checkTypes(types, ctx.FloatType()) || checkTypes(types, ctx.DoubleType()) {
 				return info
 			}
@@ -274,8 +297,11 @@ func (p *TypeInfoArm) GetTypeInfo(ctx llvm.Context, ftyp llvm.Type, typ llvm.Typ
 				info.Kind = AttrPointer
 				info.Type1 = llvm.PointerType(typ, 0)
 			} else {
+				if types == nil {
+					types = elementTypes(p.td, typ)
+				}
 				info.Kind = AttrWidthType
-				if hasTypes(types, ctx.Int64Type()) || hasTypes(types, ctx.DoubleType()) {
+				if containsTypeAny(types, ctx.Int64Type(), ctx.DoubleType()) {
 					size := (info.Size + 7) &^ 7
 					info.Type1 = llvm.ArrayType(ctx.Int64Type(), size/8)
 				} else {
@@ -324,10 +350,11 @@ func (p *TypeInfoWasm) GetTypeInfo(ctx llvm.Context, ftyp llvm.Type, typ llvm.Ty
 
 type TypeInfoRiscv64 struct {
 	*Transformer
+	mabi string
 }
 
 func (p *TypeInfoRiscv64) SupportByVal() bool {
-	return true
+	return false
 }
 
 func (p *TypeInfoRiscv64) SkipEmptyParams() bool {
@@ -354,16 +381,40 @@ func (p *TypeInfoRiscv64) GetTypeInfo(ctx llvm.Context, ftyp llvm.Type, typ llvm
 	info.Align = p.Alignof(typ)
 	switch typ.TypeKind() {
 	case llvm.StructTypeKind, llvm.ArrayTypeKind:
-		types := elementTypes(p.td, typ)
-		switch len(types) {
+		n := elementTypesCount(typ)
+		switch n {
 		case 1:
+			types := elementTypes(p.td, typ)
 			if types[0].TypeKind() == llvm.PointerTypeKind || types[0] == ctx.Int64Type() {
 				return info
 			}
+			switch p.mabi {
+			case MABI_LP64F, MABI_LP64D:
+				if types[0] == ctx.FloatType() {
+					return info
+				}
+			}
 		case 2:
+			types := elementTypes(p.td, typ)
 			if (types[0].TypeKind() == llvm.PointerTypeKind || types[0] == ctx.Int64Type()) &&
 				(types[1].TypeKind() == llvm.PointerTypeKind || types[1] == ctx.Int64Type()) {
 				return info
+			}
+			switch p.mabi {
+			case MABI_LP64F:
+				if containsType(types, ctx.FloatType()) && !containsType(types, ctx.DoubleType()) && !hasTypesKind(types, llvm.PointerTypeKind) {
+					info.Kind = AttrWidthType2
+					info.Type1 = types[0]
+					info.Type2 = types[1]
+					return info
+				}
+			case MABI_LP64D:
+				if (containsTypeAny(types, ctx.FloatType(), ctx.DoubleType())) && !hasTypesKind(types, llvm.PointerTypeKind) {
+					info.Kind = AttrWidthType2
+					info.Type1 = types[0]
+					info.Type2 = types[1]
+					return info
+				}
 			}
 		}
 		if info.Size > 16 {
@@ -375,6 +426,97 @@ func (p *TypeInfoRiscv64) GetTypeInfo(ctx llvm.Context, ftyp llvm.Type, typ llvm
 		} else {
 			info.Kind = AttrWidthType
 			info.Type1 = llvm.ArrayType(ctx.Int64Type(), 2)
+		}
+	}
+	return info
+}
+
+const (
+	MABI_LP64  = "lp64"
+	MABI_LP64F = "lp64f"
+	MABI_LP64D = "lp64d"
+)
+
+const (
+	MABI_ILP32  = "ilp32"
+	MABI_ILP32F = "ilp32f"
+	MABI_ILP32D = "ilp32d"
+)
+
+type TypeInfoRiscv32 struct {
+	*Transformer
+	mabi string
+}
+
+func (p *TypeInfoRiscv32) SupportByVal() bool {
+	return false
+}
+
+func (p *TypeInfoRiscv32) SkipEmptyParams() bool {
+	return true
+}
+
+func (p *TypeInfoRiscv32) IsWrapType(ctx llvm.Context, ftyp llvm.Type, typ llvm.Type, index int) bool {
+	switch typ.TypeKind() {
+	case llvm.StructTypeKind, llvm.ArrayTypeKind:
+		return true
+	}
+	return false
+}
+
+func (p *TypeInfoRiscv32) GetTypeInfo(ctx llvm.Context, ftyp llvm.Type, typ llvm.Type, index int) *TypeInfo {
+	info := &TypeInfo{}
+	info.Type = typ
+	info.Type1 = typ
+	if typ.TypeKind() == llvm.VoidTypeKind {
+		info.Kind = AttrVoid
+		return info
+	}
+	info.Size = p.Sizeof(typ)
+	info.Align = p.Alignof(typ)
+	switch typ.TypeKind() {
+	case llvm.StructTypeKind, llvm.ArrayTypeKind:
+		n := elementTypesCount(typ)
+		switch n {
+		case 1:
+			types := elementTypes(p.td, typ)
+			if types[0] == ctx.Int64Type() {
+				return info
+			}
+			if types[0] == ctx.DoubleType() {
+				info.Kind = AttrWidthType
+				info.Type1 = ctx.Int64Type()
+				return info
+			}
+		case 2:
+			types := elementTypes(p.td, typ)
+			switch p.mabi {
+			case MABI_ILP32F:
+				if info.Align != 8 && containsType(types, ctx.FloatType()) && !hasTypesKind(types, llvm.PointerTypeKind) {
+					info.Kind = AttrWidthType2
+					info.Type1 = types[0]
+					info.Type2 = types[1]
+					return info
+				}
+			case MABI_ILP32D:
+				if (containsTypeAny(types, ctx.FloatType(), ctx.DoubleType())) &&
+					!hasTypesKind(types, llvm.PointerTypeKind) && !containsType(types, ctx.Int64Type()) {
+					info.Kind = AttrWidthType2
+					info.Type1 = types[0]
+					info.Type2 = types[1]
+					return info
+				}
+			}
+		}
+		if info.Size > 8 {
+			info.Kind = AttrPointer
+			info.Type1 = llvm.PointerType(typ, 0)
+		} else if info.Size <= 4 {
+			info.Kind = AttrWidthType
+			info.Type1 = ctx.Int32Type()
+		} else {
+			info.Kind = AttrWidthType
+			info.Type1 = llvm.ArrayType(ctx.Int32Type(), 2)
 		}
 	}
 	return info
@@ -461,6 +603,72 @@ func (p *TypeInfo386) GetTypeInfo(ctx llvm.Context, ftyp llvm.Type, typ llvm.Typ
 	case llvm.ArrayTypeKind:
 		info.Kind = AttrPointer
 		info.Type1 = llvm.PointerType(typ, 0)
+	}
+	return info
+}
+
+type TypeInfoEsp32 struct {
+	*Transformer
+}
+
+func (p *TypeInfoEsp32) SupportByVal() bool {
+	return true
+}
+
+func (p *TypeInfoEsp32) SkipEmptyParams() bool {
+	return false
+}
+
+func (p *TypeInfoEsp32) IsWrapType(ctx llvm.Context, ftyp llvm.Type, typ llvm.Type, index int) bool {
+	switch typ.TypeKind() {
+	case llvm.ArrayTypeKind, llvm.StructTypeKind:
+		return true
+	}
+	return false
+}
+
+func (p *TypeInfoEsp32) GetTypeInfo(ctx llvm.Context, ftyp llvm.Type, typ llvm.Type, index int) *TypeInfo {
+	bret := index == 0
+	info := &TypeInfo{}
+	info.Type = typ
+	info.Type1 = typ
+	if typ.TypeKind() == llvm.VoidTypeKind {
+		info.Kind = AttrVoid
+		return info
+	}
+	info.Size = p.Sizeof(typ)
+	info.Align = p.Alignof(typ)
+	if info.Size == 0 {
+		if bret {
+			return info
+		}
+		if index == 1 {
+			info.Kind = AttrPointer
+			info.Type1 = llvm.PointerType(typ, 0)
+			return info
+		}
+		info.Kind = AttrVoid
+		info.Type1 = ctx.VoidType()
+		return info
+	}
+	switch typ.TypeKind() {
+	case llvm.StructTypeKind, llvm.ArrayTypeKind:
+		if (bret && (info.Size > 16 ||
+			(info.Size <= 4 && info.Align < 4) || (info.Size < 8 && info.Align >= 4))) ||
+			(info.Size > 24) {
+			info.Kind = AttrPointer
+			info.Type1 = llvm.PointerType(typ, 0)
+			return info
+		}
+		info.Kind = AttrWidthType
+		types := elementTypes(p.td, typ)
+		if containsTypeAny(types, ctx.Int64Type(), ctx.DoubleType()) {
+			size := (info.Size + 7) &^ 7
+			info.Type1 = llvm.ArrayType(ctx.Int64Type(), size/8)
+		} else {
+			size := (info.Size + 3) &^ 3
+			info.Type1 = llvm.ArrayType(ctx.Int32Type(), size/4)
+		}
 	}
 	return info
 }

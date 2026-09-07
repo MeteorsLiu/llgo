@@ -2,7 +2,7 @@
 // +build !llgo
 
 /*
- * Copyright (c) 2024 The GoPlus Authors (goplus.org). All rights reserved.
+ * Copyright (c) 2024 The XGo Authors (xgo.dev). All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -21,11 +21,283 @@ package clang
 
 import (
 	"bytes"
+	"fmt"
+	"io"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"reflect"
+	"runtime"
+	"slices"
 	"strings"
 	"testing"
 )
+
+const clangTestHelperEnv = "GO_WANT_LLGO_CLANG_TEST_HELPER"
+
+func init() {
+	if os.Getenv(clangTestHelperEnv) != "1" {
+		return
+	}
+	if len(os.Args) > 1 {
+		fmt.Fprintln(os.Stdout, strings.Join(os.Args[1:], " "))
+	} else if _, err := io.Copy(os.Stdout, os.Stdin); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(2)
+	}
+	os.Exit(0)
+}
+
+func newTestCmd(config Config) *Cmd {
+	cmd := New(os.Args[0], config)
+	cmd.Env = append(os.Environ(), clangTestHelperEnv+"=1")
+	return cmd
+}
+
+func TestConfiguredCommandPrefixes(t *testing.T) {
+	config := Config{
+		CC:         os.Args[0],
+		CCArgs:     []string{"--cc-prefix"},
+		CXX:        os.Args[0],
+		CXXArgs:    []string{"--cxx-prefix"},
+		Linker:     os.Args[0],
+		LinkerArgs: []string{"--link-prefix"},
+		CCFLAGS:    []string{"-O2"},
+		LDFLAGS:    []string{"-Wl,test"},
+	}
+	for _, test := range []struct {
+		name string
+		cmd  *Cmd
+		run  func(*Cmd) error
+		want string
+	}{
+		{name: "CC", cmd: NewCompiler(config), run: func(cmd *Cmd) error { return cmd.Compile("-c", "file.c") }, want: "--cc-prefix -O2 -c file.c"},
+		{name: "CXX", cmd: NewCXXCompiler(config), run: func(cmd *Cmd) error { return cmd.Compile("-c", "file.cpp") }, want: "--cxx-prefix -O2 -c file.cpp"},
+		{name: "linker", cmd: NewLinker(config), run: func(cmd *Cmd) error { return cmd.Link("file.o") }, want: "--link-prefix -Wl,test file.o"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var output bytes.Buffer
+			test.cmd.Env = append(os.Environ(), clangTestHelperEnv+"=1")
+			test.cmd.Stdout = &output
+			if err := test.run(test.cmd); err != nil {
+				t.Fatal(err)
+			}
+			if got := strings.TrimSpace(output.String()); got != test.want {
+				t.Fatalf("command = %q, want %q", got, test.want)
+			}
+		})
+	}
+}
+
+func TestCXXCompilerFallsBackToCCCommand(t *testing.T) {
+	config := Config{CC: os.Args[0], CCArgs: []string{"--cc-prefix"}}
+	cmd := NewCXXCompiler(config)
+	var output bytes.Buffer
+	cmd.Env = append(os.Environ(), clangTestHelperEnv+"=1")
+	cmd.Stdout = &output
+	if err := cmd.Compile("-c", "file.cpp"); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := strings.TrimSpace(output.String()), "--cc-prefix -c file.cpp"; got != want {
+		t.Fatalf("command = %q, want %q", got, want)
+	}
+}
+
+func TestWriteWindowsResponseArg(t *testing.T) {
+	tests := []struct {
+		arg  string
+		want string
+	}{
+		{"plain", `"plain"`},
+		{`C:\path with spaces\object.o`, `"C:\path with spaces\object.o"`},
+		{`quote"and\slash`, `"quote\"and\slash"`},
+		{`trailing\`, `"trailing\\"`},
+		{"", `""`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.arg, func(t *testing.T) {
+			var got strings.Builder
+			writeWindowsResponseArg(&got, tt.arg)
+			if got.String() != tt.want {
+				t.Fatalf("quoted response argument = %q, want %q", got.String(), tt.want)
+			}
+		})
+	}
+}
+
+func TestWriteGNUResponseArg(t *testing.T) {
+	tests := []struct {
+		arg  string
+		want string
+	}{
+		{"plain", `"plain"`},
+		{`C:\path with spaces\object.o`, `"C:\\path with spaces\\object.o"`},
+		{`quote"and\slash`, `"quote\"and\\slash"`},
+		{`trailing\`, `"trailing\\"`},
+		{"", `""`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.arg, func(t *testing.T) {
+			var got strings.Builder
+			writeGNUResponseArg(&got, tt.arg)
+			if got.String() != tt.want {
+				t.Fatalf("quoted response argument = %q, want %q", got.String(), tt.want)
+			}
+		})
+	}
+}
+
+func TestResolveMSVCImportLibraries(t *testing.T) {
+	root := t.TempDir()
+	for _, dir := range []string{"first", "second"} {
+		if err := os.Mkdir(filepath.Join(root, dir), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	clangImport := filepath.Join(root, "first", "libclang.lib")
+	for _, file := range []string{
+		clangImport,
+		filepath.Join(root, "first", "libgnu.dll.a"),
+		filepath.Join(root, "first", "libnative.dll.a"),
+		filepath.Join(root, "second", "native.lib"),
+	} {
+		if err := os.WriteFile(file, nil, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	args := []string{"-target", "x86_64-pc-windows-msvc", "-Lfirst", "-L", "second", "-lclang", "-lgnu", "-lnative", "-lmissing", "-l:exact.a"}
+	// Keep -lnative because the MSVC driver resolves it as native.lib across
+	// the complete search path, even though an earlier directory contains the
+	// GNU-only libnative.dll.a spelling.
+	want := []string{"-target", "x86_64-pc-windows-msvc", "-Lfirst", "-L", "second", clangImport, filepath.Join(root, "first", "libgnu.dll.a"), "-lnative", "-lmissing", "-l:exact.a"}
+	if got := resolveMSVCImportLibraries(root, args); !slices.Equal(got, want) {
+		t.Fatalf("resolved libraries = %q, want %q", got, want)
+	}
+	args[1] = "x86_64-w64-windows-gnu"
+	if got := resolveMSVCImportLibraries(root, args); !slices.Equal(got, args) {
+		t.Fatalf("GNU target libraries changed to %q", got)
+	}
+}
+
+func TestWriteResponseFile(t *testing.T) {
+	args := []string{"plain", `C:\path with spaces\object.o`, `quote"and\slash`, `trailing\`, ""}
+	for _, tt := range []struct {
+		name  string
+		style ResponseFileStyle
+		want  string
+	}{
+		{"gnu", ResponseFileGNU, `"plain" "C:\\path with spaces\\object.o" "quote\"and\\slash" "trailing\\" ""` + "\n"},
+		{"windows", ResponseFileWindows, `"plain" "C:\path with spaces\object.o" "quote\"and\slash" "trailing\\" ""` + "\n"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			name, err := writeResponseFile(args, tt.style)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer os.Remove(name)
+			data, err := os.ReadFile(name)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := string(data); got != tt.want {
+				t.Fatalf("response file = %q, want %q", got, tt.want)
+			}
+		})
+	}
+
+	missingTemp := filepath.Join(t.TempDir(), "missing")
+	for _, key := range []string{"TMPDIR", "TMP", "TEMP"} {
+		t.Setenv(key, missingTemp)
+	}
+	if _, err := writeResponseFile(args, ResponseFileGNU); err == nil {
+		t.Fatal("writeResponseFile succeeded with a missing temporary directory")
+	}
+	closed, err := os.CreateTemp(t.TempDir(), "closed-*.rsp")
+	if err != nil {
+		t.Fatal(err)
+	}
+	closedName := closed.Name()
+	if err := closed.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := writeResponseFileTo(closed, args, ResponseFileGNU); err == nil {
+		t.Fatal("writeResponseFileTo succeeded with a closed file")
+	}
+	if _, err := os.Stat(closedName); !os.IsNotExist(err) {
+		t.Fatalf("failed response file was not removed: %v", err)
+	}
+	if runtime.GOOS == "windows" {
+		err := New("clang", Config{}).exec(strings.Repeat("x", windowsCommandLineLimit))
+		if err == nil || !strings.Contains(err.Error(), "write clang response file") {
+			t.Fatalf("long Windows command error = %v, want response-file error", err)
+		}
+	}
+}
+
+func TestResponseFileStyle(t *testing.T) {
+	for _, tt := range []struct {
+		app  string
+		want ResponseFileStyle
+	}{
+		{"clang", ResponseFileGNU},
+		{"clang++.exe", ResponseFileGNU},
+		{"clang-cl.exe", ResponseFileWindows},
+		{"lld-link.exe", ResponseFileWindows},
+		{"link.exe", ResponseFileWindows},
+		{"cl.exe", ResponseFileWindows},
+	} {
+		t.Run(tt.app, func(t *testing.T) {
+			if got := New(tt.app, Config{}).responseFileStyle(); got != tt.want {
+				t.Fatalf("response file style = %v, want %v", got, tt.want)
+			}
+		})
+	}
+	if got := New("clang", Config{ResponseFileStyle: ResponseFileWindows}).responseFileStyle(); got != ResponseFileWindows {
+		t.Fatalf("explicit response file style = %v", got)
+	}
+}
+
+func TestUseResponseFile(t *testing.T) {
+	longArg := strings.Repeat("x", windowsCommandLineLimit)
+	if useResponseFileForGOOS("linux", "clang++", []string{longArg}) {
+		t.Fatal("non-Windows command unexpectedly uses a response file")
+	}
+	if useResponseFileForGOOS("windows", "clang++", []string{"short"}) {
+		t.Fatal("short Windows command unexpectedly uses a response file")
+	}
+	if !useResponseFileForGOOS("windows", "clang++", []string{longArg}) {
+		t.Fatal("long Windows command does not use a response file")
+	}
+}
+
+func TestLongWindowsCommandUsesClangResponseFile(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("requires Clang's Windows response-file parser")
+	}
+	clang, err := exec.LookPath("clang")
+	if err != nil {
+		t.Skip("clang is not installed")
+	}
+	dir := t.TempDir()
+	source := filepath.Join(dir, "source file.c")
+	object := filepath.Join(dir, "object file.o")
+	if err := os.WriteFile(source, []byte("int response_file_fixture;\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	args := []string{"-c", source, "-o", object}
+	for index := 0; index < 1800; index++ {
+		args = append(args, fmt.Sprintf("-DLLGO_RESPONSE_%04d=%d", index, index))
+	}
+	if !useResponseFile(clang, args) {
+		t.Fatal("fixture does not exceed the Windows command-line limit")
+	}
+	if err := New(clang, Config{}).Compile(args...); err != nil {
+		t.Fatalf("compile through response file: %v", err)
+	}
+	if _, err := os.Stat(object); err != nil {
+		t.Fatalf("response-file output: %v", err)
+	}
+}
 
 func TestConfig(t *testing.T) {
 	t.Run("NewConfig", func(t *testing.T) {
@@ -251,12 +523,11 @@ func TestMergeLinkerFlags(t *testing.T) {
 }
 
 func TestCompile(t *testing.T) {
-	// This test uses echo instead of clang to avoid dependency on clang installation
 	config := Config{
 		CCFLAGS: []string{"-Wall"},
 		CFLAGS:  []string{"-std=c99"},
 	}
-	cmd := New("echo", config)
+	cmd := newTestCmd(config)
 
 	var stdout bytes.Buffer
 	cmd.Stdout = &stdout
@@ -274,11 +545,10 @@ func TestCompile(t *testing.T) {
 }
 
 func TestLink(t *testing.T) {
-	// This test uses echo instead of clang to avoid dependency on clang installation
 	config := Config{
 		LDFLAGS: []string{"-lm"},
 	}
-	cmd := New("echo", config)
+	cmd := newTestCmd(config)
 
 	var stdout bytes.Buffer
 	cmd.Stdout = &stdout
@@ -297,7 +567,7 @@ func TestLink(t *testing.T) {
 
 func TestVerboseMode(t *testing.T) {
 	config := Config{}
-	cmd := New("echo", config)
+	cmd := newTestCmd(config)
 	cmd.Verbose = true
 
 	// Since verbose output goes to os.Stderr directly, we'll test
@@ -319,8 +589,8 @@ func TestVerboseMode(t *testing.T) {
 
 func TestCmdEnvironment(t *testing.T) {
 	config := Config{}
-	cmd := New("echo", config)
-	cmd.Env = []string{"TEST_VAR=test_value"}
+	cmd := newTestCmd(config)
+	cmd.Env = append(cmd.Env, "TEST_VAR=test_value")
 
 	var stdout bytes.Buffer
 	cmd.Stdout = &stdout
@@ -332,14 +602,23 @@ func TestCmdEnvironment(t *testing.T) {
 		t.Errorf("Compile failed: %v", err)
 	}
 
-	if len(cmd.Env) != 1 || cmd.Env[0] != "TEST_VAR=test_value" {
+	if !containsEnv(cmd.Env, "TEST_VAR=test_value") {
 		t.Errorf("Expected environment to be set correctly")
 	}
 }
 
+func containsEnv(env []string, want string) bool {
+	for _, value := range env {
+		if value == want {
+			return true
+		}
+	}
+	return false
+}
+
 func TestCmdIO(t *testing.T) {
 	config := Config{}
-	cmd := New("cat", config) // Use cat to test stdin/stdout
+	cmd := newTestCmd(config)
 
 	input := "test input"
 	cmd.Stdin = strings.NewReader(input)
@@ -347,7 +626,6 @@ func TestCmdIO(t *testing.T) {
 	var stdout bytes.Buffer
 	cmd.Stdout = &stdout
 
-	// cat will read from stdin and write to stdout
 	err := cmd.exec() // Call exec directly with no args
 	if err != nil {
 		t.Errorf("exec failed: %v", err)
@@ -361,15 +639,13 @@ func TestCmdIO(t *testing.T) {
 
 func TestCheckLinkArgs(t *testing.T) {
 	t.Run("BasicTest", func(t *testing.T) {
-		// Use echo instead of clang to avoid dependency
 		config := Config{}
-		cmd := New("echo", config)
+		cmd := newTestCmd(config)
 
 		// Redirect output to avoid clutter
 		cmd.Stdout = &bytes.Buffer{}
 		cmd.Stderr = &bytes.Buffer{}
 
-		// This should succeed with echo
 		err := cmd.CheckLinkArgs([]string{"-o"}, false)
 		if err != nil {
 			t.Errorf("CheckLinkArgs failed: %v", err)
@@ -378,7 +654,7 @@ func TestCheckLinkArgs(t *testing.T) {
 
 	t.Run("WasmExtension", func(t *testing.T) {
 		config := Config{}
-		cmd := New("echo", config)
+		cmd := newTestCmd(config)
 
 		cmd.Stdout = &bytes.Buffer{}
 		cmd.Stderr = &bytes.Buffer{}
@@ -447,7 +723,7 @@ func TestFlagMergingScenarios(t *testing.T) {
 			expectLink: []string{"-O3", "-lm", "-lpthread", "-static"},
 		},
 		{
-			// case from https://github.com/goplus/llgo/issues/1244
+			// case from https://github.com/xgo-dev/llgo/issues/1244
 			name:       "issue 1244",
 			envCFlags:  "-w -pipe -mmacosx-version-min=15 -isysroot/Library/Developer/CommandLineTools/SDKs/MacOSX15.sdk",
 			expectComp: []string{"-w", "-pipe", "-mmacosx-version-min=15", "-isysroot/Library/Developer/CommandLineTools/SDKs/MacOSX15.sdk"},

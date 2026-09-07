@@ -1,6 +1,6 @@
 // Copyright 2009 The Go Authors. All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Use of this source code is governed by a BSD-style license.
+// See LICENSES/Go-BSD-3-Clause.txt at this module root for license terms.
 
 // Deep equality test via reflection
 
@@ -9,7 +9,7 @@ package reflect
 import (
 	"unsafe"
 
-	"github.com/goplus/llgo/runtime/internal/lib/internal/bytealg"
+	c "github.com/xgo-dev/llgo/runtime/internal/clite"
 )
 
 // During deepValueEqual, must keep track of checks that are
@@ -20,6 +20,13 @@ type visit struct {
 	a1  unsafe.Pointer
 	a2  unsafe.Pointer
 	typ Type
+}
+
+func equal(a, b []byte) bool {
+	if n := len(a); n == len(b) {
+		return c.Memcmp(unsafe.Pointer(unsafe.SliceData(a)), unsafe.Pointer(unsafe.SliceData(b)), uintptr(n)) == 0
+	}
+	return false
 }
 
 // Tests for deep equality using reflected types. The map argument tracks
@@ -40,7 +47,7 @@ func deepValueEqual(v1, v2 Value, visited map[visit]bool) bool {
 	hard := func(v1, v2 Value) bool {
 		switch v1.Kind() {
 		case Pointer:
-			if v1.typ().PtrBytes == 0 {
+			if !v1.typ().Pointers() {
 				// not-in-heap pointers can't be cyclic.
 				// At least, all of our current uses of runtime/internal/sys.NotInHeap
 				// have that property. The runtime ones aren't cyclic (and we don't use
@@ -108,7 +115,7 @@ func deepValueEqual(v1, v2 Value, visited map[visit]bool) bool {
 		}
 		// Special case for []byte, which is common.
 		if v1.Type().Elem().Kind() == Uint8 {
-			return bytealg.Equal(v1.Bytes(), v2.Bytes())
+			return equal(v1.Bytes(), v2.Bytes())
 		}
 		for i := 0; i < v1.Len(); i++ {
 			if !deepValueEqual(v1.Index(i), v2.Index(i), visited) {
@@ -143,9 +150,10 @@ func deepValueEqual(v1, v2 Value, visited map[visit]bool) bool {
 		if v1.UnsafePointer() == v2.UnsafePointer() {
 			return true
 		}
-		for _, k := range v1.MapKeys() {
-			val1 := v1.MapIndex(k)
-			val2 := v2.MapIndex(k)
+		iter := v1.MapRange()
+		for iter.Next() {
+			val1 := iter.Value()
+			val2 := v2.MapIndex(iter.Key())
 			if !val1.IsValid() || !val2.IsValid() || !deepValueEqual(val1, val2, visited) {
 				return false
 			}

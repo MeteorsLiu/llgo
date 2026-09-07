@@ -1,12 +1,12 @@
-//go:build !darwin
-// +build !darwin
+//go:build !darwin && !windows
+// +build !darwin,!windows
 
 package os
 
 import (
 	_ "unsafe"
 
-	c "github.com/goplus/llgo/runtime/internal/clite"
+	c "github.com/xgo-dev/llgo/runtime/internal/clite"
 )
 
 //go:linkname Stat C.stat

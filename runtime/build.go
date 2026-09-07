@@ -1,62 +1,102 @@
 package runtime
 
+import "sort"
+
+type altPkgMode uint8
+
+const (
+	altPkgReplace altPkgMode = iota + 1
+	altPkgAdditive
+)
+
+type altPkgSpec struct {
+	mode    altPkgMode
+	goarchs map[string]struct{}
+}
+
+func (s altPkgSpec) enabledFor(goarch string) bool {
+	return len(s.goarchs) == 0 || hasGoarch(s.goarchs, goarch)
+}
+
+func hasGoarch(goarchs map[string]struct{}, goarch string) bool {
+	if goarchs == nil {
+		return false
+	}
+	_, ok := goarchs[goarch]
+	return ok
+}
+
 func SkipToBuild(pkgPath string) bool {
-	if _, ok := hasAltPkg[pkgPath]; ok {
+	if _, ok := altPkgs[pkgPath]; ok {
 		return false
 	}
 	return pkgPath == "unsafe"
 }
 
 func HasAltPkg(path string) (b bool) {
-	_, b = hasAltPkg[path]
+	_, b = altPkgs[path]
 	return
 }
 
-type none struct{}
+func HasAltPkgForGOARCH(path, goarch string) bool {
+	spec, ok := altPkgs[path]
+	return ok && spec.enabledFor(goarch)
+}
 
-var hasAltPkg = map[string]none{
-	"crypto/hmac":              {},
-	"crypto/md5":               {},
-	"crypto/rand":              {},
-	"crypto/sha1":              {},
-	"crypto/sha256":            {},
-	"crypto/sha512":            {},
-	"crypto/subtle":            {},
-	"go/parser":                {},
-	"hash/crc32":               {},
-	"internal/abi":             {},
-	"internal/bytealg":         {},
-	"internal/chacha8rand":     {},
-	"internal/cpu":             {},
-	"internal/itoa":            {},
-	"internal/godebug":         {},
-	"internal/oserror":         {},
-	"internal/poll":            {},
-	"internal/reflectlite":     {},
-	"internal/runtime/atomic":  {},
-	"internal/runtime/maps":    {},
-	"internal/runtime/sys":     {},
-	"internal/sync":            {},
-	"internal/syscall/execenv": {},
-	"internal/syscall/unix":    {},
-	"math":                     {},
-	"math/big":                 {},
-	"math/cmplx":               {},
-	"math/rand":                {},
-	"reflect":                  {},
-	"sync":                     {},
-	"sync/atomic":              {},
-	"syscall":                  {},
-	"syscall/js":               {},
-	"time":                     {},
-	"os":                       {},
-	"os/exec":                  {},
-	"os/signal":                {},
-	"runtime":                  {},
-	"runtime/debug":            {},
-	"runtime/pprof":            {},
-	"runtime/trace":            {},
-	"runtime/internal/syscall": {},
-	"io":                       {},
-	"io/fs":                    {},
+func HasAdditiveAltPkg(path string) bool {
+	return altPkgs[path].mode == altPkgAdditive
+}
+
+func HasAdditiveAltPkgForGOARCH(path, goarch string) bool {
+	spec, ok := altPkgs[path]
+	return ok && spec.mode == altPkgAdditive && spec.enabledFor(goarch)
+}
+
+var altPkgs = map[string]altPkgSpec{
+	"internal/abi":         {mode: altPkgReplace},
+	"internal/reflectlite": {mode: altPkgReplace},
+	"reflect":              {mode: altPkgReplace},
+	"runtime":              {mode: altPkgReplace},
+	"syscall/js":           {mode: altPkgReplace},
+}
+
+func HasSourcePatchPkg(path string) bool {
+	_, ok := sourcePatchPkgs[path]
+	return ok
+}
+
+func SourcePatchPkgPaths() []string {
+	paths := make([]string, 0, len(sourcePatchPkgs))
+	for path := range sourcePatchPkgs {
+		paths = append(paths, path)
+	}
+	sort.Strings(paths)
+	return paths
+}
+
+func SourcePatchReplacesAsmForGOARCH(path, goarch string) bool {
+	goarchs, ok := sourcePatchAsmPkgs[path]
+	return ok && (hasGoarch(goarchs, "*") || hasGoarch(goarchs, goarch))
+}
+
+var sourcePatchPkgs = map[string]struct{}{
+	"crypto/internal/constanttime": {},
+	"crypto/internal/sysrand":      {},
+	"internal/runtime/atomic":      {},
+	"internal/runtime/maps":        {},
+	"internal/runtime/sys":         {},
+	"internal/sync":                {},
+	"iter":                         {},
+	"runtime":                      {},
+	"runtime/metrics":              {},
+	"sync":                         {},
+	"sync/atomic":                  {},
+	"syscall":                      {},
+	"unique":                       {},
+}
+
+var sourcePatchAsmPkgs = map[string]map[string]struct{}{
+	"internal/runtime/atomic": {"arm": {}},
+	"sync/atomic":             {"*": {}},
+	"syscall":                 {"*": {}},
 }

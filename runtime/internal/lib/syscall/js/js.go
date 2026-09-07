@@ -1,6 +1,6 @@
 // Copyright 2018 The Go Authors. All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Use of this source code is governed by a BSD-style license.
+// See LICENSES/Go-BSD-3-Clause.txt at this module root for license terms.
 
 //go:build js && wasm
 // +build js,wasm
@@ -15,7 +15,7 @@ package js
 import (
 	"unsafe"
 
-	c "github.com/goplus/llgo/runtime/internal/clite"
+	c "github.com/xgo-dev/llgo/runtime/internal/clite"
 )
 
 //llgo:skipall
@@ -23,8 +23,12 @@ type _js struct{}
 
 // Value represents a JavaScript value. The zero value is the JavaScript value "undefined".
 // Values can be checked for equality with the Equal method.
+type ref uint64
+
 type Value struct {
-	ref uintptr
+	_     [0]func() // uncomparable; to make == not compile
+	ref   ref
+	gcPtr *ref // releases the owned emval handle when Value is unreachable
 }
 
 func floatValue(f float64) Value {
@@ -83,7 +87,7 @@ func Undefined() Value {
 
 // IsUndefined reports whether v is the JavaScript value "undefined".
 func (v Value) IsUndefined() bool {
-	return v.ref == valueUndefined.ref
+	return v.ref == 0 || v.ref == valueUndefined.ref
 }
 
 // Null returns the JavaScript value "null".
@@ -229,6 +233,9 @@ func (t Type) isObject() bool {
 // Type returns the JavaScript type of the value v. It is similar to JavaScript's typeof operator,
 // except that it returns TypeNull instead of TypeObject for null.
 func (v Value) Type() Type {
+	if v.ref == 0 {
+		return TypeUndefined
+	}
 	switch v.ref {
 	case valueUndefined.ref:
 		return TypeUndefined

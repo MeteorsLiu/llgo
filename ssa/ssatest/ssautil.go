@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2024 The GoPlus Authors (goplus.org). All rights reserved.
+ * Copyright (c) 2024 The XGo Authors (xgo.dev). All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -22,7 +22,7 @@ import (
 	"testing"
 
 	"github.com/goplus/gogen/packages"
-	"github.com/goplus/llgo/ssa"
+	"github.com/xgo-dev/llgo/ssa"
 )
 
 func NewProgram(t *testing.T, target *ssa.Target) ssa.Program {
@@ -52,7 +52,7 @@ func NewProgramEx(t *testing.T, target *ssa.Target, imp types.Importer) ssa.Prog
 
 func Assert(t *testing.T, p ssa.Package, expected string) {
 	t.Helper()
-	if v := p.String(); v != expected {
+	if v := p.String(); ssa.StripModuleTarget(v) != expected {
 		t.Fatalf("\n==> got:\n%s\n==> expected:\n%s\n", v, expected)
 	}
 }

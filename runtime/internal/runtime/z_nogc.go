@@ -1,8 +1,7 @@
-//go:build nogc
-// +build nogc
+//go:build nogc && (!wasm || !llgo.wasm.gc.linear)
 
 /*
- * Copyright (c) 2024 The GoPlus Authors (goplus.org). All rights reserved.
+ * Copyright (c) 2024 The XGo Authors (xgo.dev). All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -22,16 +21,56 @@ package runtime
 import (
 	"unsafe"
 
-	c "github.com/goplus/llgo/runtime/internal/clite"
+	c "github.com/xgo-dev/llgo/runtime/internal/clite"
 )
 
-// AllocU allocates uninitialized memory.
+// AllocU allocates uninitialized memory and returns a non-nil pointer or panics.
+// Zero-byte requests return the shared zerobase without allocating.
 func AllocU(size uintptr) unsafe.Pointer {
-	return c.Malloc(size)
+	if size == 0 {
+		return unsafe.Pointer(&zerobase)
+	}
+	ret := c.Malloc(size)
+	if ret == nil {
+		panic("out of memory")
+	}
+	recordMemProfileAlloc(size)
+	return ret
 }
 
 // AllocZ allocates zero-initialized memory.
 func AllocZ(size uintptr) unsafe.Pointer {
-	ret := c.Malloc(size)
-	return c.Memset(ret, 0, size)
+	ret := AllocU(size)
+	c.Memset(ret, 0, size)
+	return ret
 }
+
+func AllocRoot(size uintptr) unsafe.Pointer {
+	if size == 0 {
+		return unsafe.Pointer(&zerobase)
+	}
+	ret := c.Malloc(size)
+	if ret == nil {
+		panic("out of memory")
+	}
+	return ret
+}
+
+func FreeRoot(ptr unsafe.Pointer) {
+	if ptr == unsafe.Pointer(&zerobase) {
+		return
+	}
+	c.Free(ptr)
+}
+
+// AddCleanupPtr is not implemented when GC is disabled.
+// Cleanup functions will never be called.
+func AddCleanupPtr(ptr unsafe.Pointer, cleanup func()) (cancel func()) {
+	return func() {} // no-op cancel
+}
+
+func AddCancelableCleanupPtr(ptr unsafe.Pointer, cleanup func()) uint64 {
+	return 0
+}
+
+func StopCleanupPtr(id uint64) {}

@@ -1,5 +1,7 @@
+//go:build !windows
+
 /*
- * Copyright (c) 2024 The GoPlus Authors (goplus.org). All rights reserved.
+ * Copyright (c) 2024 The XGo Authors (xgo.dev). All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -19,8 +21,8 @@ package os
 import (
 	_ "unsafe"
 
-	c "github.com/goplus/llgo/runtime/internal/clite"
-	"github.com/goplus/llgo/runtime/internal/clite/syscall"
+	c "github.com/xgo-dev/llgo/runtime/internal/clite"
+	"github.com/xgo-dev/llgo/runtime/internal/clite/syscall"
 )
 
 const (
@@ -172,6 +174,12 @@ func Read(fd c.Int, buf c.Pointer, count uintptr) int
 
 //go:linkname Write C.write
 func Write(fd c.Int, buf c.Pointer, count uintptr) int
+
+//go:linkname Pread C.pread
+func Pread(fd c.Int, buf c.Pointer, count uintptr, offset OffT) int
+
+//go:linkname Pwrite C.pwrite
+func Pwrite(fd c.Int, buf c.Pointer, count uintptr, offset OffT) int
 
 //go:linkname Lseek C.lseek
 func Lseek(fd c.Int, offset OffT, whence c.Int) OffT

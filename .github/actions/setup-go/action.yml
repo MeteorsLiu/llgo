@@ -1,51 +1,81 @@
 name: "Setup Go"
-description: "Setup Go environment by downloading and extracting from go.dev"
+description: "Set up and verify the requested Go toolchain"
 inputs:
   go-version:
-    description: "The Go version to download and use"
-    required: true
+    description: "The exact Go version to install; omit it for the LLGo build toolchain"
+    required: false
+    default: ""
+  architecture:
+    description: "Host Go architecture; defaults to the runner architecture"
+    required: false
+    default: ""
 runs:
   using: "composite"
   steps:
-    - name: Download and setup Go
+    - name: Configure Go environment
       shell: bash
       run: |
-        set -e
-        GO_VERSION="${{ inputs.go-version }}"
-        GO_VERSION="${GO_VERSION#go}" # Remove 'go' prefix if present
+        echo "GOPATH=${RUNNER_TEMP}/go" >> "$GITHUB_ENV"
+        echo "GOBIN=${RUNNER_TEMP}/go/bin" >> "$GITHUB_ENV"
+        echo "GOMODCACHE=${RUNNER_TEMP}/go/pkg/mod" >> "$GITHUB_ENV"
+        echo "GOCACHE=${RUNNER_TEMP}/go-build-cache" >> "$GITHUB_ENV"
 
-        # Determine OS and architecture
-        if [[ "$RUNNER_OS" == "macOS" ]]; then
-          OS="darwin"
-          ARCH="arm64"
-        else
-          OS="linux"
-          ARCH="amd64"
-        fi
+    - name: Set up the LLGo build toolchain
+      if: inputs.go-version == ''
+      uses: actions/setup-go@v7
+      with:
+        go-version-file: .go-version
+        architecture: ${{ inputs.architecture }}
+        cache: true
+        cache-dependency-path: |
+          **/go.sum
 
-        DOWNLOAD_URL="https://go.dev/dl/go${GO_VERSION}.${OS}-${ARCH}.tar.gz"
-        echo "Downloading Go from: ${DOWNLOAD_URL}"
-
-        # Create temporary directory for download
-        TMP_DIR=$(mktemp -d)
-        curl -L "${DOWNLOAD_URL}" -o "${TMP_DIR}/go.tar.gz"
-
-        # Remove existing Go installation if any
-        sudo rm -rf /usr/local/go
-
-        # Extract to /usr/local
-        sudo tar -C /usr/local -xzf "${TMP_DIR}/go.tar.gz"
-
-        # Clean up
-        rm -rf "${TMP_DIR}"
-
-        # Add to PATH
-        echo "/usr/local/go/bin" >> $GITHUB_PATH
-        echo "$HOME/go/bin" >> $GITHUB_PATH
+    - name: Set up an explicit Go toolchain
+      if: inputs.go-version != ''
+      uses: actions/setup-go@v7
+      with:
+        go-version: ${{ inputs.go-version }}
+        architecture: ${{ inputs.architecture }}
+        cache: true
+        cache-dependency-path: |
+          **/go.sum
 
     - name: Verify Go installation
       shell: bash
       run: |
-        # Verify installation
-        echo "Verifying Go installation..."
+        set -euo pipefail
+
+        requested="${{ inputs.go-version }}"
+        if [[ -z "${requested}" ]]; then
+          requested="$(tr -d '[:space:]' < .go-version)"
+        fi
+        requested="${requested#go}"
+        actual="$(go env GOVERSION)"
+        actual="${actual#go}"
+
+        if [[ ! "$requested" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+          echo "Go version must be an exact stable release, got ${requested}" >&2
+          exit 1
+        fi
+        if [[ "$actual" != "$requested" ]]; then
+          echo "Expected Go ${requested}, got go${actual}" >&2
+          exit 1
+        fi
+
+        requested_arch="${{ inputs.architecture }}"
+        case "$requested_arch" in
+          "") ;;
+          x64) requested_arch=amd64 ;;
+          x86) requested_arch=386 ;;
+        esac
+        if [[ -n "$requested_arch" && "$(go env GOHOSTARCH)" != "$requested_arch" ]]; then
+          echo "Expected Go host architecture ${requested_arch}, got $(go env GOHOSTARCH)" >&2
+          exit 1
+        fi
+
+        echo "Requested Go: ${requested}"
+        echo "Resolved Go: go${actual}"
+        echo "Resolved host architecture: $(go env GOHOSTARCH)"
+        echo "Go binary: $(command -v go)"
         go version
+        go env GOROOT

@@ -5,9 +5,8 @@ name: Go
 
 on:
   push:
-    branches: 
-      - "**"
-      - "!dependabot/**"
+    branches:
+      - main
   pull_request:
     branches: ["**"]
 
@@ -17,23 +16,42 @@ concurrency:
 
 jobs:
   test:
-    continue-on-error: true
-    timeout-minutes: 30
+    name: test (${{ matrix.os }}${{ matrix.windows_abi && format(', {0}', matrix.windows_abi) || '' }}, LLVM ${{ matrix.llvm }}, Go current)
+    # The known-good #172 Windows coverage run took about 56 minutes. Leave
+    # room for runner variance and the additional shared-matrix checks without
+    # changing the established Linux/macOS budget.
+    timeout-minutes: ${{ startsWith(matrix.os, 'windows') && 90 || 60 }}
     strategy:
+      fail-fast: false
       matrix:
-        os:
-          - macos-latest
-          - ubuntu-24.04
-        llvm: [19]
-    runs-on: ${{matrix.os}}
+        # Compiler and repository-tool tests use only the pinned current Go
+        # release. User-code compatibility is covered by LLGo's test matrix.
+        include:
+          - os: macos-latest
+            llvm: 22
+          - os: ubuntu-latest
+            runner: ${{ github.repository == 'xgo-dev/llgo' && fromJSON('["qiniu", "ubuntu-24.04-large"]') || 'ubuntu-latest' }}
+            llvm: 22
+          - os: windows-2022
+            llvm: 22
+            windows_abi: msvc
+          - os: windows-2022
+            llvm: 22
+            windows_abi: mingw
+    runs-on: ${{ matrix.runner || matrix.os }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - name: Install dependencies
         uses: ./.github/actions/setup-deps
         with:
           llvm-version: ${{matrix.llvm}}
+          windows-abi: ${{ matrix.windows_abi || 'msvc' }}
+
+      - name: Install embedded dependencies
+        uses: ./.github/actions/setup-embed-deps
 
       - name: Clang information
+        shell: bash
         run: |
           echo $PATH
           which clang
@@ -41,21 +59,281 @@ jobs:
 
       - name: Set up Go
         uses: ./.github/actions/setup-go
+
+      - name: Set up LLGo cache
+        uses: ./.github/actions/setup-llgo-cache
         with:
-          go-version: "1.24.2"
+          # PR caches are isolated from main by GitHub's cache scope. Let the
+          # first run populate its merge-commit snapshot so retries can reuse it.
+          build-cache-mode: readwrite
+          crosscompile-cache-mode: readwrite
+
+      - name: Install further optional dependencies for demos
+        uses: ./.github/actions/setup-demo-deps
+        with:
+          windows-abi: ${{ matrix.windows_abi || 'msvc' }}
+
+      - name: Set LLGO_ROOT
+        shell: bash
+        run: echo "LLGO_ROOT=$GITHUB_WORKSPACE" >> $GITHUB_ENV
 
       - name: Build
-        run: go build -v ./...
+        shell: bash
+        run: |
+          set -euo pipefail
+          go build -v ./...
 
-      - name: Test
-        if: ${{!startsWith(matrix.os, 'macos')}}
-        run: go test ./...
+      - name: Validate Windows host-only integration
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
 
+          # Keep the concurrency stress from the former dedicated workflow;
+          # one ordinary package run does not prove mutual exclusion.
+          go test -count=20 -timeout=10m -run 'Lock' ./internal/crosscompile
+
+          # These tests recover runtime faults before the protected-memory
+          # checks that exposed corruption on some hosted amd64 runners. Stress
+          # the shared Windows exception-stack preparation independently of the
+          # much larger coverage command below.
+          go test -count=100 -timeout=10m \
+            -ldflags='-linkmode=external -extldflags=-lsynchronization' \
+            -coverprofile="$RUNNER_TEMP/windows-exception-stress.txt" -covermode=atomic \
+            -run '^(TestMapUpdateRHSNilDerefOrder|TestMapUpdateAppendRHSOrder|TestMultipleAssignmentMapUpdateBeforeNilStore|TestMultipleAssignmentOrderBeforeLaterPanic|TestBinOpIntegerDivideByZeroPanics|TestBinOpIntegerRemainderByZeroPanics)$' \
+            ./test/go
+
+          # The runtime is a nested module and is therefore outside ./....
+          # These host-side FFI tests still need native Windows coverage.
+          (
+            cd runtime
+            go test -count=1 -timeout=10m \
+              ./internal/ffi ./internal/clite/ffi ./internal/lib/reflect
+            for arch in 386 arm64; do
+              CGO_ENABLED=0 GOOS=windows GOARCH="$arch" go test -c \
+                -o "$RUNNER_TEMP/llgo-ffi-$arch.test.exe" ./internal/ffi
+            done
+          )
+
+          ffi_include="$(pkg-config --variable=includedir libffi)"
+          clang -I"$ffi_include" -c \
+            runtime/internal/clite/ffi/_wrap/libffi.c \
+            -o "$RUNNER_TEMP/llgo-libffi-amd64.obj"
+          llvm-readobj --file-headers "$RUNNER_TEMP/llgo-libffi-amd64.obj"
+
+      # Every host uploads coverage: OS-specific ELF, Mach-O, and COFF paths
+      # plus per-OS runtime shims are otherwise invisible to codecov/patch.
       - name: Test with coverage
-        if: startsWith(matrix.os, 'macos')
-        run: go test -coverprofile="coverage.txt" -covermode=atomic ./...
+        id: test_coverage
+        # Compiler fixtures build and run many programs under coverage; leave
+        # enough headroom for the slower native toolchains.
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          go_test=(go test)
+          if [[ "$RUNNER_OS" == Windows ]]; then
+            # Go's internal linker cannot consume every GNU COFF import
+            # archive used by the race runtime and LLVM. Use the configured
+            # Clang driver for the host test binaries instead of excluding
+            # those packages from the shared suite.
+            go_test+=("-ldflags=-linkmode=external -extldflags=-lsynchronization")
+            if [[ "${{ matrix.windows_abi }}" == msvc ]]; then
+              export LLGO_REQUIRE_MSVC=1
+            fi
+            export LLGO_STDIO_NOBUF=1
+            # Only the main batch contains the test package tree affected by
+            # golang/go#81238. Its wrapper accepts the single exact fatal
+            # signature, records the quarantine, and preserves other failures.
+            main_go_test=(bash dev/go_test_windows.sh "${go_test[@]}")
+          else
+            main_go_test=("${go_test[@]}")
+          fi
+
+          # Keep the direct language-behavior suite in a separate profile so
+          # its coverage remains independently visible. Compiler-only source
+          # and diagnostic fixtures are embedded under test/cmd/llgo, so the
+          # remaining test/go sources pass go test's default vet checks.
+          go list ./... \
+            | grep -v '^github.com/xgo-dev/llgo/test/go$' \
+            | grep -v '^github.com/xgo-dev/llgo/cl$' \
+            | xargs "${main_go_test[@]}" -timeout 45m -coverprofile="coverage-main.txt" -covermode=atomic \
+                -bench '^BenchmarkGo126' -benchtime=1x
+
+          # Compiler fixtures owned by cl exercise ssa in-process. Instrument
+          # both packages in this single test binary so coverage follows those
+          # calls without restoring duplicate fixture tests under ssa.
+          "${go_test[@]}" -timeout 45m \
+            -coverpkg=github.com/xgo-dev/llgo/cl,github.com/xgo-dev/llgo/ssa \
+            -coverprofile="coverage-compiler.txt" -covermode=atomic \
+            -bench '^BenchmarkGo126' -benchtime=1x ./cl
+          "${go_test[@]}" -timeout 45m \
+            -coverprofile="coverage-test-go.txt" -covermode=atomic ./test/go
+
+      - name: Test with embedded emulator env
+        env:
+          LLGO_EMBED_TESTS: "1"
+        run: go test -v -timeout 60m ./cl -run '^TestRunEmbedEmulator$'
+
+      - name: Check std symbol coverage
+        shell: bash
+        run: bash doc/_readme/scripts/check_std_cover.sh
 
       - name: Upload coverage reports to Codecov
-        uses: codecov/codecov-action@v5
+        if: steps.test_coverage.outputs.windows_runtime_corruption != 'true'
+        uses: codecov/codecov-action@v7
         with:
           token: ${{secrets.CODECOV_TOKEN}}
+          files: coverage-main.txt,coverage-compiler.txt,coverage-test-go.txt
+          disable_search: true
+
+  macos-lto-plugin:
+    name: macOS LTO plugin
+    timeout-minutes: 45
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install dependencies
+        uses: ./.github/actions/setup-deps
+        with:
+          llvm-version: 22
+
+      - name: Set up Go
+        uses: ./.github/actions/setup-go
+
+      - name: Set LLGO_ROOT
+        run: echo "LLGO_ROOT=$GITHUB_WORKSPACE" >> "$GITHUB_ENV"
+
+      - name: Build LTO plugin
+        run: |
+          set -euo pipefail
+          cmake -S ltoplugin -B ltoplugin/build \
+            -DLLVM_DIR="$(llvm-config --cmakedir)" \
+            -DCMAKE_BUILD_TYPE=Release
+          cmake --build ltoplugin/build --config Release
+          test -f ltoplugin/build/LLGOLTOPlugin.dylib
+          echo "LLGO_LTO_PLUGIN=$GITHUB_WORKSPACE/ltoplugin/build/LLGOLTOPlugin.dylib" >> "$GITHUB_ENV"
+
+      - name: Test LTO plugin passes, runtime behavior, and retained symbols
+        env:
+          LLGO_BUILD_CACHE: "off"
+        run: |
+          set -euo pipefail
+          go test -tags=dev -count=1 ./internal/lto ./cmd/internal/flags
+          go test -tags=dev -count=1 -timeout=30m \
+            -run '^(TestRunAndTestFromTestltoLTOPlugin|TestBuildAndCheckSymbolsFromTestltoLTOPlugin|TestLTOPlugin)' \
+            ./cl
+
+  dev-lto-globaldce:
+    name: Dev LTO GlobalDCE
+    timeout-minutes: 60
+    runs-on: ${{ github.repository == 'xgo-dev/llgo' && fromJSON('["qiniu", "ubuntu-24.04-large"]') || 'ubuntu-latest' }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install dependencies
+        uses: ./.github/actions/setup-deps
+        with:
+          llvm-version: 22
+
+      - name: Set up Go
+        uses: ./.github/actions/setup-go
+
+      - name: Setup demo dependencies
+        uses: ./.github/actions/setup-demo-deps
+
+      - name: Set LLGO_ROOT
+        run: echo "LLGO_ROOT=$GITHUB_WORKSPACE" >> $GITHUB_ENV
+
+      - name: Build llgo with dev tag
+        run: go install -tags=dev ./cmd/llgo
+
+      - name: Build LTO plugin
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+
+          llvm_config="$(command -v llvm-config || command -v llvm-config-22)"
+          cmake -S ltoplugin -B ltoplugin/build \
+            -DLLVM_DIR="$("${llvm_config}" --cmakedir)" \
+            -DCMAKE_BUILD_TYPE=Release
+          cmake --build ltoplugin/build --config Release
+
+          echo "LLGO_LTO_PLUGIN=$GITHUB_WORKSPACE/ltoplugin/build/LLGOLTOPlugin.so" >> "$GITHUB_ENV"
+
+      - name: Run dev LTO GlobalDCE tests and demos with coverage
+        run: |
+          set -euo pipefail
+
+          go test -tags=dev -timeout 30m -covermode=atomic \
+            -coverprofile=coverage-dev-globaldce-unit.txt \
+            -run '^TestDevLTOGlobalDCE' \
+            ./ssa ./internal/build ./internal/crosscompile ./cmd/internal/flags ./internal/cabi
+          go tool cover -func=coverage-dev-globaldce-unit.txt
+
+          go test -tags=dev -timeout 30m -covermode=atomic \
+            -coverpkg=github.com/xgo-dev/llgo/ssa,github.com/xgo-dev/llgo/internal/build,github.com/xgo-dev/llgo/internal/crosscompile \
+            -coverprofile=coverage-dev-lto-globaldce-cl.txt \
+            -run '^TestRunAndTestFromTestlto/globaldce_' \
+            ./cl
+          go tool cover -func=coverage-dev-lto-globaldce-cl.txt
+
+          go test -tags=dev -timeout 30m -covermode=atomic \
+            -coverpkg=github.com/xgo-dev/llgo/ssa,github.com/xgo-dev/llgo/internal/build,github.com/xgo-dev/llgo/internal/crosscompile \
+            -coverprofile=coverage-dev-lto-globaldce-symbols.txt \
+            -run '^TestBuildAndCheckSymbolsFromTestlto/globaldce_' \
+            ./cl
+          go tool cover -func=coverage-dev-lto-globaldce-symbols.txt
+
+          go test -tags=dev -timeout 30m -covermode=atomic \
+            -coverpkg=github.com/xgo-dev/llgo/ssa,github.com/xgo-dev/llgo/internal/build,github.com/xgo-dev/llgo/internal/crosscompile \
+            -coverprofile=coverage-dev-lto-plugin-cl.txt \
+            -run '^(TestRunAndTestFromTestltoLTOPlugin|TestBuildAndCheckSymbolsFromTestltoLTOPlugin|TestLTOPlugin)' \
+            ./cl
+          go tool cover -func=coverage-dev-lto-plugin-cl.txt
+
+          LLGO_DEMO_LLGORUN_FLAGS="-lto=full -globaldce" \
+            bash .github/workflows/test_demo.sh
+
+      - name: Upload dev LTO GlobalDCE coverage reports to Codecov
+        continue-on-error: true
+        uses: codecov/codecov-action@v7
+        with:
+          token: ${{secrets.CODECOV_TOKEN}}
+          files: coverage-dev-globaldce-unit.txt,coverage-dev-lto-globaldce-cl.txt,coverage-dev-lto-globaldce-symbols.txt,coverage-dev-lto-plugin-cl.txt
+          flags: dev-lto-globaldce
+
+  # Tests deletion of unreachable Go methods.
+  # See https://github.com/xgo-dev/llgo/issues/1853.
+  dev-go-methoddrop:
+    name: Dev Go Method Drop
+    timeout-minutes: 60
+    runs-on: ${{ github.repository == 'xgo-dev/llgo' && fromJSON('["qiniu", "ubuntu-24.04-large"]') || 'ubuntu-latest' }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install dependencies
+        uses: ./.github/actions/setup-deps
+        with:
+          llvm-version: 22
+
+      - name: Set up Go
+        uses: ./.github/actions/setup-go
+
+      - name: Setup demo dependencies
+        uses: ./.github/actions/setup-demo-deps
+
+      - name: Set LLGO_ROOT
+        run: echo "LLGO_ROOT=$GITHUB_WORKSPACE" >> $GITHUB_ENV
+
+      - name: Build llgo with dev tag
+        run: go install -tags=dev ./cmd/llgo
+
+      - name: Run Go method drop tests
+        run: go test -tags=dev -timeout 30m -run '^TestBuildAndCheckSymbolsFromTestdrop$' ./cl
+
+      - name: Run Go deadcode-drop demos
+        run: |
+          LLGO_DEMO_LLGORUN_FLAGS="-deadcodedrop" \
+            bash .github/workflows/test_demo.sh

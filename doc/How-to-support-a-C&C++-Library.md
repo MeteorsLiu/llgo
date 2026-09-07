@@ -67,7 +67,7 @@ const (
 
 5. Write the corresponding function in `inih.go`
 
-Note that the basic C function type mapping to Go function type can be found at [https://github.com/goplus/llgo/blob/main/doc/Type-Mapping-between-C-and-Go.md](https://github.com/goplus/llgo/blob/main/doc/Type-Mapping-between-C-and-Go.md). Some types requiring special handling are listed at the end of this document for reference.
+Note that the basic C function type mapping to Go function type can be found at [https://github.com/xgo-dev/llgo/blob/main/doc/Type-Mapping-between-C-and-Go.md](https://github.com/xgo-dev/llgo/blob/main/doc/Type-Mapping-between-C-and-Go.md). Some types requiring special handling are listed at the end of this document for reference.
 
 ```go
 //go:linkname Parse C.ini_parse
@@ -204,6 +204,32 @@ For the size of Unused, if the methods bound to the structure do not need to cre
 type Comp func(a c.Int)
 
 ```
+
+#### Handling Windows stdcall APIs
+
+Use the `stdcall.` linkname namespace for Windows functions declared with
+`WINAPI` or `__stdcall`, and use `//llgo:type stdcall` for their function
+pointer and callback types:
+
+```go
+import _ "unsafe"
+
+//go:linkname MessageBoxW stdcall.MessageBoxW
+func MessageBoxW(hwnd uintptr, text, caption *uint16, flags uint32) int32
+
+//llgo:type stdcall
+type Callback func(context uintptr) uintptr
+```
+
+On Windows/386 this selects the x86 stdcall calling convention. Windows/amd64
+and Windows/arm64 use their unified native C ABI. You may spell a 386 export
+explicitly as `_Name@N`; LLGo preserves that spelling on 386 and normalizes it
+to `Name` on 64-bit Windows.
+
+Both forms accept only non-variadic function types. A native callback carries
+one function pointer and no LLGo closure environment, so only a direct Go
+function can cross this boundary. Pass callback state through an explicit
+context pointer.
 
 #### Handling char ** Type in C
 

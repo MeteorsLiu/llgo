@@ -4,12 +4,60 @@
 package build
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
-	"github.com/goplus/llgo/internal/crosscompile"
-	"github.com/goplus/llgo/internal/flash"
+	"github.com/xgo-dev/llgo/internal/crosscompile"
+	"github.com/xgo-dev/llgo/internal/flash"
 )
+
+func TestBuildOutFmtsIsolatesImplicitNativeTestOutput(t *testing.T) {
+	details, err := buildOutFmts("example.test", &Config{
+		Mode: ModeTest, BuildMode: BuildModeExe,
+	}, false, &crosscompile.Export{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { removeOutFmts(details) })
+	if details.tempDir == "" || filepath.Dir(details.Out) != details.tempDir {
+		t.Fatalf("output %q is not isolated in temp directory %q", details.Out, details.tempDir)
+	}
+	if err := os.WriteFile(filepath.Join(details.tempDir, ".link-sidecar"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	tempDir := details.tempDir
+	removeOutFmts(details)
+	if _, err := os.Stat(tempDir); !os.IsNotExist(err) {
+		t.Fatalf("temporary output directory still exists: %v", err)
+	}
+}
+
+func TestWebAssemblyTargetDefaultExtension(t *testing.T) {
+	for _, target := range []string{"emscripten", "emscripten-memory64", "wasm"} {
+		if got := defaultAppExt(&Config{BuildMode: BuildModeExe, Target: target}); got != ".mjs" {
+			t.Errorf("target %q extension = %q, want .mjs", target, got)
+		}
+	}
+	for _, target := range []string{"wasi", "wasip1", "wasip2", "wasm-unknown"} {
+		if got := defaultAppExt(&Config{BuildMode: BuildModeExe, Target: target}); got != ".wasm" {
+			t.Errorf("target %q extension = %q, want .wasm", target, got)
+		}
+	}
+	for _, target := range []string{"wasip3", "wasm-custom"} {
+		if got := defaultAppExt(&Config{BuildMode: BuildModeExe, Target: target}); got != ".wasm" {
+			t.Errorf("future/custom target %q extension = %q, want .wasm", target, got)
+		}
+	}
+	if got := defaultAppExt(&Config{BuildMode: BuildModeExe, Target: "esp32"}); got != ".elf" {
+		t.Errorf("embedded target extension = %q, want .elf", got)
+	}
+}
+
+func sameHostPath(got, want string) bool {
+	return got == want || got != "" && want != "" && filepath.Clean(got) == filepath.Clean(want)
+}
 
 func TestBuildOutFmtsWithTarget(t *testing.T) {
 	tests := []struct {
@@ -36,6 +84,17 @@ func TestBuildOutFmtsWithTarget(t *testing.T) {
 				BinaryFormat: "",
 			},
 			wantOut: "myapp",
+		},
+		{
+			name: "embedded target keeps configured output extension",
+			conf: &Config{
+				Mode:    ModeBuild,
+				Target:  "esp32",
+				OutFile: "myapp",
+				AppExt:  ".elf",
+			},
+			pkgName: "hello",
+			wantOut: "myapp.elf",
 		},
 		{
 			name: "build hex format",
@@ -144,7 +203,7 @@ func TestBuildOutFmtsWithTarget(t *testing.T) {
 
 			// Check base output path
 			if tt.wantOut != "" {
-				if result.Out != tt.wantOut {
+				if !sameHostPath(result.Out, tt.wantOut) {
 					t.Errorf("buildOutFmts().Out = %v, want %v", result.Out, tt.wantOut)
 				}
 			} else {
@@ -182,6 +241,29 @@ func TestBuildOutFmtsWithTarget(t *testing.T) {
 			checkFormatPath(result.Uf2, tt.wantUf2, "Uf2")
 			checkFormatPath(result.Zip, tt.wantZip, "Zip")
 		})
+	}
+}
+
+func TestDefaultAppExtJSExplicitGlueOutput(t *testing.T) {
+	tests := []struct {
+		out  string
+		want string
+	}{
+		{out: "app.mjs", want: ".mjs"},
+		{out: "app.js", want: ".js"},
+		{out: "app.wasm", want: ".wasm"},
+		{want: ".wasm"},
+	}
+	for _, tt := range tests {
+		conf := &Config{
+			Goos:      "js",
+			Goarch:    "wasm",
+			BuildMode: BuildModeExe,
+			OutFile:   tt.out,
+		}
+		if got := defaultAppExt(conf); got != tt.want {
+			t.Errorf("defaultAppExt(%q) = %q, want %q", tt.out, got, tt.want)
+		}
 	}
 }
 
@@ -249,6 +331,16 @@ func TestBuildOutFmtsNativeTarget(t *testing.T) {
 			wantOut:  "myapp.exe",
 		},
 		{
+			name:     "build single pkg with exact extensionless outfile on windows",
+			mode:     ModeBuild,
+			multiPkg: false,
+			outFile:  "myapp",
+			appExt:   ".exe",
+			goos:     "windows",
+			pkgName:  "hello",
+			wantOut:  "myapp",
+		},
+		{
 			name:     "build multi pkg",
 			mode:     ModeBuild,
 			multiPkg: true,
@@ -313,6 +405,16 @@ func TestBuildOutFmtsNativeTarget(t *testing.T) {
 			pkgName:  "hello",
 			wantOut:  "", // Should be temp file
 		},
+		{
+			name:     "test mode with exact extensionless outfile on windows",
+			mode:     ModeTest,
+			multiPkg: false,
+			outFile:  "mytest",
+			appExt:   ".exe",
+			goos:     "windows",
+			pkgName:  "hello",
+			wantOut:  "mytest",
+		},
 	}
 
 	for _, tt := range tests {
@@ -335,7 +437,7 @@ func TestBuildOutFmtsNativeTarget(t *testing.T) {
 
 			// Check base output path
 			if tt.wantOut != "" {
-				if result.Out != tt.wantOut {
+				if !sameHostPath(result.Out, tt.wantOut) {
 					t.Errorf("buildOutFmts().Out = %v, want %v", result.Out, tt.wantOut)
 				}
 			} else {
@@ -360,6 +462,328 @@ func TestBuildOutFmtsNativeTarget(t *testing.T) {
 			}
 			if result.Zip != "" {
 				t.Errorf("buildOutFmts().Zip = %v, want empty for native target", result.Zip)
+			}
+		})
+	}
+}
+
+func TestBuildOutFmtsPCLN(t *testing.T) {
+	tests := []struct {
+		name string
+		conf *Config
+		want string
+	}{
+		{
+			name: "embedded",
+			conf: &Config{Mode: ModeBuild, BuildMode: BuildModeExe, OutFile: "app", PCLNMode: PCLNEmbedded},
+		},
+		{
+			name: "none",
+			conf: &Config{Mode: ModeBuild, BuildMode: BuildModeExe, OutFile: "app", PCLNMode: PCLNNone},
+		},
+		{
+			name: "external",
+			conf: &Config{Mode: ModeBuild, BuildMode: BuildModeExe, OutFile: "app", PCLNMode: PCLNExternal},
+			want: "app.pclntab",
+		},
+		{
+			name: "external suffix follows executable extension",
+			conf: &Config{Mode: ModeBuild, BuildMode: BuildModeExe, OutFile: "dist/app.exe", AppExt: ".exe", PCLNMode: PCLNExternal},
+			want: "dist/app.exe.pclntab",
+		},
+		{
+			name: "external install",
+			conf: &Config{Mode: ModeInstall, BuildMode: BuildModeExe, BinPath: "/go/bin", PCLNMode: PCLNExternal},
+			want: "/go/bin/hello.pclntab",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := buildOutFmts("hello", tt.conf, false, &crosscompile.Export{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !sameHostPath(got.PCLN, tt.want) {
+				t.Fatalf("buildOutFmts().PCLN = %q, want %q", got.PCLN, tt.want)
+			}
+		})
+	}
+}
+
+func TestOutFmtDetailsToEnvMapIncludesPCLN(t *testing.T) {
+	details := &OutFmtDetails{Out: "app", PCLN: "app.pclntab"}
+	if got := details.ToEnvMap()["pclntab"]; got != details.PCLN {
+		t.Fatalf("ToEnvMap()[pclntab] = %q, want %q", got, details.PCLN)
+	}
+	if _, ok := (&OutFmtDetails{Out: "app"}).ToEnvMap()["pclntab"]; ok {
+		t.Fatal("ToEnvMap() contains pclntab for an empty PCLN output")
+	}
+}
+
+func TestBuildOutFmtsBuildModes(t *testing.T) {
+	tests := []struct {
+		name        string
+		pkgName     string
+		buildMode   BuildMode
+		outFile     string
+		mode        Mode
+		target      string
+		goos        string
+		appExt      string
+		expectedOut string
+	}{
+		// C-Archive tests
+		{
+			name:        "c_archive_build_linux",
+			pkgName:     "mylib",
+			buildMode:   BuildModeCArchive,
+			outFile:     "",
+			mode:        ModeBuild,
+			target:      "",
+			goos:        "linux",
+			appExt:      ".a",
+			expectedOut: "libmylib.a",
+		},
+		{
+			name:        "c_archive_build_with_outfile",
+			pkgName:     "mylib",
+			buildMode:   BuildModeCArchive,
+			outFile:     "custom.a",
+			mode:        ModeBuild,
+			target:      "",
+			goos:        "linux",
+			appExt:      ".a",
+			expectedOut: "custom.a",
+		},
+		{
+			name:        "c_archive_build_with_path",
+			pkgName:     "mylib",
+			buildMode:   BuildModeCArchive,
+			outFile:     "build/custom.a",
+			mode:        ModeBuild,
+			target:      "",
+			goos:        "linux",
+			appExt:      ".a",
+			expectedOut: "build/custom.a",
+		},
+		{
+			name:        "c_archive_build_with_exact_extensionless_outfile",
+			pkgName:     "mylib",
+			buildMode:   BuildModeCArchive,
+			outFile:     "custom",
+			mode:        ModeBuild,
+			goos:        "windows",
+			appExt:      ".a",
+			expectedOut: "custom",
+		},
+
+		// C-Shared tests
+		{
+			name:        "c_shared_build_linux",
+			pkgName:     "mylib",
+			buildMode:   BuildModeCShared,
+			outFile:     "",
+			mode:        ModeBuild,
+			target:      "",
+			goos:        "linux",
+			appExt:      ".so",
+			expectedOut: "libmylib.so",
+		},
+		{
+			name:        "c_shared_build_windows",
+			pkgName:     "mylib",
+			buildMode:   BuildModeCShared,
+			outFile:     "",
+			mode:        ModeBuild,
+			target:      "",
+			goos:        "windows",
+			appExt:      ".dll",
+			expectedOut: "mylib.dll",
+		},
+		{
+			name:        "c_shared_windows_exact_outfile",
+			pkgName:     "mylib",
+			buildMode:   BuildModeCShared,
+			outFile:     "custom-name",
+			mode:        ModeBuild,
+			goos:        "windows",
+			appExt:      ".dll",
+			expectedOut: "custom-name",
+		},
+		{
+			name:        "c_shared_build_darwin",
+			pkgName:     "mylib",
+			buildMode:   BuildModeCShared,
+			outFile:     "",
+			mode:        ModeBuild,
+			target:      "",
+			goos:        "darwin",
+			appExt:      ".dylib",
+			expectedOut: "libmylib.dylib",
+		},
+		{
+			name:        "c_shared_embedded_target",
+			pkgName:     "mylib",
+			buildMode:   BuildModeCShared,
+			outFile:     "",
+			mode:        ModeBuild,
+			target:      "rp2040",
+			goos:        "windows",
+			appExt:      ".so", // embedded follows linux rules
+			expectedOut: "libmylib.so",
+		},
+
+		// Executable tests
+		{
+			name:        "exe_build_linux",
+			pkgName:     "myapp",
+			buildMode:   BuildModeExe,
+			outFile:     "",
+			mode:        ModeBuild,
+			target:      "",
+			goos:        "linux",
+			appExt:      "",
+			expectedOut: "myapp",
+		},
+		{
+			name:        "exe_build_windows",
+			pkgName:     "myapp",
+			buildMode:   BuildModeExe,
+			outFile:     "",
+			mode:        ModeBuild,
+			target:      "",
+			goos:        "windows",
+			appExt:      ".exe",
+			expectedOut: "myapp.exe",
+		},
+		{
+			name:        "exe_build_windows_exact_outfile",
+			pkgName:     "myapp",
+			buildMode:   BuildModeExe,
+			outFile:     "custom-name",
+			mode:        ModeBuild,
+			target:      "",
+			goos:        "windows",
+			appExt:      ".exe",
+			expectedOut: "custom-name",
+		},
+		{
+			name:        "exe_remove_lib_prefix",
+			pkgName:     "libmyapp",
+			buildMode:   BuildModeExe,
+			outFile:     "",
+			mode:        ModeBuild,
+			target:      "",
+			goos:        "linux",
+			appExt:      "",
+			expectedOut: "myapp",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			conf := &Config{
+				Mode:      tt.mode,
+				BuildMode: tt.buildMode,
+				Target:    tt.target,
+				Goos:      tt.goos,
+				OutFile:   tt.outFile,
+				AppExt:    tt.appExt,
+			}
+
+			crossCompile := &crosscompile.Export{}
+			result, err := buildOutFmts(tt.pkgName, conf, false, crossCompile)
+
+			if err != nil {
+				t.Fatalf("buildOutFmts failed: %v", err)
+			}
+
+			if !sameHostPath(result.Out, tt.expectedOut) {
+				t.Errorf("buildOutFmts(%q, buildMode=%v, target=%q, goos=%q) = %q, want %q",
+					tt.pkgName, tt.buildMode, tt.target, tt.goos, result.Out, tt.expectedOut)
+			}
+		})
+	}
+}
+
+func TestApplyBuildModeNaming(t *testing.T) {
+	tests := []struct {
+		name      string
+		baseName  string
+		buildMode BuildMode
+		target    string
+		goos      string
+		expected  string
+	}{
+		// Executable tests
+		{
+			name:      "exe_linux",
+			baseName:  "myapp",
+			buildMode: BuildModeExe,
+			target:    "",
+			goos:      "linux",
+			expected:  "myapp",
+		},
+		{
+			name:      "exe_remove_lib_prefix",
+			baseName:  "libmyapp",
+			buildMode: BuildModeExe,
+			target:    "",
+			goos:      "linux",
+			expected:  "myapp",
+		},
+
+		// C-Archive tests
+		{
+			name:      "c_archive_linux",
+			baseName:  "mylib",
+			buildMode: BuildModeCArchive,
+			target:    "",
+			goos:      "linux",
+			expected:  "libmylib",
+		},
+		{
+			name:      "c_archive_existing_prefix",
+			baseName:  "libmylib",
+			buildMode: BuildModeCArchive,
+			target:    "",
+			goos:      "linux",
+			expected:  "libmylib",
+		},
+
+		// C-Shared tests
+		{
+			name:      "c_shared_linux",
+			baseName:  "mylib",
+			buildMode: BuildModeCShared,
+			target:    "",
+			goos:      "linux",
+			expected:  "libmylib",
+		},
+		{
+			name:      "c_shared_windows",
+			baseName:  "mylib",
+			buildMode: BuildModeCShared,
+			target:    "",
+			goos:      "windows",
+			expected:  "mylib", // Windows doesn't use lib prefix
+		},
+		{
+			name:      "c_shared_embedded_rp2040",
+			baseName:  "mylib",
+			buildMode: BuildModeCShared,
+			target:    "rp2040",
+			goos:      "darwin",
+			expected:  "libmylib", // embedded follows linux rules
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := applyPrefix(tt.baseName, tt.buildMode, tt.target, tt.goos)
+			if result != tt.expected {
+				t.Errorf("applyBuildModeNaming(%q, %v, %q, %q) = %q, want %q",
+					tt.baseName, tt.buildMode, tt.target, tt.goos, result, tt.expected)
 			}
 		})
 	}

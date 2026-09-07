@@ -1,15 +1,15 @@
 // Copyright 2009 The Go Authors. All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Use of this source code is governed by a BSD-style license.
+// See LICENSES/Go-BSD-3-Clause.txt at this module root for license terms.
 
 package reflectlite
 
 import (
 	"unsafe"
 
-	"github.com/goplus/llgo/runtime/abi"
-	_ "github.com/goplus/llgo/runtime/internal/runtime"
-	"github.com/goplus/llgo/runtime/internal/runtime/goarch"
+	"github.com/xgo-dev/llgo/runtime/abi"
+	_ "github.com/xgo-dev/llgo/runtime/internal/runtime"
+	"github.com/xgo-dev/llgo/runtime/internal/runtime/goarch"
 )
 
 // Value is the reflection interface to a Go value.
@@ -205,7 +205,7 @@ func (f flag) mustBeExported() {
 // or it is not addressable.
 func (f flag) mustBeAssignable() {
 	if f == 0 {
-		panic(&ValueError{methodName(), abi.Invalid})
+		panic(&ValueError{methodName(), Invalid})
 	}
 	// Assignable if addressable and not read-only.
 	if f&flagRO != 0 {
@@ -232,7 +232,7 @@ func (v Value) CanSet() bool {
 func (v Value) Elem() Value {
 	k := v.kind()
 	switch k {
-	case abi.Interface:
+	case Interface:
 		var eface any
 		if v.typ.NumMethod() == 0 {
 			eface = *(*any)(v.ptr)
@@ -246,7 +246,7 @@ func (v Value) Elem() Value {
 			x.flag |= v.flag.ro()
 		}
 		return x
-	case abi.Pointer:
+	case Ptr:
 		ptr := v.ptr
 		if v.flag&flagIndir != 0 {
 			ptr = *(*unsafe.Pointer)(ptr)
@@ -269,7 +269,7 @@ func valueInterface(v Value) any {
 		panic(&ValueError{"reflectlite.Value.Interface", 0})
 	}
 
-	if v.kind() == abi.Interface {
+	if v.kind() == Interface {
 		// Special case: return the element inside the interface.
 		// Empty interface has one layout, all interfaces with
 		// methods have a second layout.
@@ -295,7 +295,7 @@ func valueInterface(v Value) any {
 func (v Value) IsNil() bool {
 	k := v.kind()
 	switch k {
-	case abi.Chan, abi.Func, abi.Map, abi.Pointer, abi.UnsafePointer:
+	case Chan, Func, Map, Ptr, UnsafePointer:
 		// if v.flag&flagMethod != 0 {
 		// 	return false
 		// }
@@ -304,7 +304,7 @@ func (v Value) IsNil() bool {
 			ptr = *(*unsafe.Pointer)(ptr)
 		}
 		return ptr == nil
-	case abi.Interface, abi.Slice:
+	case Interface, Slice:
 		// Both interface and slice are nil if first word is 0.
 		// Both are always bigger than a word; assume flagIndir.
 		return *(*unsafe.Pointer)(v.ptr) == nil
@@ -327,10 +327,10 @@ func (v Value) Kind() Kind {
 	return v.kind()
 }
 
-//go:linkname chanlen github.com/goplus/llgo/runtime/internal/runtime.ChanLen
+//go:linkname chanlen github.com/xgo-dev/llgo/runtime/internal/runtime.ChanLen
 func chanlen(ch unsafe.Pointer) int
 
-//go:linkname maplen github.com/goplus/llgo/runtime/internal/runtime.MapLen
+//go:linkname maplen github.com/xgo-dev/llgo/runtime/internal/runtime.MapLen
 func maplen(ch unsafe.Pointer) int
 
 // Len returns v's length.
@@ -338,18 +338,18 @@ func maplen(ch unsafe.Pointer) int
 func (v Value) Len() int {
 	k := v.kind()
 	switch k {
-	case abi.Slice:
+	case Slice:
 		// Slice is bigger than a word; assume flagIndir.
 		return (*unsafeheaderSlice)(v.ptr).Len
-	case abi.String:
+	case String:
 		// String is bigger than a word; assume flagIndir.
 		return (*unsafeheaderString)(v.ptr).Len
-	case abi.Array:
+	case Array:
 		tt := (*arrayType)(unsafe.Pointer(v.typ))
 		return int(tt.Len)
-	case abi.Chan:
+	case Chan:
 		return chanlen(v.pointer())
-	case abi.Map:
+	case Map:
 		return maplen(v.pointer())
 	}
 	panic(&ValueError{"reflect.Value.Len", v.kind()})
@@ -358,7 +358,7 @@ func (v Value) Len() int {
 // NumMethod returns the number of exported methods in the value's method set.
 func (v Value) numMethod() int {
 	if v.typ == nil {
-		panic(&ValueError{"reflectlite.Value.NumMethod", abi.Invalid})
+		panic(&ValueError{"reflectlite.Value.NumMethod", Invalid})
 	}
 	return v.typ.NumMethod()
 }
@@ -370,7 +370,7 @@ func (v Value) Set(x Value) {
 	v.mustBeAssignable()
 	x.mustBeExported() // do not let unexported x leak
 	var target unsafe.Pointer
-	if v.kind() == abi.Interface {
+	if v.kind() == Interface {
 		target = v.ptr
 	}
 	x = x.assignTo("reflectlite.Set", v.typ, target)
@@ -385,7 +385,7 @@ func (v Value) Set(x Value) {
 func (v Value) Type() Type {
 	f := v.flag
 	if f == 0 {
-		panic(&ValueError{"reflectlite.Value.Type", abi.Invalid})
+		panic(&ValueError{"reflectlite.Value.Type", Invalid})
 	}
 	// closure func
 	if v.typ.IsClosure() {
@@ -403,7 +403,7 @@ func (v Value) closureFunc() *abi.FuncType {
  * constructors
  */
 
-//go:linkname unsafe_New github.com/goplus/llgo/runtime/internal/runtime.New
+//go:linkname unsafe_New github.com/xgo-dev/llgo/runtime/internal/runtime.New
 func unsafe_New(*abi.Type) unsafe.Pointer
 
 // ValueOf returns a new Value initialized to the concrete value
@@ -436,7 +436,7 @@ func (v Value) assignTo(context string, dst *abi.Type, target unsafe.Pointer) Va
 		if target == nil {
 			target = unsafe_New(dst)
 		}
-		if v.Kind() == abi.Interface && v.IsNil() {
+		if v.Kind() == Interface && v.IsNil() {
 			// A nil ReadWriter passed to nil Reader is OK,
 			// but using ifaceE2I below will panic.
 			// Avoid the panic by returning a nil dst (e.g., Reader) explicitly.
@@ -466,10 +466,10 @@ func arrayAt(p unsafe.Pointer, i int, eltSize uintptr, whySafe string) unsafe.Po
 	return add(p, uintptr(i)*eltSize, "i < len")
 }
 
-//go:linkname ifaceE2I github.com/goplus/llgo/runtime/internal/runtime.IfaceE2I
+//go:linkname ifaceE2I github.com/xgo-dev/llgo/runtime/internal/runtime.IfaceE2I
 func ifaceE2I(t *abi.Type, src any, dst unsafe.Pointer)
 
 // typedmemmove copies a value of type t to dst from src.
 //
-//go:linkname typedmemmove github.com/goplus/llgo/runtime/internal/runtime.Typedmemmove
+//go:linkname typedmemmove github.com/xgo-dev/llgo/runtime/internal/runtime.Typedmemmove
 func typedmemmove(t *abi.Type, dst, src unsafe.Pointer)

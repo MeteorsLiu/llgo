@@ -1,6 +1,6 @@
 // Copyright 2016 The Go Authors. All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Use of this source code is governed by a BSD-style license.
+// See LICENSES/Go-BSD-3-Clause.txt at this module root for license terms.
 
 package reflectlite
 
@@ -35,7 +35,7 @@ func Swapper(slice any) func(i, j int) {
 
 	typ := v.Type().Elem().common()
 	size := typ.Size()
-	hasPtr := typ.PtrBytes != 0
+	hasPtr := typ.Pointers()
 
 	// Some common & small cases, without using memmove:
 	if hasPtr {
@@ -43,7 +43,7 @@ func Swapper(slice any) func(i, j int) {
 			ps := *(*[]unsafe.Pointer)(v.ptr)
 			return func(i, j int) { ps[i], ps[j] = ps[j], ps[i] }
 		}
-		if typ.Kind() == String {
+		if Kind(typ.Kind()) == String {
 			ss := *(*[]string)(v.ptr)
 			return func(i, j int) { ss[i], ss[j] = ss[j], ss[i] }
 		}

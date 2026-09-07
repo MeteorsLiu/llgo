@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 The GoPlus Authors (goplus.org). All rights reserved.
+ * Copyright (c) 2023 The XGo Authors (xgo.dev). All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -13,6 +13,10 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+
+// Portions of this file are derived from tinygo/builder/ar.go.
+// Copyright (c) 2018-2025 The TinyGo Authors. All rights reserved.
+// See ../../../LICENSES/TinyGo-BSD-3-Clause.txt for license terms.
 
 package ar
 
@@ -29,7 +33,7 @@ import (
 	"time"
 
 	wasm "github.com/aykevl/go-wasm"
-	"github.com/goplus/llgo/xtool/ar"
+	"github.com/xgo-dev/llgo/xtool/ar"
 )
 
 // Create creates an arcive for static linking from a list of object files

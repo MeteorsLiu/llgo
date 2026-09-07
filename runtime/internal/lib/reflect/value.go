@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2024 The GoPlus Authors (goplus.org). All rights reserved.
+ * Copyright (c) 2024 The XGo Authors (xgo.dev). All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,8 +15,8 @@
  */
 
 // Copyright 2009 The Go Authors. All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Use of this source code is governed by a BSD-style license.
+// See LICENSES/Go-BSD-3-Clause.txt at this module root for license terms.
 
 package reflect
 
@@ -25,12 +25,11 @@ import (
 	"math"
 	"unsafe"
 
-	"github.com/goplus/llgo/runtime/abi"
-	"github.com/goplus/llgo/runtime/internal/clite/bitcast"
-	"github.com/goplus/llgo/runtime/internal/ffi"
-	"github.com/goplus/llgo/runtime/internal/lib/internal/itoa"
-	"github.com/goplus/llgo/runtime/internal/runtime"
-	"github.com/goplus/llgo/runtime/internal/runtime/goarch"
+	"github.com/xgo-dev/llgo/runtime/abi"
+	"github.com/xgo-dev/llgo/runtime/internal/clite/bitcast"
+	"github.com/xgo-dev/llgo/runtime/internal/ffi"
+	"github.com/xgo-dev/llgo/runtime/internal/runtime"
+	"github.com/xgo-dev/llgo/runtime/internal/runtime/goarch"
 )
 
 // Value is the reflection interface to a Go value.
@@ -141,36 +140,42 @@ func packEface(v Value) any {
 	t := v.typ()
 	var i any
 	e := (*emptyInterface)(unsafe.Pointer(&i))
-	// First, fill in the data portion of the interface.
-	switch {
-	case t.IfaceIndir():
-		if v.flag&flagIndir == 0 {
-			panic("bad indir")
-		}
-		// Value is indirect, and so is the interface we're making.
-		ptr := v.ptr
-		if v.flag&flagAddr != 0 {
-			// TODO: pass safe boolean from valueInterface so
-			// we don't need to copy if safe==true?
-			c := unsafe_New(t)
-			typedmemmove(t, c, ptr)
-			ptr = c
-		}
-		e.word = ptr
-	case v.flag&flagIndir != 0:
-		// Value is indirect, but interface is direct. We need
-		// to load the data at v.ptr into the interface data word.
-		e.word = *(*unsafe.Pointer)(v.ptr)
-	default:
-		// Value is direct, and so is the interface.
-		e.word = v.ptr
-	}
+	e.word = packEfaceData(v)
 	// Now, fill in the type portion. We're very careful here not
 	// to have any operation between the e.word and e.typ assignments
 	// that would let the garbage collector observe the partially-built
 	// interface value.
 	e.typ = t
 	return i
+}
+
+// packEfaceData is a helper that packs the data word as if v were stored in
+// an empty interface. Go 1.26's reflect.TypeAssert refers to it directly.
+func packEfaceData(v Value) unsafe.Pointer {
+	t := v.typ()
+	switch {
+	case t.IfaceIndir():
+		if v.flag&flagIndir == 0 {
+			panic("bad indir")
+		}
+		ptr := v.ptr
+		if v.flag&flagAddr != 0 {
+			c := unsafe_New(t)
+			typedmemmove(t, c, ptr)
+			ptr = c
+		}
+		return ptr
+	case v.flag&flagIndir != 0:
+		return *(*unsafe.Pointer)(v.ptr)
+	default:
+		return v.ptr
+	}
+}
+
+// packIfaceValueIntoEmptyIface is used by Go 1.26's reflect.TypeAssert helpers
+// when reboxing a non-empty interface value into an empty interface.
+func packIfaceValueIntoEmptyIface(v Value) any {
+	return packEface(v)
 }
 
 // unpackEface converts the empty interface i to a Value.
@@ -238,11 +243,10 @@ type emptyInterface struct {
 type nonEmptyInterface struct {
 	// see ../runtime/iface.go:/Itab
 	itab *struct {
-		ityp *abi.Type // static interface type
-		typ  *abi.Type // dynamic concrete type
-		hash uint32    // copy of typ.hash
-		_    [4]byte
-		fun  [100000]unsafe.Pointer // method table
+		inter *abi.InterfaceType
+		typ   *abi.Type
+		hash  uint32     // copy of _type.hash. Used for type switches.
+		fun   [1]uintptr // variable sized. fun[0]==0 means _type does not implement inter.
 	}
 	word unsafe.Pointer
 }
@@ -385,7 +389,14 @@ func (v Value) Addr() Value {
 	// Preserve flagRO instead of using v.flag.ro() so that
 	// v.Addr().Elem() is equivalent to v (#32772)
 	fl := v.flag & flagRO
-	return Value{ptrTo(v.typ()), v.ptr, fl | flag(Pointer)}
+	typ := v.typ()
+	if v.typ_.IsClosure() {
+		// Function values use a closure struct as their physical LLGo
+		// representation. Addr must expose the pointer to the semantic Go
+		// function type, just as Type does, rather than *$closure.
+		typ = v.Type().common()
+	}
+	return Value{ptrTo(typ), v.ptr, fl | flag(Pointer)}
 }
 
 // Bool returns v's underlying value.
@@ -395,7 +406,7 @@ func (v Value) Bool() bool {
 	if v.kind() != Bool {
 		v.panicNotBool()
 	}
-	if v.flag&flagAddr != 0 {
+	if v.flag&flagIndir != 0 {
 		return *(*bool)(v.ptr)
 	}
 	return uintptr(v.ptr) != 0
@@ -498,12 +509,16 @@ func (v Value) capNonSlice() int {
 // Close closes the channel v.
 // It panics if v's Kind is not Chan.
 func (v Value) Close() {
-	/* TODO(xsw):
 	v.mustBe(Chan)
 	v.mustBeExported()
-	chanclose(v.pointer())
-	*/
-	panic("todo: reflect.Value.Close")
+	tt := (*chanType)(unsafe.Pointer(v.typ()))
+	if ChanDir(tt.Dir)&SendDir == 0 {
+		panic("reflect: close of receive-only channel")
+	}
+	if v.pointer() == nil {
+		panic("close of nil channel")
+	}
+	runtime.ChanClose((*runtime.Chan)(v.pointer()))
 }
 
 // CanComplex reports whether Complex can be used without panicking.
@@ -577,7 +592,13 @@ func (v Value) Elem() Value {
 		tt := (*ptrType)(unsafe.Pointer(v.typ()))
 		typ := tt.Elem
 		fl := v.flag&flagRO | flagIndir | flagAddr
-		fl |= flag(typ.Kind())
+		kind := typ.Kind()
+		if typ.IsClosure() {
+			kind = abi.Func
+		} else if kind == abi.Func {
+			typ = closureOf(typ.FuncType())
+		}
+		fl |= flag(kind)
 		return Value{typ, ptr, fl}
 	}
 	panic(&ValueError{"reflect.Value.Elem", v.kind()})
@@ -600,8 +621,15 @@ func (v Value) Field(i int) Value {
 	field := &tt.Fields[i]
 	typ := field.Typ
 
+	// Check closure to func
+	kind := typ.Kind()
+	if kind == abi.Func {
+		typ = closureOf(typ.FuncType())
+	} else if typ.IsClosure() {
+		kind = abi.Func
+	}
 	// Inherit permission bits from v, but clear flagEmbedRO.
-	fl := v.flag&(flagStickyRO|flagIndir|flagAddr) | flag(typ.Kind())
+	fl := v.flag&(flagStickyRO|flagIndir|flagAddr) | flag(kind)
 	// Using an unexported field forces flagRO.
 	if !field.Exported() {
 		if field.Embedded() {
@@ -1093,7 +1121,7 @@ func (v Value) Pointer() uintptr {
 	k := v.kind()
 	switch k {
 	case Pointer:
-		if v.typ().PtrBytes == 0 {
+		if !v.typ().Pointers() {
 			val := *(*uintptr)(v.ptr)
 			// Since it is a not-in-heap pointer, all pointers to the heap are
 			// forbidden! See comment in Value.Elem and issue #48399.
@@ -1120,7 +1148,7 @@ func (v Value) Pointer() uintptr {
 		p := v.pointer()
 		// Non-nil func value points at data block.
 		// First word of data block is actual code.
-		if p != nil {
+		if p != nil && v.typ_.IsClosure() {
 			p = *(*unsafe.Pointer)(p)
 		}
 		return uintptr(p)
@@ -1145,7 +1173,6 @@ func (v Value) Recv() (x Value, ok bool) {
 // internal recv, possibly non-blocking (nb).
 // v is known to be a channel.
 func (v Value) recv(nb bool) (val Value, ok bool) {
-	/* TODO(xsw):
 	tt := (*chanType)(unsafe.Pointer(v.typ()))
 	if ChanDir(tt.Dir)&RecvDir == 0 {
 		panic("reflect: recv on send-only channel")
@@ -1160,13 +1187,25 @@ func (v Value) recv(nb bool) (val Value, ok bool) {
 	} else {
 		p = unsafe.Pointer(&val.ptr)
 	}
-	selected, ok := chanrecv(v.pointer(), nb, p)
+	ch := (*runtime.Chan)(v.pointer())
+	if ch == nil {
+		if nb {
+			return Value{}, false
+		}
+		select {}
+	}
+	selected := true
+	if nb {
+		var tryOK bool
+		ok, tryOK = runtime.ChanTryRecv(ch, p, int(t.Size()))
+		selected = tryOK
+	} else {
+		ok = runtime.ChanRecv(ch, p, int(t.Size()))
+	}
 	if !selected {
 		val = Value{}
 	}
 	return
-	*/
-	panic("todo: reflect.Value.recv")
 }
 
 // Send sends x on the channel v.
@@ -1181,7 +1220,6 @@ func (v Value) Send(x Value) {
 // internal send, possibly non-blocking.
 // v is known to be a channel.
 func (v Value) send(x Value, nb bool) (selected bool) {
-	/* TODO(xsw):
 	tt := (*chanType)(unsafe.Pointer(v.typ()))
 	if ChanDir(tt.Dir)&SendDir == 0 {
 		panic("reflect: send on recv-only channel")
@@ -1194,9 +1232,20 @@ func (v Value) send(x Value, nb bool) (selected bool) {
 	} else {
 		p = unsafe.Pointer(&x.ptr)
 	}
-	return chansend(v.pointer(), p, nb)
-	*/
-	panic("todo: reflect.Value.send")
+	ch := (*runtime.Chan)(v.pointer())
+	if ch == nil {
+		if nb {
+			return false
+		}
+		select {}
+	}
+	if nb {
+		return runtime.ChanTrySend(ch, p, int(tt.Elem.Size()))
+	}
+	if !runtime.ChanSend(ch, p, int(tt.Elem.Size())) {
+		panic("send on closed channel")
+	}
+	return true
 }
 
 // Set assigns x to the value v.
@@ -1559,12 +1608,9 @@ func (v Value) stringNonString() string {
 // If the receive cannot finish without blocking, x is the zero Value and ok is false.
 // If the channel is closed, x is the zero value for the channel's element type and ok is false.
 func (v Value) TryRecv() (x Value, ok bool) {
-	/* TODO(xsw):
 	v.mustBe(Chan)
 	v.mustBeExported()
 	return v.recv(true)
-	*/
-	panic("todo: reflect.Value.TryRecv")
 }
 
 // TrySend attempts to send x on the channel v but will not block.
@@ -1572,12 +1618,9 @@ func (v Value) TryRecv() (x Value, ok bool) {
 // It reports whether the value was sent.
 // As in Go, x's value must be assignable to the channel's element type.
 func (v Value) TrySend(x Value) bool {
-	/* TODO(xsw):
 	v.mustBe(Chan)
 	v.mustBeExported()
 	return v.send(x, true)
-	*/
-	panic("todo: reflect.Value.TrySend")
 }
 
 // Type returns v's type.
@@ -1594,11 +1637,11 @@ func (v Value) typeSlow() Type {
 	}
 
 	typ := v.typ()
-	// closure func
-	if v.typ_.IsClosure() {
-		return toRType(&v.closureFunc().Type)
-	}
 	if v.flag&flagMethod == 0 {
+		// closure func
+		if v.typ_.IsClosure() {
+			return toRType(&v.closureFunc().Type)
+		}
 		return toRType(v.typ())
 	}
 
@@ -1702,7 +1745,7 @@ func (v Value) UnsafePointer() unsafe.Pointer {
 	k := v.kind()
 	switch k {
 	case Pointer:
-		if v.typ().PtrBytes == 0 {
+		if !v.typ().Pointers() {
 			// Since it is a not-in-heap pointer, all pointers to the heap are
 			// forbidden! See comment in Value.Elem and issue #48399.
 			if !verifyNotInHeapPtr(*(*uintptr)(v.ptr)) {
@@ -1727,7 +1770,7 @@ func (v Value) UnsafePointer() unsafe.Pointer {
 		p := v.pointer()
 		// Non-nil func value points at data block.
 		// First word of data block is actual code.
-		if p != nil {
+		if p != nil && v.typ_.IsClosure() {
 			p = *(*unsafe.Pointer)(p)
 		}
 		return p
@@ -1738,10 +1781,10 @@ func (v Value) UnsafePointer() unsafe.Pointer {
 	panic(&ValueError{"reflect.Value.UnsafePointer", v.kind()})
 }
 
-//go:linkname unsafe_New github.com/goplus/llgo/runtime/internal/runtime.New
+//go:linkname unsafe_New github.com/xgo-dev/llgo/runtime/internal/runtime.New
 func unsafe_New(*abi.Type) unsafe.Pointer
 
-//go:linkname unsafe_NewArray github.com/goplus/llgo/runtime/internal/runtime.NewArray
+//go:linkname unsafe_NewArray github.com/xgo-dev/llgo/runtime/internal/runtime.NewArray
 func unsafe_NewArray(*abi.Type, int) unsafe.Pointer
 
 // ValueOf returns a new Value initialized to the concrete value
@@ -1752,6 +1795,22 @@ func ValueOf(i any) Value {
 	}
 
 	return unpackEface(i)
+}
+
+// Indirect returns the value that v points to.
+// If v is a nil pointer, Indirect returns a zero Value.
+// If v is not a pointer, Indirect returns v.
+func Indirect(v Value) Value {
+	if v.Kind() != Pointer {
+		return v
+	}
+	return v.Elem()
+}
+
+func typesMustMatch(what string, t1, t2 Type) {
+	if t1 != t2 {
+		panic(what + ": " + t1.String() + " != " + t2.String())
+	}
 }
 
 // arrayAt returns the i-th element of p,
@@ -1788,7 +1847,13 @@ func (v Value) grow(n int) {
 		panic("reflect.Value.Grow: slice overflow")
 	case oldLen+n > p.Cap:
 		t := v.typ().Elem()
-		*p = growslice(*p, n, int(t.Size_))
+		// The linknamed growslice must use the same ABI as runtime slice helpers.
+		// LLGo lowers slice-like values (data,len,cap) as 3 registers, while a
+		// plain 3-word struct may use a different calling convention.
+		// Reinterpret the header as a builtin slice so the call ABI matches.
+		sh := *(*[]byte)(unsafe.Pointer(p))
+		sh = growslice(sh, n, int(t.Size_))
+		*p = *(*unsafeheaderSlice)(unsafe.Pointer(&sh))
 		p.Len = oldLen // set oldLen back
 	}
 }
@@ -1829,17 +1894,74 @@ func Append(s Value, x ...Value) Value {
 // AppendSlice appends a slice t to a slice s and returns the resulting slice.
 // The slices s and t must have the same element type.
 func AppendSlice(s, t Value) Value {
-	/*
-		s.mustBe(Slice)
-		t.mustBe(Slice)
-		typesMustMatch("reflect.AppendSlice", s.Type().Elem(), t.Type().Elem())
-		ns := s.Len()
-		nt := t.Len()
-		s = s.extendSlice(nt)
-		Copy(s.Slice(ns, ns+nt), t)
-		return s
-	*/
-	panic("todo: reflect.AppendSlice")
+	s.mustBe(Slice)
+	t.mustBe(Slice)
+	if s.typ().Elem() != t.typ().Elem() {
+		panic("reflect.AppendSlice: " + stringFor(s.typ().Elem()) + " != " + stringFor(t.typ().Elem()))
+	}
+	ns := s.Len()
+	nt := t.Len()
+	s = s.extendSlice(nt)
+	Copy(s.Slice(ns, ns+nt), t)
+	return s
+}
+
+// Copy copies the contents of src into dst until either
+// dst has been filled or src has been exhausted.
+// It returns the number of elements copied.
+// Dst and src each must have kind Array or Slice, and
+// dst and src must have the same element type.
+// If dst is an Array, it panics if Value.CanSet returns false.
+//
+// As a special case, src can have kind String if the element type of dst is kind Uint8.
+func Copy(dst, src Value) int {
+	dk := dst.kind()
+	if dk != Array && dk != Slice {
+		panic(&ValueError{"reflect.Copy", dk})
+	}
+	if dk == Array {
+		dst.mustBeAssignable()
+	}
+	dst.mustBeExported()
+
+	sk := src.kind()
+	stringCopy := false
+	if sk != Array && sk != Slice {
+		stringCopy = sk == String && dst.typ().Elem().Kind() == abi.Uint8
+		if !stringCopy {
+			panic(&ValueError{"reflect.Copy", sk})
+		}
+	}
+	src.mustBeExported()
+
+	de := dst.typ().Elem()
+	if !stringCopy {
+		se := src.typ().Elem()
+		typesMustMatch("reflect.Copy", toType(de), toType(se))
+	}
+
+	var ds, ss unsafeheaderSlice
+	if dk == Array {
+		ds.Data = dst.ptr
+		ds.Len = dst.Len()
+		ds.Cap = ds.Len
+	} else {
+		ds = *(*unsafeheaderSlice)(dst.ptr)
+	}
+	if sk == Array {
+		ss.Data = src.ptr
+		ss.Len = src.Len()
+		ss.Cap = ss.Len
+	} else if sk == Slice {
+		ss = *(*unsafeheaderSlice)(src.ptr)
+	} else {
+		sh := *(*unsafeheaderString)(src.ptr)
+		ss.Data = sh.Data
+		ss.Len = sh.Len
+		ss.Cap = sh.Len
+	}
+
+	return typedslicecopy(de, ds, ss)
 }
 
 // Zero returns a Value representing the zero value for the specified type.
@@ -1879,6 +2001,9 @@ func New(typ Type) Value {
 		panic("reflect: New(nil)")
 	}
 	t := &typ.(*rtype).t
+	if t.Kind() == abi.Func {
+		t = closureOf(t.FuncType())
+	}
 	pt := ptrTo(t)
 	if ifaceIndir(pt) {
 		// This is a pointer to a not-in-heap type.
@@ -1894,6 +2019,9 @@ func New(typ Type) Value {
 func NewAt(typ Type, p unsafe.Pointer) Value {
 	fl := flag(Pointer)
 	t := typ.(*rtype)
+	if t.Kind() == Func {
+		t = toRType(closureOf(t.t.FuncType()))
+	}
 	return Value{t.ptrTo(), p, fl}
 }
 
@@ -1906,16 +2034,20 @@ func (v Value) assignTo(context string, dst *abi.Type, target unsafe.Pointer) Va
 	if v.flag&flagMethod != 0 {
 		v = makeMethodValue(context, v)
 	}
+	typ := v.typ()
+	if typ.Kind() == abi.Func {
+		typ = closureOf(typ.FuncType())
+	}
 
 	switch {
-	case directlyAssignable(dst, v.typ()):
+	case directlyAssignable(dst, typ):
 		// Overwrite type so that they match.
 		// Same memory layout, so no harm done.
 		fl := v.flag&(flagAddr|flagIndir) | v.flag.ro()
 		fl |= flag(dst.Kind())
 		return Value{dst, v.ptr, fl}
 
-	case implements(dst, v.typ()):
+	case implements(dst, typ):
 		if v.Kind() == Interface && v.IsNil() {
 			// A nil ReadWriter passed to nil Reader is OK,
 			// but using ifaceE2I below will panic.
@@ -1987,13 +2119,21 @@ func memmove(dst, src unsafe.Pointer, size uintptr)
 
 // typedmemmove copies a value of type t to dst from src.
 //
-//go:linkname typedmemmove github.com/goplus/llgo/runtime/internal/runtime.Typedmemmove
+//go:linkname typedmemmove github.com/xgo-dev/llgo/runtime/internal/runtime.Typedmemmove
 func typedmemmove(t *abi.Type, dst, src unsafe.Pointer)
 
 // typedmemclr zeros the value at ptr of type t.
 //
-//go:linkname typedmemclr github.com/goplus/llgo/runtime/internal/runtime.Typedmemclr
+//go:linkname typedmemclr github.com/xgo-dev/llgo/runtime/internal/runtime.Typedmemclr
 func typedmemclr(t *abi.Type, ptr unsafe.Pointer)
+
+// typedslicecopy copies a slice of elemType values from src to dst,
+// returning the number of elements copied.
+func typedslicecopy(t *abi.Type, dst, src unsafeheaderSlice) int {
+	rdst := *(*runtime.Slice)(unsafe.Pointer(&dst))
+	rsrc := *(*runtime.Slice)(unsafe.Pointer(&src))
+	return runtime.Typedslicecopy(t, rdst, rsrc)
+}
 
 /*
 	TODO(xsw):
@@ -2003,12 +2143,6 @@ func typedmemclr(t *abi.Type, ptr unsafe.Pointer)
 //
 //go:noescape
 func typedmemclrpartial(t *abi.Type, ptr unsafe.Pointer, off, size uintptr)
-
-// typedslicecopy copies a slice of elemType values from src to dst,
-// returning the number of elements copied.
-//
-//go:noescape
-func typedslicecopy(t *abi.Type, dst, src unsafeheaderSlice) int
 
 // typedarrayclear zeroes the value at ptr of an array of elemType,
 // only clears len elem.
@@ -2023,8 +2157,11 @@ func verifyNotInHeapPtr(p uintptr) bool {
 	return true
 }
 
-//go:linkname growslice github.com/goplus/llgo/runtime/internal/runtime.GrowSlice
-func growslice(src unsafeheaderSlice, num, etSize int) unsafeheaderSlice
+func growslice(src []byte, num, etSize int) []byte {
+	rs := *(*runtime.Slice)(unsafe.Pointer(&src))
+	rs = runtime.GrowSlice(rs, num, etSize)
+	return *(*[]byte)(unsafe.Pointer(&rs))
+}
 
 // Dummy annotation marking that the value x escapes,
 // for use in cases where the reflect code is so clever that
@@ -2150,13 +2287,20 @@ type closure struct {
 	env unsafe.Pointer
 }
 
+func toFFIWordArg(v Value) unsafe.Pointer {
+	if v.flag&flagIndir != 0 {
+		return v.ptr
+	}
+	return unsafe.Pointer(&v.ptr)
+}
+
 func toFFIArg(v Value, typ *abi.Type) unsafe.Pointer {
 	kind := typ.Kind()
 	switch kind {
 	case abi.Bool, abi.Int, abi.Int8, abi.Int16, abi.Int32, abi.Int64,
 		abi.Uint, abi.Uint8, abi.Uint16, abi.Uint32, abi.Uint64, abi.Uintptr,
 		abi.Float32, abi.Float64:
-		if v.flag&flagAddr != 0 {
+		if v.flag&flagIndir != 0 {
 			return v.ptr
 		} else {
 			return unsafe.Pointer(&v.ptr)
@@ -2169,16 +2313,32 @@ func toFFIArg(v Value, typ *abi.Type) unsafe.Pointer {
 		}
 		return unsafe.Pointer(&v.ptr)
 	case abi.Chan:
-		return unsafe.Pointer(&v.ptr)
+		return toFFIWordArg(v)
 	case abi.Func:
+		if v.flag&flagIndir != 0 {
+			return v.ptr
+		}
 		return unsafe.Pointer(&v.ptr)
 	case abi.Interface:
 		i := v.Interface()
-		return unsafe.Pointer(&i)
+		iface := typ.InterfaceType()
+		if len(iface.Methods) == 0 {
+			return unsafe.Pointer(&i)
+		}
+		// Interface-valued reflect arguments carry the dynamic concrete type
+		// in i. Using v.typ() here instead constructs an itab for the source
+		// interface type itself, leaving method entries invalid when the
+		// reflected callee invokes them.
+		itab := runtime.NewItab(iface, rtypeOf(i))
+		data := struct {
+			itab *runtime.Itab
+			data unsafe.Pointer
+		}{itab, (*emptyInterface)(unsafe.Pointer(&i)).word}
+		return unsafe.Pointer(&data)
 	case abi.Map:
-		return unsafe.Pointer(&v.ptr)
+		return toFFIWordArg(v)
 	case abi.Pointer:
-		return unsafe.Pointer(&v.ptr)
+		return toFFIWordArg(v)
 	case abi.Slice:
 		return v.ptr
 	case abi.String:
@@ -2189,7 +2349,7 @@ func toFFIArg(v Value, typ *abi.Type) unsafe.Pointer {
 		}
 		return unsafe.Pointer(&v.ptr)
 	case abi.UnsafePointer:
-		return unsafe.Pointer(&v.ptr)
+		return toFFIWordArg(v)
 	}
 	panic("reflect.toFFIArg unsupport type " + v.typ().String())
 }
@@ -2223,16 +2383,57 @@ func toFFIType(typ *abi.Type) *ffi.Type {
 	case abi.String:
 		return ffi.TypeString
 	case abi.Struct:
-		st := typ.StructType()
-		fields := make([]*ffi.Type, len(st.Fields))
-		for i, fs := range st.Fields {
-			fields[i] = toFFIType(fs.Typ)
+		if typ.IsClosure() {
+			return ffiTypeClosure
 		}
-		return ffi.StructOf(fields...)
+		return toFFIStructType(typ)
 	case abi.UnsafePointer:
 		return ffi.TypePointer
 	}
 	panic("reflect.toFFIType unsupport type " + typ.String())
+}
+
+func toFFIStructType(typ *abi.Type) *ffi.Type {
+	st := typ.StructType()
+	fields := make([]*ffi.Type, 0, len(st.Fields))
+	var off uintptr
+	for _, fs := range st.Fields {
+		if fs.Offset > off {
+			fields, off = appendFFIPadding(fields, off, fs.Offset-off)
+		}
+		if fs.Typ.Size_ == 0 {
+			continue
+		}
+		fields = append(fields, toFFIType(fs.Typ))
+		off = fs.Offset + fs.Typ.Size_
+	}
+	// Do not pad to typ.Size_: trailing zero-sized fields can enlarge the
+	// Go-visible size without consuming registers in llgo's callable ABI.
+	return ffi.StructOf(fields...)
+}
+
+func appendFFIPadding(fields []*ffi.Type, off, size uintptr) ([]*ffi.Type, uintptr) {
+	for size > 0 {
+		switch {
+		case off%8 == 0 && size >= 8:
+			fields = append(fields, ffi.TypeUint64)
+			off += 8
+			size -= 8
+		case off%4 == 0 && size >= 4:
+			fields = append(fields, ffi.TypeUint32)
+			off += 4
+			size -= 4
+		case off%2 == 0 && size >= 2:
+			fields = append(fields, ffi.TypeUint16)
+			off += 2
+			size -= 2
+		default:
+			fields = append(fields, ffi.TypeUint8)
+			off++
+			size--
+		}
+	}
+	return fields, off
 }
 
 func toFFISig(tin, tout []*abi.Type) (*ffi.Signature, error) {
@@ -2240,47 +2441,52 @@ func toFFISig(tin, tout []*abi.Type) (*ffi.Signature, error) {
 	for i, in := range tin {
 		args[i] = toFFIType(in)
 	}
-	var ret *ffi.Type
+	return ffi.NewSignature(toFFIRetType(tout), args...)
+}
+
+func toFFIRetType(tout []*abi.Type) *ffi.Type {
 	switch n := len(tout); n {
 	case 0:
-		ret = ffi.TypeVoid
+		return ffi.TypeVoid
 	case 1:
-		ret = toFFIType(tout[0])
+		return toFFIType(tout[0])
 	default:
 		fields := make([]*ffi.Type, n)
 		for i, out := range tout {
 			fields[i] = toFFIType(out)
 		}
-		ret = ffi.StructOf(fields...)
+		return ffi.StructOf(fields...)
 	}
-	return ffi.NewSignature(ret, args...)
 }
 
 func (v Value) closureFunc() *abi.FuncType {
-	return v.typ_.StructType().Fields[0].Typ.FuncType()
+	return toFuncType(v.typ_.StructType())
 }
 
 func (v Value) call(op string, in []Value) (out []Value) {
 	var (
 		ft   *abi.FuncType
 		tin  []*abi.Type
-		tout []*abi.Type
 		args []unsafe.Pointer
 		fn   unsafe.Pointer
+		env  unsafe.Pointer
 		ret  unsafe.Pointer
 		ioff int
 	)
-	if v.typ_.IsClosure() {
+	if v.typ_.IsClosure() && v.flag&flagMethod == 0 {
 		ft = v.typ_.StructType().Fields[0].Typ.FuncType()
-		tin = append([]*abi.Type{rtypeOf(unsafe.Pointer(nil))}, ft.In...)
-		tout = ft.Out
 		c := (*struct {
 			fn  unsafe.Pointer
 			env unsafe.Pointer
 		})(v.ptr)
 		fn = c.fn
-		ioff = 1
-		args = append(args, unsafe.Pointer(&c.env))
+		env = c.env
+		tin = ft.In
+		if env != nil && ffi.ClosureEnvExplicit {
+			tin = append([]*abi.Type{rtypeOf(unsafe.Pointer(nil))}, tin...)
+			ioff = 1
+			args = append(args, unsafe.Pointer(&env))
+		}
 	} else {
 		if v.flag&flagMethod != 0 {
 			var (
@@ -2288,7 +2494,6 @@ func (v Value) call(op string, in []Value) (out []Value) {
 			)
 			rcvrtype, ft, fn = methodReceiver(op, v, int(v.flag)>>flagMethodShift)
 			tin = append([]*abi.Type{rcvrtype}, ft.In...)
-			tout = ft.Out
 			ioff = 1
 			var ptr unsafe.Pointer
 			storeRcvr(v, unsafe.Pointer(&ptr))
@@ -2301,8 +2506,11 @@ func (v Value) call(op string, in []Value) (out []Value) {
 			}
 			ft = v.typ_.FuncType()
 			tin = ft.In
-			tout = ft.Out
 		}
+	}
+
+	if fn == nil {
+		panic("reflect.Value.Call: call of nil function")
 	}
 
 	isSlice := op == "CallSlice"
@@ -2335,7 +2543,7 @@ func (v Value) call(op string, in []Value) (out []Value) {
 		}
 	}
 	for i := 0; i < n; i++ {
-		if xt, targ := in[i].Type(), ft.In[i]; !xt.AssignableTo(toRType(targ)) {
+		if xt, targ := in[i].Type(), ft.In[i]; !xt.AssignableTo(toPublicType(targ)) {
 			panic("reflect: " + op + " using " + xt.String() + " as type " + stringFor(targ))
 		}
 	}
@@ -2343,7 +2551,7 @@ func (v Value) call(op string, in []Value) (out []Value) {
 		// prepare slice for remaining values
 		m := len(in) - n
 		slice := MakeSlice(toRType(ft.In[n]), m, m)
-		elem := toRType(ft.In[n].Elem()) // FIXME cast to slice type and Elem()
+		elem := toPublicType(ft.In[n].Elem()) // FIXME cast to slice type and Elem()
 		for i := 0; i < m; i++ {
 			x := in[n+i]
 			if xt := x.Type(); !xt.AssignableTo(elem) {
@@ -2362,31 +2570,105 @@ func (v Value) call(op string, in []Value) (out []Value) {
 		panic("reflect.Value.Call: wrong argument count")
 	}
 
-	sig, err := toFFISig(tin, tout)
+	ffiArgs := make([]*ffi.Type, 0, len(tin)+4)
+	for i := 0; i < ioff; i++ {
+		ffiArgs = append(ffiArgs, toFFIType(tin[i]))
+	}
+	for i, arg := range in {
+		typ := tin[ioff+i]
+		if ffiCallSliceAsTriple && typ.Kind() == abi.Slice {
+			h := (*unsafeheaderSlice)(arg.ptr)
+			ffiArgs = append(ffiArgs, ffi.TypePointer, ffi.TypeInt, ffi.TypeInt)
+			args = append(args, unsafe.Pointer(&h.Data), unsafe.Pointer(&h.Len), unsafe.Pointer(&h.Cap))
+			continue
+		}
+		ffiArgs = append(ffiArgs, toFFIType(typ))
+		args = append(args, toFFIArg(arg, typ))
+	}
+
+	sig, err := ffi.NewSignature(toFFIRetType(ft.Out), ffiArgs...)
 	if err != nil {
 		panic(err)
 	}
 	if sig.RType != ffi.TypeVoid {
 		v := runtime.AllocZ(sig.RType.Size)
-		ret = unsafe.Pointer(&v)
+		// libffi expects rvalue to point to the return value storage.
+		ret = v
 	}
-	for i, in := range in {
-		args = append(args, toFFIArg(in, tin[ioff+i]))
-	}
-	ffi.Call(sig, fn, ret, args...)
+
+	ffi.CallWithEnv(sig, fn, env, ret, args...)
+	tout := toRuntimeTypes(ft.Out)
 	switch n := len(tout); n {
 	case 0:
 	case 1:
-		return []Value{NewAt(toType(tout[0]), ret).Elem()}
+		out := NewAt(toType(tout[0]), ret).Elem()
+		resolveIndirectValue(&out, tout[0])
+		return []Value{out}
 	default:
 		out = make([]Value, n)
+		alignment := uintptr(sig.RType.Alignment)
 		var off uintptr
 		for i, tout := range tout {
 			out[i] = NewAt(toType(tout), add(ret, off, "")).Elem()
-			off += tout.Size()
+			resolveIndirectValue(&out[i], tout)
+			off += (tout.Size_ + alignment - 1) &^ (alignment - 1)
 		}
 	}
 	return
+}
+
+func toRuntimeTypes(typs []*abi.Type) []*abi.Type {
+	switch n := len(typs); n {
+	case 0:
+		return nil
+	case 1:
+		return []*abi.Type{toRuntimeType(typs[0])}
+	default:
+		rets := make([]*abi.Type, n)
+		for i, typ := range typs {
+			rets[i] = toRuntimeType(typ)
+		}
+		return rets
+	}
+}
+
+func toRuntimeType(typ *abi.Type) *abi.Type {
+	switch typ.Kind() {
+	case abi.Func:
+		return closureOf((*abi.FuncType)(unsafe.Pointer(typ)))
+	}
+	return typ
+}
+
+// resolveIndirectValue converts Value's indirect reference to direct based on abi.Type, clears flagIndir
+// It adjusts the Value's ptr (dereferences or truncates) and removes the flagIndir flag.
+func resolveIndirectValue(v *Value, typ *abi.Type) {
+	if !typ.IsDirectIface() || v.flag&flagIndir == 0 {
+		return
+	}
+	k := typ.Kind()
+	switch {
+	case k == abi.Float32:
+		fv := *(*float32)(v.ptr)
+		v.ptr = unsafe.Pointer(uintptr(bitcast.FromFloat32(fv)))
+	case k == abi.Float64:
+		fv := *(*float64)(v.ptr)
+		v.ptr = unsafe.Pointer(uintptr(bitcast.FromFloat64(fv)))
+	default:
+		// convert abi.Bool~abi.Uintptr and abi.Struct/abi.Array themselves.
+		// struct/array elem conversion by caller func.
+		if typ.Size_ < unsafe.Sizeof(0) {
+			v.ptr = truncate(*(*unsafe.Pointer)(v.ptr), typ.Size_*8)
+		} else {
+			v.ptr = *(*unsafe.Pointer)(v.ptr)
+		}
+	}
+	v.flag &= ^flagIndir
+}
+
+func truncate(addr unsafe.Pointer, bits uintptr) unsafe.Pointer {
+	mask := uintptr(1<<bits) - 1
+	return unsafe.Pointer(uintptr(addr) & mask)
 }
 
 // v is a method receiver. Store at p the word which is used to
@@ -2398,12 +2680,31 @@ func storeRcvr(v Value, p unsafe.Pointer) {
 	if t.Kind() == abi.Interface {
 		// the interface data word becomes the receiver word
 		iface := (*nonEmptyInterface)(v.ptr)
-		*(*unsafe.Pointer)(p) = iface.word
-	} else if v.flag&flagIndir != 0 && !ifaceIndir(t) {
-		*(*unsafe.Pointer)(p) = *(*unsafe.Pointer)(v.ptr)
+		*(*unsafe.Pointer)(p) = ifacePtrData(iface)
+	} else if v.flag&flagIndir != 0 {
+		if ifaceIndir(t) {
+			*(*unsafe.Pointer)(p) = v.ptr
+		} else if runtime.DirectIfaceData(t) {
+			*(*unsafe.Pointer)(p) = v.ptr
+		} else {
+			*(*unsafe.Pointer)(p) = *(*unsafe.Pointer)(v.ptr)
+		}
 	} else {
-		*(*unsafe.Pointer)(p) = v.ptr
+		if ifaceIndir(t) {
+			*(*unsafe.Pointer)(p) = *(*unsafe.Pointer)(v.ptr)
+		} else if runtime.DirectIfaceData(t) {
+			*(*unsafe.Pointer)(p) = unsafe.Pointer(&v.ptr)
+		} else {
+			*(*unsafe.Pointer)(p) = v.ptr
+		}
 	}
+}
+
+func ifacePtrData(i *nonEmptyInterface) unsafe.Pointer {
+	if runtime.DirectIfaceData(i.itab.typ) {
+		return unsafe.Pointer(&i.word)
+	}
+	return i.word
 }
 
 var stringType = rtypeOf("")
@@ -2668,6 +2969,12 @@ func (f flag) panicNotMap() {
 // copyVal returns a Value containing the map key or value at ptr,
 // allocating a new variable as needed.
 func copyVal(typ *abi.Type, fl flag, ptr unsafe.Pointer) Value {
+	if typ.IsClosure() {
+		// Maps retain LLGo's physical two-word closure descriptor so bucket
+		// evacuation copies both the code and environment pointers. Expose the
+		// semantic Go kind on the reflected value, just as unpackEface does.
+		fl = fl&^flagKindMask | flag(Func)
+	}
 	if typ.IfaceIndir() {
 		// Copy result so future changes to the map
 		// won't change the underlying value.
@@ -2701,7 +3008,7 @@ func methodReceiver(op string, v Value, methodIndex int) (rcvrtype *abi.Type, t 
 			panic("reflect: " + op + " of method on nil interface value")
 		}
 		rcvrtype = iface.itab.typ
-		fn = unsafe.Pointer(iface.itab.fun[i])
+		fn = unsafe.Pointer(unsafe.Slice(&iface.itab.fun[0], i+1)[i])
 		t = (*funcType)(unsafe.Pointer(m.Typ_))
 	} else {
 		rcvrtype = v.typ()
@@ -2713,9 +3020,12 @@ func methodReceiver(op string, v Value, methodIndex int) (rcvrtype *abi.Type, t 
 		if !abi.IsExported(m.Name()) {
 			panic("reflect: " + op + " of unexported method")
 		}
-		ifn := m.Ifn_
-		fn = unsafe.Pointer(ifn)
+		fn = unsafe.Pointer(m.Ifn_)
 		t = (*funcType)(unsafe.Pointer(m.Mtyp_))
+	}
+	if rcvrtype.Kind() != abi.Pointer {
+		// convert rcvrtype to abi.Pointer to match ifn call
+		rcvrtype = toRType(rcvrtype).ptrTo()
 	}
 	return
 }
@@ -2794,6 +3104,10 @@ func convertOp(dst, src *abi.Type) func(Value, Type) Value {
 		if dst.Kind() == abi.Chan && specialChannelAssignability(dst, src) {
 			return cvtDirect
 		}
+	case Func:
+		if dst.Kind() == abi.Func {
+			return cvtFunc
+		}
 	}
 
 	// dst and src have same underlying type.
@@ -2825,46 +3139,40 @@ const is64bit = (1 << (^uintptr(0) >> 63) / 2) == 1
 // where t is a signed or unsigned int type.
 func makeInt(f flag, bits uint64, t Type) Value {
 	typ := t.common()
-	var ptr unsafe.Pointer
+	ptr := unsafe_New(typ)
 	switch typ.Size() {
-	case 1, 2, 4:
-		ptr = unsafe.Pointer(uintptr(bits))
+	case 1:
+		*(*uint8)(ptr) = uint8(bits)
+	case 2:
+		*(*uint16)(ptr) = uint16(bits)
+	case 4:
+		*(*uint32)(ptr) = uint32(bits)
 	case 8:
-		if is64bit {
-			ptr = unsafe.Pointer(uintptr(bits))
-		} else {
-			ptr = unsafe_New(typ)
-			*(*uint64)(ptr) = bits
-			f |= flagIndir
-		}
+		*(*uint64)(ptr) = bits
 	}
-	return Value{typ, ptr, f | flag(typ.Kind())}
+	return Value{typ, ptr, f | flagIndir | flag(typ.Kind())}
 }
 
 // makeFloat returns a Value of type t equal to v (possibly truncated to float32),
 // where t is a float32 or float64 type.
 func makeFloat(f flag, v float64, t Type) Value {
 	typ := t.common()
-	var ptr unsafe.Pointer
+	ptr := unsafe_New(typ)
 	switch typ.Size() {
 	case 4:
-		ptr = unsafe.Pointer(uintptr(bitcast.FromFloat32(float32(v))))
+		*(*float32)(ptr) = float32(v)
 	case 8:
-		if is64bit {
-			ptr = unsafe.Pointer(uintptr(bitcast.FromFloat64(v)))
-		} else {
-			ptr = unsafe_New(typ)
-			*(*float64)(ptr) = v
-			f |= flagIndir
-		}
+		*(*float64)(ptr) = v
 	}
-	return Value{typ, ptr, f | flag(typ.Kind())}
+	return Value{typ, ptr, f | flagIndir | flag(typ.Kind())}
 }
 
 // makeFloat32 returns a Value of type t equal to v, where t is a float32 type.
-func makeFloat32(f flag, ptr unsafe.Pointer, t Type) Value {
+func makeFloat32(f flag, v float32, t Type) Value {
 	typ := t.common()
-	return Value{typ, ptr, f | flag(typ.Kind())}
+	ptr := unsafe_New(typ)
+	*(*float32)(ptr) = v
+	return Value{typ, ptr, f | flagIndir | flag(typ.Kind())}
 }
 
 // makeComplex returns a Value of type t equal to v (possibly truncated to complex64),
@@ -2943,7 +3251,7 @@ func cvtFloat(v Value, t Type) Value {
 		// Don't do any conversion if both types have underlying type float32.
 		// This avoids converting to float64 and back, which will
 		// convert a signaling NaN to a quiet NaN. See issue 36400.
-		return makeFloat32(v.flag.ro(), v.ptr, t)
+		return makeFloat32(v.flag.ro(), *(*float32)(v.ptr), t)
 	}
 	return makeFloat(v.flag.ro(), v.Float(), t)
 }
@@ -2995,7 +3303,7 @@ func cvtStringRunes(v Value, t Type) Value {
 func cvtSliceArrayPtr(v Value, t Type) Value {
 	n := t.Elem().Len()
 	if n > v.Len() {
-		panic("reflect: cannot convert slice with length " + itoa.Itoa(v.Len()) + " to pointer to array with length " + itoa.Itoa(n))
+		panic("reflect: cannot convert slice with length " + itoa(v.Len()) + " to pointer to array with length " + itoa(n))
 	}
 	h := (*unsafeheaderSlice)(v.ptr)
 	return Value{t.common(), h.Data, v.flag&^(flagIndir|flagAddr|flagKindMask) | flag(Pointer)}
@@ -3005,7 +3313,7 @@ func cvtSliceArrayPtr(v Value, t Type) Value {
 func cvtSliceArray(v Value, t Type) Value {
 	n := t.Len()
 	if n > v.Len() {
-		panic("reflect: cannot convert slice with length " + itoa.Itoa(v.Len()) + " to array with length " + itoa.Itoa(n))
+		panic("reflect: cannot convert slice with length " + itoa(v.Len()) + " to array with length " + itoa(n))
 	}
 	h := (*unsafeheaderSlice)(v.ptr)
 	typ := t.common()
@@ -3021,6 +3329,24 @@ func cvtSliceArray(v Value, t Type) Value {
 func cvtDirect(v Value, typ Type) Value {
 	f := v.flag
 	t := typ.common()
+	ptr := v.ptr
+	if f&flagAddr != 0 {
+		// indirect, mutable word - make a copy
+		c := unsafe_New(t)
+		typedmemmove(t, c, ptr)
+		ptr = c
+		f &^= flagAddr
+	}
+	return Value{t, ptr, v.flag.ro() | f} // v.flag.ro()|f == f?
+}
+
+// convertOp: func copy
+func cvtFunc(v Value, typ Type) Value {
+	f := v.flag
+	t := typ.common()
+	if t.Kind() == abi.Func {
+		t = closureOf(t.FuncType())
+	}
 	ptr := v.ptr
 	if f&flagAddr != 0 {
 		// indirect, mutable word - make a copy
@@ -3054,22 +3380,22 @@ func cvtI2I(v Value, typ Type) Value {
 	return cvtT2I(v.Elem(), typ)
 }
 
-//go:linkname chancap github.com/goplus/llgo/runtime/internal/runtime.ChanCap
+//go:linkname chancap github.com/xgo-dev/llgo/runtime/internal/runtime.ChanCap
 func chancap(ch unsafe.Pointer) int
 
-//go:linkname chanlen github.com/goplus/llgo/runtime/internal/runtime.ChanLen
+//go:linkname chanlen github.com/xgo-dev/llgo/runtime/internal/runtime.ChanLen
 func chanlen(ch unsafe.Pointer) int
 
-//go:linkname makemap github.com/goplus/llgo/runtime/internal/runtime.MakeMap
+//go:linkname makemap github.com/xgo-dev/llgo/runtime/internal/runtime.MakeMap
 func makemap(t *abi.Type, cap int) (m unsafe.Pointer)
 
-//go:linkname maplen github.com/goplus/llgo/runtime/internal/runtime.MapLen
+//go:linkname maplen github.com/xgo-dev/llgo/runtime/internal/runtime.MapLen
 func maplen(ch unsafe.Pointer) int
 
-//go:linkname mapaccess github.com/goplus/llgo/runtime/internal/runtime.MapAccess2
+//go:linkname mapaccess github.com/xgo-dev/llgo/runtime/internal/runtime.MapAccess2
 func mapaccess(t *abi.Type, m unsafe.Pointer, key unsafe.Pointer) (val unsafe.Pointer, ok bool)
 
-//go:linkname mapassign0 github.com/goplus/llgo/runtime/internal/runtime.MapAssign
+//go:linkname mapassign0 github.com/xgo-dev/llgo/runtime/internal/runtime.MapAssign
 func mapassign0(t *abi.Type, m unsafe.Pointer, key unsafe.Pointer) unsafe.Pointer
 
 func mapassign(t *abi.Type, m unsafe.Pointer, key, val unsafe.Pointer) {
@@ -3088,13 +3414,13 @@ func mapassign(t *abi.Type, m unsafe.Pointer, key, val unsafe.Pointer) {
 // 	mapassign_faststr0(t, m, key, val)
 // }
 
-//go:linkname mapdelete github.com/goplus/llgo/runtime/internal/runtime.MapDelete
+//go:linkname mapdelete github.com/xgo-dev/llgo/runtime/internal/runtime.MapDelete
 func mapdelete(t *abi.Type, m unsafe.Pointer, key unsafe.Pointer)
 
 //go:noescape
 // func mapdelete_faststr(t *abi.Type, m unsafe.Pointer, key string)
 
-//go:linkname mapiterinit github.com/goplus/llgo/runtime/internal/runtime.mapiterinit
+//go:linkname mapiterinit github.com/xgo-dev/llgo/runtime/internal/runtime.mapiterinit
 func mapiterinit(t *abi.Type, m unsafe.Pointer, it *hiter)
 
 func mapiterkey(it *hiter) (key unsafe.Pointer) {
@@ -3105,14 +3431,17 @@ func mapiterelem(it *hiter) (elem unsafe.Pointer) {
 	return it.elem
 }
 
-//go:linkname mapiternext github.com/goplus/llgo/runtime/internal/runtime.mapiternext
+//go:linkname mapiternext github.com/xgo-dev/llgo/runtime/internal/runtime.mapiternext
 func mapiternext(it *hiter)
 
-//go:linkname mapclear github.com/goplus/llgo/runtime/internal/runtime.mapclear
+//go:linkname mapclear github.com/xgo-dev/llgo/runtime/internal/runtime.mapclear
 func mapclear(t *abi.Type, m unsafe.Pointer)
 
-//go:linkname typehash github.com/goplus/llgo/runtime/internal/runtime.typehash
+//go:linkname typehash github.com/xgo-dev/llgo/runtime/internal/runtime.typehashImpl
 func typehash(t *abi.Type, p unsafe.Pointer, h uintptr) uintptr
+
+//go:linkname makechan github.com/xgo-dev/llgo/runtime/internal/runtime.NewChan
+func makechan(eltSize, cap int) unsafe.Pointer
 
 // MakeSlice creates a new zero-initialized slice value
 // for the specified slice type, length, and capacity.
@@ -3134,6 +3463,22 @@ func MakeSlice(typ Type, len, cap int) Value {
 	return Value{&typ.(*rtype).t, unsafe.Pointer(&s), flagIndir | flag(Slice)}
 }
 
+// MakeChan creates a new channel with the specified type and buffer size.
+func MakeChan(typ Type, buffer int) Value {
+	if typ.Kind() != Chan {
+		panic("reflect.MakeChan of non-chan type")
+	}
+	if buffer < 0 {
+		panic("reflect.MakeChan: negative buffer size")
+	}
+	if typ.ChanDir() != BothDir {
+		panic("reflect.MakeChan: unidirectional channel type")
+	}
+	t := typ.common()
+	ch := makechan(int(t.Elem().Size()), buffer)
+	return Value{t, ch, flag(Chan)}
+}
+
 // MakeMap creates a new map with the specified type.
 func MakeMap(typ Type) Value {
 	return MakeMapWithSize(typ, 0)
@@ -3150,5 +3495,69 @@ func MakeMapWithSize(typ Type, n int) Value {
 	return Value{t, m, flag(Map)}
 }
 
-//go:linkname ifaceE2I github.com/goplus/llgo/runtime/internal/runtime.IfaceE2I
+// Comparable reports whether the value v is comparable.
+// If the type of v is an interface, this checks the dynamic type.
+// If this reports true then v.Interface() == x will not panic for any x,
+// nor will v.Equal(u) for any Value u.
+func (v Value) Comparable() bool {
+	k := v.Kind()
+	switch k {
+	case Invalid:
+		return false
+
+	case Array:
+		switch v.Type().Elem().Kind() {
+		case Interface, Array, Struct:
+			for i := 0; i < v.Type().Len(); i++ {
+				if !v.Index(i).Comparable() {
+					return false
+				}
+			}
+			return true
+		}
+		return v.Type().Comparable()
+
+	case Interface:
+		return v.IsNil() || v.Elem().Comparable()
+
+	case Struct:
+		for i := 0; i < v.NumField(); i++ {
+			if !v.Field(i).Comparable() {
+				return false
+			}
+		}
+		return true
+
+	default:
+		return v.Type().Comparable()
+	}
+}
+
+// Clear clears the contents of a map or zeros the contents of a slice.
+//
+// It panics if v's Kind is not [Map] or [Slice].
+func (v Value) Clear() {
+	switch v.Kind() {
+	case Slice:
+		sh := *(*unsafeheaderSlice)(v.ptr)
+		if sh.Len == 0 || sh.Data == nil {
+			return
+		}
+		st := (*sliceType)(unsafe.Pointer(v.typ()))
+		elem := st.Elem
+		step := elem.Size()
+		for i := 0; i < sh.Len; i++ {
+			typedmemclr(elem, unsafe.Add(sh.Data, uintptr(i)*step))
+		}
+	case Map:
+		mapclear(v.typ(), v.pointer())
+	default:
+		panic(&ValueError{"reflect.Value.Clear", v.Kind()})
+	}
+}
+
+//go:linkname sliceclear github.com/xgo-dev/llgo/runtime/internal/runtime.SliceClear
+func sliceclear(t *abi.Type, s unsafeheaderSlice)
+
+//go:linkname ifaceE2I github.com/xgo-dev/llgo/runtime/internal/runtime.IfaceE2I
 func ifaceE2I(t *abi.Type, src any, dst unsafe.Pointer)

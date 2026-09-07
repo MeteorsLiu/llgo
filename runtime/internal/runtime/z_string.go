@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2024 The GoPlus Authors (goplus.org). All rights reserved.
+ * Copyright (c) 2024 The XGo Authors (xgo.dev). All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -19,7 +19,7 @@ package runtime
 import (
 	"unsafe"
 
-	c "github.com/goplus/llgo/runtime/internal/clite"
+	c "github.com/xgo-dev/llgo/runtime/internal/clite"
 )
 
 // -----------------------------------------------------------------------------
@@ -60,13 +60,24 @@ func CStrDup(s String) *int8 {
 }
 
 func StringSlice(base String, i, j int) String {
-	if i < 0 || j < i || j > base.len {
-		panic("string slice index out of bounds")
+	return StringSlice2(base, int64(i), int64(j), true, true)
+}
+
+func StringSlice2(base String, i, j int64, iSigned, jSigned bool) String {
+	if boundsOutOfRange(j, jSigned, base.len, true) {
+		panicBounds(j, jSigned, base.len, boundsSliceAlen)
 	}
-	if i < base.len {
-		return String{c.Advance(base.data, i), j - i}
+	if boundsAbove(i, iSigned, j) {
+		panicBounds(i, iSigned, int(j), boundsSliceB)
 	}
-	return String{nil, 0}
+	ii := int(i)
+	jj := int(j)
+	if ii < base.len {
+		return String{c.Advance(base.data, ii), jj - ii}
+	}
+	// Keep the source base for empty suffix slices to avoid advancing past
+	// the underlying allocation while still preserving a stable non-nil base.
+	return String{base.data, 0}
 }
 
 type StringIter struct {
@@ -95,7 +106,7 @@ func StringIterNext(it *StringIter) (ok bool, k int, v rune) {
 
 func StringToBytes(s String) []byte {
 	if s.len == 0 {
-		return nil
+		return []byte{}
 	}
 	data := make([]byte, s.len)
 	c.Memcpy(unsafe.Pointer(&data[0]), s.data, uintptr(s.len))
@@ -104,7 +115,7 @@ func StringToBytes(s String) []byte {
 
 func StringToRunes(s string) []rune {
 	if len(s) == 0 {
-		return nil
+		return []rune{}
 	}
 	data := make([]rune, len(s))
 	var index uint
@@ -121,6 +132,9 @@ func StringToRunes(s string) []rune {
 }
 
 func StringFromCStr(cstr *int8) (s String) {
+	if cstr == nil {
+		return
+	}
 	return StringFrom(unsafe.Pointer(cstr), int(c.Strlen(cstr)))
 }
 
@@ -159,6 +173,22 @@ func StringFromRune(r rune) (s String) {
 	s.len = n
 	s.data = unsafe.Pointer(&buf[0])
 	return
+}
+
+func StringFromInt64(r int64) String {
+	if r < 0 || r > maxRune {
+		return StringFromRune(runeError)
+	}
+	// StringFromRune handles surrogate code points by emitting runeError.
+	return StringFromRune(rune(r))
+}
+
+func StringFromUint64(r uint64) String {
+	if r > maxRune {
+		return StringFromRune(runeError)
+	}
+	// StringFromRune handles surrogate code points by emitting runeError.
+	return StringFromRune(rune(r))
 }
 
 func StringEqual(x, y String) bool {

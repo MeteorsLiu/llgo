@@ -1,0 +1,40 @@
+#include "LLGOLTOPasses.h"
+
+#include "llvm/Config/llvm-config.h"
+#include "llvm/Passes/PassBuilder.h"
+#include "llvm/Plugins/PassPlugin.h"
+#include "llvm/Support/Compiler.h"
+
+using namespace llvm;
+
+PassPluginLibraryInfo getLLGOLTOPluginInfo() {
+  return {LLVM_PLUGIN_API_VERSION, "llgo-lto-plugin", LLVM_VERSION_STRING,
+          [](PassBuilder &PB) {
+            PB.registerPipelineParsingCallback(
+                [](StringRef Name, ModulePassManager &MPM,
+                   ArrayRef<PassBuilder::PipelineElement>) {
+                  if (Name == llgo::LLGOInterfaceMethodTypeIDPassName) {
+                    llgo::addLLGOInterfaceMethodTypeIDPass(MPM);
+                    return true;
+                  }
+                  if (Name == llgo::LLGOPreGlobalDCEPassName) {
+                    llgo::addLLGOPreGlobalDCEPipeline(MPM);
+                    return true;
+                  }
+                  return false;
+                });
+
+            PB.registerFullLinkTimeOptimizationEarlyEPCallback(
+                [](ModulePassManager &MPM, OptimizationLevel) {
+                  llgo::addLLGOPreGlobalDCEPipeline(MPM);
+                });
+            PB.registerFullLinkTimeOptimizationLastEPCallback(
+                [](ModulePassManager &MPM, OptimizationLevel) {
+                  llgo::addLLGOTypeIDExportCleanupPass(MPM);
+                });
+          }};
+}
+
+extern "C" LLVM_ATTRIBUTE_WEAK PassPluginLibraryInfo llvmGetPassPluginInfo() {
+  return getLLGOLTOPluginInfo();
+}

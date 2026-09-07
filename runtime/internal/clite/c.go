@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2024 The GoPlus Authors (goplus.org). All rights reserved.
+ * Copyright (c) 2024 The XGo Authors (xgo.dev). All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -18,10 +18,6 @@ package c
 
 import (
 	"unsafe"
-)
-
-const (
-	LLGoPackage = "decl"
 )
 
 type (
@@ -55,7 +51,9 @@ type integer interface {
 }
 
 type SizeT = uintptr
-type SsizeT = Long
+
+// ssize_t is the pointer-sized signed integer in every supported C data model.
+type SsizeT = int
 
 type IntptrT = uintptr
 type UintptrT = uintptr
@@ -267,11 +265,6 @@ type IconvT = Pointer
 // -----------------------------------------------------------------------------
 
 type LocaleT = Pointer
-
-// -----------------------------------------------------------------------------
-
-//go:linkname Usleep C.usleep
-func Usleep(useconds Uint) Int
 
 // -----------------------------------------------------------------------------
 

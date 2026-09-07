@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2024 The GoPlus Authors (goplus.org). All rights reserved.
+ * Copyright (c) 2024 The XGo Authors (xgo.dev). All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -19,9 +19,9 @@ package ssa
 import (
 	"fmt"
 	"go/types"
-	"log"
 
-	"github.com/goplus/llvm"
+	"github.com/xgo-dev/llgo/ssa/abi"
+	"github.com/xgo-dev/llvm"
 )
 
 // -----------------------------------------------------------------------------
@@ -40,10 +40,9 @@ import (
 //
 //	t1 = &t0.name [#1]
 func (b Builder) FieldAddr(x Expr, idx int) Expr {
-	if debugInstr {
-		log.Printf("FieldAddr %v, %d\n", x.impl, idx)
-	}
+	dbgInstrf("FieldAddr %v, %d\n", x.impl, idx)
 	prog := b.Prog
+	b.assertStaticNilDeref(x)
 	tstruc := prog.Elem(x.Type)
 	telem := prog.Field(tstruc, idx)
 	pt := prog.Pointer(telem)
@@ -52,24 +51,21 @@ func (b Builder) FieldAddr(x Expr, idx int) Expr {
 
 // The Field instruction yields the value of Field of struct X.
 func (b Builder) Field(x Expr, idx int) Expr {
-	if debugInstr {
-		log.Printf("Field %v, %d\n", x.impl, idx)
-	}
+	dbgInstrf("Field %v, %d\n", x.impl, idx)
 	return b.getField(x, idx)
 }
 
 func (b Builder) getField(x Expr, idx int) Expr {
 	tfld := b.Prog.Field(x.Type, idx)
 	fld := llvm.CreateExtractValue(b.impl, x.impl, idx)
+	fld = b.unwrapStructField(x.Type, idx, fld)
 	return Expr{fld, tfld}
 }
 
 // -----------------------------------------------------------------------------
 
 func (b Builder) Complex(r, i Expr) Expr {
-	if debugInstr {
-		log.Printf("Complex %v, %v\n", r.impl, i.impl)
-	}
+	dbgInstrf("Complex %v, %v\n", r.impl, i.impl)
 	prog := b.Prog
 	var t Type
 	switch kind := r.raw.Type.Underlying().(*types.Basic).Kind(); kind {
@@ -83,9 +79,7 @@ func (b Builder) Complex(r, i Expr) Expr {
 
 // MakeString creates a new string from a C string pointer and length.
 func (b Builder) MakeString(cstr Expr, n ...Expr) (ret Expr) {
-	if debugInstr {
-		log.Printf("MakeString %v\n", cstr.impl)
-	}
+	dbgInstrf("MakeString %v\n", cstr.impl)
 	pkg := b.Pkg
 	prog := b.Prog
 	ret.Type = prog.String()
@@ -100,18 +94,14 @@ func (b Builder) MakeString(cstr Expr, n ...Expr) (ret Expr) {
 
 // StringData returns the data pointer of a string.
 func (b Builder) StringData(x Expr) Expr {
-	if debugInstr {
-		log.Printf("StringData %v\n", x.impl)
-	}
+	dbgInstrf("StringData %v\n", x.impl)
 	ptr := llvm.CreateExtractValue(b.impl, x.impl, 0)
-	return Expr{ptr, b.Prog.CStr()}
+	return Expr{ptr, b.Prog.Pointer(b.Prog.Byte())}
 }
 
 // StringLen returns the length of a string.
 func (b Builder) StringLen(x Expr) Expr {
-	if debugInstr {
-		log.Printf("StringLen %v\n", x.impl)
-	}
+	dbgInstrf("StringLen %v\n", x.impl)
 	ptr := llvm.CreateExtractValue(b.impl, x.impl, 1)
 	return Expr{ptr, b.Prog.Int()}
 }
@@ -120,9 +110,7 @@ func (b Builder) StringLen(x Expr) Expr {
 
 // SliceData returns the data pointer of a slice.
 func (b Builder) SliceData(x Expr) Expr {
-	if debugInstr {
-		log.Printf("SliceData %v\n", x.impl)
-	}
+	dbgInstrf("SliceData %v\n", x.impl)
 	ptr := llvm.CreateExtractValue(b.impl, x.impl, 0)
 	ty := x.Type.RawType()
 	tySlice := ty.Underlying().(*types.Slice)
@@ -131,18 +119,14 @@ func (b Builder) SliceData(x Expr) Expr {
 
 // SliceLen returns the length of a slice.
 func (b Builder) SliceLen(x Expr) Expr {
-	if debugInstr {
-		log.Printf("SliceLen %v\n", x.impl)
-	}
+	dbgInstrf("SliceLen %v\n", x.impl)
 	ptr := llvm.CreateExtractValue(b.impl, x.impl, 1)
 	return Expr{ptr, b.Prog.Int()}
 }
 
 // SliceCap returns the length of a slice cap.
 func (b Builder) SliceCap(x Expr) Expr {
-	if debugInstr {
-		log.Printf("SliceCap %v\n", x.impl)
-	}
+	dbgInstrf("SliceCap %v\n", x.impl)
 	ptr := llvm.CreateExtractValue(b.impl, x.impl, 2)
 	return Expr{ptr, b.Prog.Int()}
 }
@@ -162,9 +146,7 @@ func (b Builder) SliceCap(x Expr) Expr {
 //
 //	t2 = &t0[t1]
 func (b Builder) IndexAddr(x, idx Expr) Expr {
-	if debugInstr {
-		log.Printf("IndexAddr %v, %v\n", x.impl, idx.impl)
-	}
+	dbgInstrf("IndexAddr %v, %v\n", x.impl, idx.impl)
 	prog := b.Prog
 	telem := prog.Index(x.Type)
 	pt := prog.Pointer(telem)
@@ -179,9 +161,28 @@ func (b Builder) IndexAddr(x, idx Expr) Expr {
 		ar := t.Elem().Underlying().(*types.Array)
 		max := prog.IntVal(uint64(ar.Len()), prog.Int())
 		idx = b.checkIndex(idx, max)
+		if !isKnownNonNilArrayBase(x.impl) {
+			b.AssertNilDeref(x)
+		}
 	}
 	indices := []llvm.Value{idx.impl}
 	return Expr{llvm.CreateInBoundsGEP(b.impl, telem.ll, x.impl, indices), pt}
+}
+
+func isKnownNonNilArrayBase(v llvm.Value) bool {
+	if !v.IsAGlobalValue().IsNil() || !v.IsAAllocaInst().IsNil() {
+		return true
+	}
+	if call := v.IsACallInst(); !call.IsNil() {
+		if fn := call.CalledValue().IsAFunction(); !fn.IsNil() {
+			switch fn.Name() {
+			case "github.com/xgo-dev/llgo/runtime/internal/runtime.AllocU",
+				"github.com/xgo-dev/llgo/runtime/internal/runtime.AllocZ":
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func isConstantInt(x Expr) (v int64, ok bool) {
@@ -233,30 +234,65 @@ func checkRange(idx Expr, max Expr) (checkMin, checkMax bool) {
 	return
 }
 
+func (b Builder) boundsArg(idx Expr) (Expr, bool) {
+	signed := idx.kind == vkSigned
+	typ := b.Prog.Int64()
+	if idx.impl.Type() != typ.ll {
+		idx.impl = castInt(b, idx.impl, idx.Type, typ)
+	}
+	idx.Type = typ
+	return idx, signed
+}
+
 // check index >= 0 && index < max and size to uint
 func (b Builder) checkIndex(idx Expr, max Expr) Expr {
 	prog := b.Prog
-	// check range
-	checkMin, checkMax := checkRange(idx, max)
-	// fit size
+	var checkMin, checkMax bool
+	if !prog.disableBoundsChecks {
+		checkMin, checkMax = checkRange(idx, max)
+	}
+	// GEP indexes use the native word size. Keep a wider index intact until
+	// after its bounds check: truncating first can turn an out-of-range uint64
+	// into an apparently valid 32-bit index.
+	signed := idx.kind == vkSigned
 	var typ Type
-	if idx.kind == vkSigned {
+	if signed {
 		typ = prog.Int()
 	} else {
 		typ = prog.Uint()
 	}
-	if prog.SizeOf(idx.Type) != prog.SizeOf(typ) {
-		idx.Type = typ
-		idx.impl = castUintptr(b, idx.impl, typ)
+	toNative := func(idx Expr) Expr {
+		if prog.SizeOf(idx.Type) != prog.SizeOf(typ) {
+			srcType := idx.Type
+			idx.Type = typ
+			idx.impl = castUintptr(b, idx.impl, srcType, typ)
+		}
+		return idx
+	}
+	if prog.disableBoundsChecks {
+		return toNative(idx)
+	}
+	extended := prog.SizeOf(idx.Type) > prog.SizeOf(typ)
+	nativeIdx := idx
+	if !extended {
+		nativeIdx = toNative(idx)
+	}
+	checkIdx, checkLimit := nativeIdx, max
+	if extended {
+		checkIdx, _ = b.boundsArg(idx)
+		checkLimit, _ = b.boundsArg(max)
 	}
 	// check range expr
 	var check Expr
 	if checkMin {
-		zero := llvm.ConstInt(idx.ll, 0, false)
-		check = Expr{llvm.CreateICmp(b.impl, llvm.IntSLT, idx.impl, zero), prog.Bool()}
+		zero := llvm.ConstInt(checkIdx.ll, 0, false)
+		check = Expr{llvm.CreateICmp(b.impl, llvm.IntSLT, checkIdx.impl, zero), prog.Bool()}
 	}
 	if checkMax {
-		r := Expr{llvm.CreateICmp(b.impl, llvm.IntSGE, idx.impl, max.impl), prog.Bool()}
+		// max is a non-negative len/cap value. Unsigned comparison is valid for
+		// both signed and unsigned indexes, and signed negatives fail as large
+		// unsigned values.
+		r := Expr{llvm.CreateICmp(b.impl, llvm.IntUGE, checkIdx.impl, checkLimit.impl), prog.Bool()}
 		if check.IsNil() {
 			check = r
 		} else {
@@ -264,9 +300,44 @@ func (b Builder) checkIndex(idx Expr, max Expr) Expr {
 		}
 	}
 	if !check.IsNil() {
-		b.InlineCall(b.Pkg.rtFunc("AssertIndexRange"), check)
+		blks := b.Func.MakeBlocks(2)
+		b.If(check, blks[0], blks[1])
+		b.SetBlockEx(blks[0], AtEnd, false)
+		panicIndex := "PanicIndexU"
+		if signed {
+			panicIndex = "PanicIndex"
+		}
+		if extended {
+			panicIndex = "PanicExtendIndexU"
+			if signed {
+				panicIndex = "PanicExtendIndex"
+			}
+			checkBytes := prog.SizeOf(checkIdx.Type)
+			wordBytes := prog.SizeOf(prog.Uint())
+			if checkBytes != 8 || wordBytes != 4 {
+				panic(fmt.Sprintf("ssa: extended index split requires 64-bit index and 32-bit word, got %d-bit index and %d-bit word", checkBytes*8, wordBytes*8))
+			}
+			lo := Expr{castInt(b, checkIdx.impl, checkIdx.Type, prog.Uint()), prog.Uint()}
+			hi64 := llvm.CreateLShr(b.impl, checkIdx.impl, llvm.ConstInt(checkIdx.ll, uint64(wordBytes*8), false))
+			hiType := prog.Uint()
+			if signed {
+				hiType = prog.Int()
+			}
+			hi := Expr{castInt(b, hi64, prog.Uint64(), hiType), hiType}
+			b.InlineCall(b.Pkg.rtFunc(panicIndex), hi, lo, max)
+		} else {
+			b.InlineCall(b.Pkg.rtFunc(panicIndex), nativeIdx, max)
+		}
+		// Keep the failure path disconnected from the successful continuation,
+		// while retaining a post-call instruction for return-address line info.
+		b.Jump(blks[0])
+		b.SetBlockEx(blks[1], AtEnd, false)
+		b.blk.last = blks[1].last
 	}
-	return idx
+	if extended {
+		nativeIdx = toNative(idx)
+	}
+	return nativeIdx
 }
 
 // The Index instruction yields element Index of collection X, an array,
@@ -277,9 +348,7 @@ func (b Builder) checkIndex(idx Expr, max Expr) Expr {
 //
 //	t2 = t0[t1]
 func (b Builder) Index(x, idx Expr, takeAddr func() (addr Expr, zero bool)) Expr {
-	if debugInstr {
-		log.Printf("Index %v, %v\n", x.impl, idx.impl)
-	}
+	dbgInstrf("Index %v, %v\n", x.impl, idx.impl)
 	prog := b.Prog
 	var telem Type
 	var ptr Expr
@@ -303,9 +372,6 @@ func (b Builder) Index(x, idx Expr, takeAddr func() (addr Expr, zero bool)) Expr
 		return prog.Zero(telem)
 	}
 	if ptr.IsNil() {
-		if x.impl.IsConstant() {
-			return Expr{llvm.ConstExtractElement(x.impl, idx.impl), telem}
-		}
 		ptr = b.Alloc(x.Type, false)
 		b.impl.CreateStore(x.impl, ptr.impl)
 	}
@@ -330,16 +396,33 @@ func (b Builder) Index(x, idx Expr, takeAddr func() (addr Expr, zero bool)) Expr
 //
 //	t1 = slice t0[1:]
 func (b Builder) Slice(x, low, high, max Expr) (ret Expr) {
-	if debugInstr {
-		log.Printf("Slice %v, %v, %v\n", x.impl, low.impl, high.impl)
-	}
+	dbgInstrf("Slice %v, %v, %v\n", x.impl, low.impl, high.impl)
 	prog := b.Prog
 	var nCap Expr
 	var nEltSize Expr
 	var base Expr
 	var lowIsNil = low.IsNil()
+	var lowArg Expr
+	var highArg Expr
+	var maxArg Expr
+	var lowSigned = true
+	var highSigned = true
+	var maxSigned = true
+	var upperIsLen bool
 	if lowIsNil {
 		low = prog.IntVal(0, prog.Int())
+		lowArg = prog.IntVal(0, prog.Int64())
+	} else {
+		lowArg, lowSigned = b.boundsArg(low)
+		low = b.FitIntSize(low)
+	}
+	if !high.IsNil() {
+		highArg, highSigned = b.boundsArg(high)
+		high = b.FitIntSize(high)
+	}
+	if !max.IsNil() {
+		maxArg, maxSigned = b.boundsArg(max)
+		max = b.FitIntSize(max)
 	}
 	switch t := x.raw.Type.Underlying().(type) {
 	case *types.Basic:
@@ -348,15 +431,21 @@ func (b Builder) Slice(x, low, high, max Expr) (ret Expr) {
 		}
 		if high.IsNil() {
 			high = b.StringLen(x)
+			highArg, highSigned = b.boundsArg(high)
 		}
 		ret.Type = x.Type
-		ret.impl = b.InlineCall(b.Pkg.rtFunc("StringSlice"), x, low, high).impl
+		if prog.disableBoundsChecks {
+			ret.impl = b.stringSliceUnchecked(x, low, high).impl
+		} else {
+			ret.impl = b.InlineCall(b.Pkg.rtFunc("StringSlice2"), x, lowArg, highArg, prog.BoolVal(lowSigned), prog.BoolVal(highSigned)).impl
+		}
 		return
 	case *types.Slice:
 		nEltSize = SizeOf(prog, prog.Index(x.Type))
 		nCap = b.SliceCap(x)
 		if high.IsNil() {
 			high = b.SliceLen(x)
+			highArg, highSigned = b.boundsArg(high)
 		}
 		ret.Type = x.Type
 		base = b.SliceData(x)
@@ -368,21 +457,78 @@ func (b Builder) Slice(x, low, high, max Expr) (ret Expr) {
 			ret.Type = prog.Slice(elem)
 			nEltSize = SizeOf(prog, elem)
 			nCap = prog.IntVal(uint64(te.Len()), prog.Int())
+			upperIsLen = true
 			if high.IsNil() {
-				if lowIsNil && max.IsNil() {
+				if lowIsNil && max.IsNil() && !prog.disableBoundsChecks {
 					ret.impl = b.unsafeSlice(x, nCap.impl, nCap.impl).impl
 					return
 				}
 				high = nCap
+				highArg, highSigned = b.boundsArg(high)
 			}
 			base = x
 		}
 	}
-	if max.IsNil() {
-		max = nCap
+	if prog.disableBoundsChecks {
+		if _, ok := x.raw.Type.Underlying().(*types.Pointer); ok && !isKnownNonNilArrayBase(x.impl) {
+			b.AssertNilDeref(x)
+		}
+		upper := nCap
+		if !max.IsNil() {
+			upper = max
+		}
+		ret.impl = b.sliceUnchecked(ret.Type, base, low, high, upper).impl
+		return
 	}
-	ret.impl = b.InlineCall(b.Pkg.rtFunc("NewSlice3"), base, nEltSize, nCap, low, high, max).impl
+	if max.IsNil() {
+		ret.impl = b.InlineCall(
+			b.Pkg.rtFunc("NewSlice2"),
+			base,
+			nEltSize,
+			nCap,
+			lowArg,
+			highArg,
+			prog.BoolVal(lowSigned),
+			prog.BoolVal(highSigned),
+			prog.BoolVal(upperIsLen),
+		).impl
+		return
+	}
+	ret.impl = b.InlineCall(
+		b.Pkg.rtFunc("NewSlice3Bounds"),
+		base,
+		nEltSize,
+		nCap,
+		lowArg,
+		highArg,
+		maxArg,
+		prog.BoolVal(lowSigned),
+		prog.BoolVal(highSigned),
+		prog.BoolVal(maxSigned),
+		prog.BoolVal(upperIsLen),
+	).impl
 	return
+}
+
+func (b Builder) stringSliceUnchecked(x, low, high Expr) Expr {
+	data := b.StringData(x)
+	advanced := b.Advance(data, low)
+	beforeEnd := llvm.CreateICmp(b.impl, llvm.IntSLT, low.impl, b.StringLen(x).impl)
+	data.impl = llvm.CreateSelect(b.impl, beforeEnd, advanced.impl, data.impl)
+	length := b.impl.CreateSub(high.impl, low.impl, "")
+	return b.unsafeString(data.impl, length)
+}
+
+func (b Builder) sliceUnchecked(t Type, base, low, high, upper Expr) Expr {
+	length := b.impl.CreateSub(high.impl, low.impl, "")
+	capacity := b.impl.CreateSub(upper.impl, low.impl, "")
+	advanced := b.Advance(base, low)
+	zero := llvm.ConstInt(capacity.Type(), 0, false)
+	hasCapacity := llvm.CreateICmp(b.impl, llvm.IntSGT, capacity, zero)
+	base.impl = llvm.CreateSelect(b.impl, hasCapacity, advanced.impl, base.impl)
+	ret := b.unsafeSlice(base, length, capacity)
+	ret.Type = t
+	return ret
 }
 
 // SliceLit creates a new slice with the specified elements.
@@ -412,26 +558,43 @@ func (b Builder) SliceLit(t Type, elts ...Expr) Expr {
 //	t1 = make []string 1:int t0
 //	t1 = make StringSlice 1:int t0
 func (b Builder) MakeSlice(t Type, len, cap Expr) (ret Expr) {
-	if debugInstr {
-		log.Printf("MakeSlice %v, %v, %v\n", t.RawType(), len.impl, cap.impl)
-	}
+	dbgInstrf("MakeSlice %v, %v, %v\n", t.RawType(), len.impl, cap.impl)
 	prog := b.Prog
-	len = b.fitIntSize(len)
-	cap = b.fitIntSize(cap)
 	telem := prog.Index(t)
-	ret = b.InlineCall(b.Pkg.rtFunc("MakeSlice"), len, cap, prog.IntVal(prog.SizeOf(telem), prog.Int()))
+	fn := "MakeSlice"
+	if prog.SizeOf(len.Type) > prog.SizeOf(prog.Int()) || prog.SizeOf(cap.Type) > prog.SizeOf(prog.Int()) {
+		fn = "MakeSlice64"
+		len = b.fitInt64(len)
+		cap = b.fitInt64(cap)
+	} else {
+		len = b.FitIntSize(len)
+		cap = b.FitIntSize(cap)
+	}
+	ret = b.InlineCall(b.Pkg.rtFunc(fn), len, cap, prog.IntVal(prog.SizeOf(telem), prog.Int()))
 	ret.Type = t
 	return
 }
 
 // fit size to int
-func (b Builder) fitIntSize(n Expr) Expr {
+func (b Builder) FitIntSize(n Expr) Expr {
 	prog := b.Prog
 	typ := prog.Int()
 	if prog.SizeOf(n.Type) != prog.SizeOf(typ) {
-		n.Type = typ
-		n.impl = castInt(b, n.impl, typ)
+		srcType := n.Type
+		n.impl = castInt(b, n.impl, srcType, typ)
 	}
+	n.Type = typ
+	return n
+}
+
+// fitInt64 applies the conversion used for runtime's 64-bit make helpers.
+// Equal-width signed and unsigned inputs have the same i64 representation.
+func (b Builder) fitInt64(n Expr) Expr {
+	typ := b.Prog.Int64()
+	if n.impl.Type() != typ.ll {
+		n.impl = castInt(b, n.impl, n.Type, typ)
+	}
+	n.Type = typ
 	return n
 }
 
@@ -447,12 +610,11 @@ func (b Builder) fitIntSize(n Expr) Expr {
 //	t1 = make map[string]int t0
 //	t1 = make StringIntMap t0
 func (b Builder) MakeMap(t Type, nReserve Expr) (ret Expr) {
-	if debugInstr {
-		log.Printf("MakeMap %v, %v\n", t.RawType(), nReserve.impl)
-	}
+	dbgInstrf("MakeMap %v, %v\n", t.RawType(), nReserve.impl)
 	if nReserve.IsNil() {
 		nReserve = b.Prog.Val(0)
 	}
+	nReserve = b.FitIntSize(nReserve)
 	typ := b.abiType(t.raw.Type)
 	ret = b.InlineCall(b.Pkg.rtFunc("MakeMap"), typ, nReserve)
 	ret.Type = t
@@ -471,21 +633,31 @@ func (b Builder) MakeMap(t Type, nReserve Expr) (ret Expr) {
 //	t2 = t0[t1]
 //	t5 = t3[t4],ok
 func (b Builder) Lookup(x, key Expr, commaOk bool) (ret Expr) {
-	if debugInstr {
-		log.Printf("Lookup %v, %v, %v\n", x.impl, key.impl, commaOk)
-	}
+	dbgInstrf("Lookup %v, %v, %v\n", x.impl, key.impl, commaOk)
 	prog := b.Prog
 	typ := b.abiType(x.raw.Type)
 	vtyp := prog.Elem(x.Type)
-	ptr := b.mapKeyPtr(key)
+	vsize := prog.SizeOf(vtyp)
+	kind := mapKeyFastKind(prog, x.raw.Type)
+	arg := b.mapKeyAccessArg(x, key, kind)
+	name := kind.accessName(commaOk)
+	args := []Expr{typ, x, arg}
+	if vsize > abi.ZeroValSize {
+		if commaOk {
+			name = "MapAccess2Fat"
+		} else {
+			name = "MapAccess1Fat"
+		}
+		args = append(args, b.Pkg.mapZeroAddr(vsize, prog.td.ABITypeAlignment(vtyp.ll)))
+	}
 	if commaOk {
-		vals := b.Call(b.Pkg.rtFunc("MapAccess2"), typ, x, ptr)
+		vals := b.Call(b.Pkg.rtFunc(name), args...)
 		val := b.Load(Expr{b.impl.CreateExtractValue(vals.impl, 0, ""), prog.Pointer(vtyp)})
 		ok := b.impl.CreateExtractValue(vals.impl, 1, "")
 		t := prog.Struct(vtyp, prog.Bool())
 		return b.aggregateValue(t, val.impl, ok)
 	} else {
-		val := b.Call(b.Pkg.rtFunc("MapAccess1"), typ, x, ptr)
+		val := b.Call(b.Pkg.rtFunc(name), args...)
 		val.Type = prog.Pointer(vtyp)
 		ret = b.Load(val)
 	}
@@ -502,21 +674,178 @@ func (b Builder) Lookup(x, key Expr, commaOk bool) (ret Expr) {
 //
 //	t0[t1] = t2
 func (b Builder) MapUpdate(m, k, v Expr) {
-	if debugInstr {
-		log.Printf("MapUpdate %v[%v] = %v\n", m.impl, k.impl, v.impl)
+	// Convert function declarations to proper closure form when stored in maps.
+	// This ensures function values are correctly wrapped as closures, similar to
+	// interface assignment (see MakeInterface).
+	if v.kind == vkFuncDecl {
+		typ := b.Prog.Type(v.raw.Type, InGo)
+		v = checkExpr(v, typ.raw.Type, b)
 	}
+	dbgInstrf("MapUpdate %v[%v] = %v\n", m.impl, k.impl, v.impl)
 	typ := b.abiType(m.raw.Type)
-	ptr := b.mapKeyPtr(k)
-	ret := b.Call(b.Pkg.rtFunc("MapAssign"), typ, m, ptr)
+	kind := mapKeyFastKind(b.Prog, m.raw.Type)
+	arg := b.mapKeyAssignArg(m, k, kind)
+	ret := b.Call(b.Pkg.rtFunc(kind.assignName()), typ, m, arg)
 	ret.Type = b.Prog.Pointer(v.Type)
 	b.Store(ret, v)
 }
 
-// key => unsafe.Pointer
-func (b Builder) mapKeyPtr(x Expr) Expr {
-	typ := x.Type
+type mapFastKind uint8
+
+const (
+	mapFastNone mapFastKind = iota
+	mapFast32
+	mapFast64
+	mapFast32Ptr
+	mapFast64Ptr
+	mapFastStr
+)
+
+func mapKeyFastKind(prog Program, mapType types.Type) mapFastKind {
+	m, ok := types.Unalias(mapType).Underlying().(*types.Map)
+	if !ok {
+		return mapFastNone
+	}
+	// The specialized runtime map operations return direct bucket storage.
+	// Large values are stored indirectly by the map implementation, so use
+	// the generic operations to preserve their pointer indirection semantics.
+	if prog.SizeOf(prog.rawType(m.Elem())) > abi.MAXELEMSIZE {
+		return mapFastNone
+	}
+	ptrSize := prog.PointerSize()
+	key := types.Unalias(m.Key()).Underlying()
+	switch key := key.(type) {
+	case *types.Basic:
+		switch key.Kind() {
+		case types.Int32, types.Uint32:
+			return mapFast32
+		case types.Int64, types.Uint64:
+			return mapFast64
+		case types.Int, types.Uint, types.Uintptr:
+			if ptrSize == 4 {
+				return mapFast32
+			} else if ptrSize == 8 {
+				return mapFast64
+			}
+		case types.String:
+			return mapFastStr
+		case types.UnsafePointer:
+			if ptrSize == 4 {
+				return mapFast32Ptr
+			} else if ptrSize == 8 {
+				return mapFast64Ptr
+			}
+		}
+	case *types.Pointer, *types.Chan:
+		if ptrSize == 4 {
+			return mapFast32Ptr
+		} else if ptrSize == 8 {
+			return mapFast64Ptr
+		}
+	}
+	return mapFastNone
+}
+
+func (k mapFastKind) accessName(commaOK bool) string {
+	suffix := "1"
+	if commaOK {
+		suffix = "2"
+	}
+	switch k {
+	case mapFast32, mapFast32Ptr:
+		return "MapAccess" + suffix + "Fast32"
+	case mapFast64, mapFast64Ptr:
+		return "MapAccess" + suffix + "Fast64"
+	case mapFastStr:
+		return "MapAccess" + suffix + "FastStr"
+	default:
+		return "MapAccess" + suffix
+	}
+}
+
+func (k mapFastKind) assignName() string {
+	switch k {
+	case mapFast32:
+		return "MapAssignFast32"
+	case mapFast64:
+		return "MapAssignFast64"
+	case mapFast32Ptr:
+		return "MapAssignFast32Ptr"
+	case mapFast64Ptr:
+		return "MapAssignFast64Ptr"
+	case mapFastStr:
+		return "MapAssignFastStr"
+	default:
+		return "MapAssign"
+	}
+}
+
+func (k mapFastKind) deleteName() string {
+	switch k {
+	case mapFast32, mapFast32Ptr:
+		return "MapDeleteFast32"
+	case mapFast64, mapFast64Ptr:
+		return "MapDeleteFast64"
+	case mapFastStr:
+		return "MapDeleteFastStr"
+	default:
+		return "MapDelete"
+	}
+}
+
+func (b Builder) mapKeyAccessArg(m, key Expr, kind mapFastKind) Expr {
+	switch kind {
+	case mapFast32:
+		if key.Type == b.Prog.Uint32() {
+			return key
+		}
+		return b.Convert(b.Prog.Uint32(), key)
+	case mapFast64:
+		if key.Type == b.Prog.Uint64() {
+			return key
+		}
+		return b.Convert(b.Prog.Uint64(), key)
+	case mapFast32Ptr:
+		return Expr{llvm.CreatePtrToInt(b.impl, key.impl, b.Prog.Uint32().ll), b.Prog.Uint32()}
+	case mapFast64Ptr:
+		return Expr{llvm.CreatePtrToInt(b.impl, key.impl, b.Prog.Uint64().ll), b.Prog.Uint64()}
+	case mapFastStr:
+		return key
+	default:
+		return b.mapKeyPtr(m, key)
+	}
+}
+
+func (b Builder) mapKeyAssignArg(m, key Expr, kind mapFastKind) Expr {
+	switch kind {
+	case mapFast32Ptr, mapFast64Ptr:
+		return Expr{castPtr(b.impl, key.impl, b.Prog.VoidPtr().ll), b.Prog.VoidPtr()}
+	default:
+		return b.mapKeyAccessArg(m, key, kind)
+	}
+}
+
+// mapKeyPtr allocates a temporary key value and returns it as unsafe.Pointer.
+// Use the map's declared key type for the allocation; in an instantiated
+// generic function, the expression may still use a type-parameter representation
+// with a different physical size.
+func (b Builder) mapKeyPtr(m, x Expr) Expr {
+	mapType, ok := m.raw.Type.Underlying().(*types.Map)
+	if !ok {
+		panic("mapKeyPtr called with non-map value")
+	}
+	typ := b.Prog.Type(mapType.Key(), InGo)
+	// Generic map bodies can expose either the instantiated key type or the
+	// type-parameter representation at this point. Keep the larger physical
+	// representation so runtime mapassign never reads past the temporary key.
+	if b.Prog.SizeOf(x.Type) > b.Prog.SizeOf(typ) {
+		typ = x.Type
+	}
 	vtyp := b.Prog.VoidPtr()
 	vptr := b.AllocU(typ)
+	if !types.Identical(typ.RawType(), x.RawType()) {
+		x = b.ChangeType(typ, x)
+	}
 	b.Store(vptr, x)
 	return Expr{vptr.impl, vtyp}
 }
@@ -583,17 +912,17 @@ func (b Builder) Next(typ Type, iter Expr, isString bool) Expr {
 		if i == 0 {
 			k := b.impl.CreateExtractValue(rets.impl, 1, "")
 			v := b.impl.CreateExtractValue(rets.impl, 2, "")
-			valTrue := aggregateValue(b.impl, t.ll, prog.BoolVal(true).impl,
+			valTrue := b.aggregateValue(t, prog.BoolVal(true).impl,
 				llvm.CreateLoad(b.impl, ktyp.ll, k),
 				llvm.CreateLoad(b.impl, vtyp.ll, v))
 			b.Jump(blks[2])
-			return Expr{valTrue, t}
+			return valTrue
 		}
-		valFalse := aggregateValue(b.impl, t.ll, prog.BoolVal(false).impl,
+		valFalse := b.aggregateValue(t, prog.BoolVal(false).impl,
 			llvm.ConstNull(ktyp.ll),
 			llvm.ConstNull(vtyp.ll))
 		b.Jump(blks[2])
-		return Expr{valFalse, t}
+		return valFalse
 	})
 	b.SetBlockEx(blks[2], AtEnd, false)
 	b.blk.last = blks[2].last
@@ -618,13 +947,18 @@ func (b Builder) Next(typ Type, iter Expr, isString bool) Expr {
 //		Size Value // int; size of buffer; zero => synchronous.
 //	}
 func (b Builder) MakeChan(t Type, size Expr) (ret Expr) {
-	if debugInstr {
-		log.Printf("MakeChan %v, %v\n", t.RawType(), size.impl)
-	}
+	dbgInstrf("MakeChan %v, %v\n", t.RawType(), size.impl)
 	prog := b.Prog
 	eltSize := prog.IntVal(prog.SizeOf(prog.Elem(t)), prog.Int())
+	fn := "NewChan"
+	if prog.SizeOf(size.Type) > prog.SizeOf(prog.Int()) {
+		fn = "NewChan64"
+		size = b.fitInt64(size)
+	} else {
+		size = b.FitIntSize(size)
+	}
 	ret.Type = t
-	ret.impl = b.InlineCall(b.Pkg.rtFunc("NewChan"), eltSize, size).impl
+	ret.impl = b.InlineCall(b.Pkg.rtFunc(fn), eltSize, size).impl
 	return
 }
 
@@ -636,12 +970,12 @@ func (b Builder) MakeChan(t Type, size Expr) (ret Expr) {
 //
 //	send t0 <- t1
 func (b Builder) Send(ch Expr, x Expr) (ret Expr) {
-	if debugInstr {
-		log.Printf("Send %v, %v\n", ch.impl, x.impl)
-	}
+	dbgInstrf("Send %v, %v\n", ch.impl, x.impl)
 	prog := b.Prog
 	eltSize := prog.IntVal(prog.SizeOf(prog.Elem(ch.Type)), prog.Int())
+	sp := b.StackSave()
 	ret = b.InlineCall(b.Pkg.rtFunc("ChanSend"), ch, b.toPtr(x), eltSize)
+	b.StackRestore(sp)
 	return
 }
 
@@ -654,20 +988,20 @@ func (b Builder) toPtr(x Expr) Expr {
 }
 
 func (b Builder) Recv(ch Expr, commaOk bool) (ret Expr) {
-	if debugInstr {
-		log.Printf("Recv %v, %v\n", ch.impl, commaOk)
-	}
+	dbgInstrf("Recv %v, %v\n", ch.impl, commaOk)
 	prog := b.Prog
 	eltSize := prog.IntVal(prog.SizeOf(prog.Elem(ch.Type)), prog.Int())
 	etyp := prog.Elem(ch.Type)
+	sp := b.StackSave()
 	ptr := b.Alloc(etyp, false)
 	ok := b.InlineCall(b.Pkg.rtFunc("ChanRecv"), ch, ptr, eltSize)
+	val := b.Load(ptr)
+	b.StackRestore(sp)
 	if commaOk {
-		val := b.Load(ptr)
 		t := prog.Struct(etyp, prog.Bool())
 		return b.aggregateValue(t, val.impl, ok.impl)
 	} else {
-		return b.Load(ptr)
+		return val
 	}
 }
 
@@ -715,6 +1049,7 @@ type SelectState struct {
 //	t3 = select nonblocking [<-t0, t1<-t2]
 //	t4 = select blocking []
 func (b Builder) Select(states []*SelectState, blocking bool) (ret Expr) {
+	sp := b.StackSave()
 	ops := make([]Expr, len(states))
 	for i, s := range states {
 		ops[i] = b.chanOp(s)
@@ -727,12 +1062,15 @@ func (b Builder) Select(states []*SelectState, blocking bool) (ret Expr) {
 	}
 	prog := b.Prog
 	tSlice := lastParamType(prog, fn)
-	slice := b.SliceLit(tSlice, ops...)
+	slice := b.selectOpsSlice(tSlice, ops)
 	ret = b.Call(fn, slice)
 	chosen := b.impl.CreateExtractValue(ret.impl, 0, "")
 	recvOK := b.impl.CreateExtractValue(ret.impl, 1, "")
 	if !blocking {
-		chosen = llvm.CreateSelect(b.impl, recvOK, chosen, prog.Val(-1).impl)
+		// runtime.TrySelect returns (isel, recvOK, tryOK). recvOK is only meaningful
+		// for receives; selection success is reported by tryOK.
+		tryOK := b.impl.CreateExtractValue(ret.impl, 2, "")
+		chosen = llvm.CreateSelect(b.impl, tryOK, chosen, prog.Val(-1).impl)
 	}
 	results := []llvm.Value{chosen, recvOK}
 	typs := []Type{prog.Int(), prog.Bool()}
@@ -744,7 +1082,25 @@ func (b Builder) Select(states []*SelectState, blocking bool) (ret Expr) {
 			results = append(results, r.impl)
 		}
 	}
+	b.StackRestore(sp)
 	return b.aggregateValue(b.Prog.Struct(typs...), results...)
+}
+
+func (b Builder) selectOpsSlice(t Type, ops []Expr) Expr {
+	prog := b.Prog
+	telem := prog.Index(t)
+	size := SizeOf(prog, telem, int64(len(ops)))
+	opPtr := Expr{b.Alloca(size).impl, prog.Pointer(telem)}
+	for i, op := range ops {
+		b.Store(b.Advance(opPtr, prog.Val(i)), op)
+	}
+	n := llvm.ConstInt(prog.tyInt(), uint64(len(ops)), false)
+	return b.unsafeSlice(opPtr, n, n)
+}
+
+func lastParamType(prog Program, fn Expr) Type {
+	params := fn.raw.Type.(*types.Signature).Params()
+	return prog.rawType(params.At(params.Len() - 1).Type())
 }
 
 func (b Builder) chanOp(s *SelectState) Expr {

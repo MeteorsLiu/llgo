@@ -1,0 +1,18 @@
+//go:build !unix && !windows
+
+package goroot
+
+import "os/exec"
+
+func configureProcessGroup(cmd *exec.Cmd) {}
+
+func killProcessTree(cmd *exec.Cmd) {
+	if cmd.Process == nil {
+		return
+	}
+	_ = cmd.Process.Kill()
+}
+
+func resourceMonitoringSupported() bool { return false }
+
+func processGroupRSS(int) (uint64, error) { return 0, nil }

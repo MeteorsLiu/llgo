@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2024 The GoPlus Authors (goplus.org). All rights reserved.
+ * Copyright (c) 2024 The XGo Authors (xgo.dev). All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,11 +17,12 @@
 package ssa
 
 import (
+	"fmt"
 	"go/types"
-	"log"
 	"strconv"
+	"strings"
 
-	"github.com/goplus/llvm"
+	"github.com/xgo-dev/llvm"
 )
 
 // -----------------------------------------------------------------------------
@@ -69,12 +70,97 @@ func (p Package) NewConst(name string, val constant.Value) NamedConst {
 
 type aGlobal struct {
 	Expr
-	//array bool
+	isZeroSizedAlias bool
 }
 
 // A Global is a named Value holding the address of a package-level
 // variable.
 type Global = *aGlobal
+
+const (
+	moduleZeroName              = "__llgo.moduleZeroSizedAlloc$"
+	moduleMapZeroName           = "__llgo.map.zero"
+	runtimeZeroSizedAllocSymbol = "zeroSizedAlloc"
+)
+
+func (p Package) moduleZeroSizedAlloc(elem Type) Expr {
+	zerobase := p.mod.NamedGlobal(moduleZeroName)
+	if zerobase.IsNil() {
+		byteTy := p.Prog.Byte()
+		zerobase = llvm.AddGlobal(p.mod, byteTy.ll, moduleZeroName)
+		zerobase.SetInitializer(llvm.ConstNull(byteTy.ll))
+		if p.Prog.target.effectiveGOOS() == "windows" {
+			// COFF aliases remain attached to their defining section. If the
+			// shared sentinel is COMDAT-folded, lld-link can discard the section
+			// behind an externally visible zero-sized global alias while another
+			// object still relocates against that alias. A module-local sentinel
+			// preserves the permitted Go semantics for zero-sized addresses and
+			// keeps every alias in a retained section.
+			zerobase.SetLinkage(llvm.PrivateLinkage)
+		} else {
+			p.setODRLinkage(zerobase, llvm.LinkOnceODRLinkage)
+		}
+		zerobase.SetUnnamedAddr(true)
+	}
+	return Expr{zerobase, p.Prog.Pointer(elem)}
+}
+
+// mapZeroAddr returns the address of a module-local symbol containing at
+// least size zero bytes. The Go compiler passes an equivalent package-local
+// symbol to mapaccess1_fat and mapaccess2_fat for elements larger than
+// runtime.zeroVal.
+func (p Package) mapZeroAddr(size uint64, alignment int) Expr {
+	if size >= 1<<31 {
+		panic(fmt.Sprintf("map elem too big %d", size))
+	}
+	zero := p.mod.NamedGlobal(moduleMapZeroName)
+	if !zero.IsNil() && zero.GlobalValueType().ArrayLength() >= int(size) {
+		if zero.Alignment() < alignment {
+			zero.SetAlignment(alignment)
+		}
+		return Expr{zero, p.Prog.VoidPtr()}
+	}
+
+	oldAlignment := 0
+	if !zero.IsNil() {
+		oldAlignment = zero.Alignment()
+	}
+	typ := llvm.ArrayType(p.Prog.tyInt8(), int(size))
+	next := llvm.AddGlobal(p.mod, typ, "")
+	next.SetInitializer(llvm.ConstNull(typ))
+	next.SetLinkage(llvm.PrivateLinkage)
+	if alignment < oldAlignment {
+		alignment = oldAlignment
+	}
+	next.SetAlignment(alignment)
+	if !zero.IsNil() {
+		zero.ReplaceAllUsesWith(next)
+		zero.EraseFromParentAsGlobal()
+	}
+	next.SetName(moduleMapZeroName)
+	return Expr{next, p.Prog.VoidPtr()}
+}
+
+// setODRLinkage gives multiply emitted definitions the section-group metadata
+// required by COFF. On ELF and Mach-O, LLVM's weak/linkonce linkage is enough;
+// on COFF, omitting COMDAT leaves every object with a separately named weak
+// fallback and lld-link rejects the otherwise identical definitions.
+func (p Package) setODRLinkage(value llvm.Value, linkage llvm.Linkage) {
+	value.SetLinkage(linkage)
+	if p.Prog.target.effectiveGOOS() != "windows" {
+		return
+	}
+	comdat := p.mod.Comdat(value.Name())
+	comdat.SetSelectionKind(llvm.AnyComdatSelectionKind)
+	value.SetComdat(comdat)
+}
+
+func (p Package) ownsGlobal(name string) bool {
+	if p.path == "" {
+		return true
+	}
+	return strings.HasPrefix(name, p.path+".")
+}
 
 // NewVar creates a new global variable.
 func (p Package) NewVar(name string, typ types.Type, bg Background) Global {
@@ -93,12 +179,50 @@ func (p Package) NewVarEx(name string, t Type) Global {
 	return p.doNewVar(name, t)
 }
 
+// NewThreadLocalVar creates a native TLS variable. Unlike NewVar, it keeps
+// independent storage for zero-sized values instead of using the module-wide
+// zero-sized allocation sentinel.
+func (p Package) NewThreadLocalVar(name string, typ types.Type, bg Background) Global {
+	if v, ok := p.vars[name]; ok {
+		v.impl.SetThreadLocal(true)
+		return v
+	}
+	t := p.Prog.Type(typ, bg)
+	return p.doNewVarEx(name, t, true)
+}
+
 func (p Package) doNewVar(name string, t Type) Global {
+	return p.doNewVarEx(name, t, false)
+}
+
+func (p Package) doNewVarEx(name string, t Type, threadLocal bool) Global {
 	typ := p.Prog.Elem(t).ll
+	if !threadLocal && p.Prog.td.TypeAllocSize(typ) == 0 {
+		var rt *types.Package
+		if p.Prog.rt != nil || p.Prog.rtget != nil {
+			rt = p.Prog.runtime()
+		}
+		if rt != nil {
+			// Do not redirect the runtime's own zero-sized allocation sentinel.
+			zeroName := FullName(rt, runtimeZeroSizedAllocSymbol)
+			if name != zeroName && p.ownsGlobal(name) {
+				zero := p.moduleZeroSizedAlloc(p.Prog.Elem(t))
+				alias := llvm.AddAlias(p.mod, typ, 0, zero.impl, name)
+				alias.SetLinkage(llvm.ExternalLinkage)
+				// The returned Global intentionally points at the shared
+				// sentinel; the alias above preserves this package variable's
+				// symbol for external references.
+				ret := &aGlobal{Expr: zero, isZeroSizedAlias: true}
+				p.vars[name] = ret
+				return ret
+			}
+		}
+	}
 	gbl := llvm.AddGlobal(p.mod, typ, name)
+	gbl.SetThreadLocal(threadLocal)
 	alignment := p.Prog.td.ABITypeAlignment(typ)
 	gbl.SetAlignment(alignment)
-	ret := &aGlobal{Expr{gbl, t}}
+	ret := &aGlobal{Expr: Expr{gbl, t}}
 	p.vars[name] = ret
 	return ret
 }
@@ -110,10 +234,20 @@ func (p Package) VarOf(name string) Global {
 
 // Init initializes the global variable with the given value.
 func (g Global) Init(v Expr) {
+	// Zero-sized globals alias the shared moduleZeroName sentinel, which already has
+	// a null initializer under LinkOnceODRLinkage and must not be mutated.
+	if g.isZeroSizedAlias {
+		return
+	}
 	g.impl.SetInitializer(v.impl)
 }
 
 func (g Global) InitNil() {
+	// Zero-sized globals alias the shared moduleZeroName sentinel, which already has
+	// a null initializer under LinkOnceODRLinkage and must not be mutated.
+	if g.isZeroSizedAlias {
+		return
+	}
 	g.impl.SetInitializer(llvm.ConstNull(g.impl.GlobalValueType()))
 }
 
@@ -179,13 +313,22 @@ type aFunction struct {
 
 	blks []BasicBlock
 
-	defer_ *aDefer
-	recov  BasicBlock
+	defer_           *aDefer
+	recoverToken     Expr
+	pendingLoopCases []loopDeferCase
+	nextDeferID      uintptr
+	recov            BasicBlock
 
 	params   []Type
 	freeVars Expr
-	base     int // base = 1 if hasFreeVars; base = 0 otherwise
+	env      Type
 	hasVArg  bool
+
+	fakeUses   []llvm.Value
+	fakeUseSet map[llvm.Value]struct{}
+
+	gcRootFrame Expr
+	gcRootPrev  Expr
 
 	diFunc DIFunction
 }
@@ -200,18 +343,79 @@ func (p Package) NewFunc(name string, sig *types.Signature, bg Background) Funct
 
 // NewFuncEx creates a new function.
 func (p Package) NewFuncEx(name string, sig *types.Signature, bg Background, hasFreeVars bool, instantiated bool) Function {
+	if hasFreeVars {
+		panic("ssa: NewFuncEx cannot represent an environment; use NewEnvFunc")
+	}
+	return p.newFunc(name, sig, bg, nil, instantiated)
+}
+
+// NewEnvFunc creates a function whose Go signature is sig and whose physical
+// LLVM entry has an additional compiler-owned environment parameter.
+func (p Package) NewEnvFunc(
+	name string, sig *types.Signature, bg Background, env *types.Var, instantiated bool,
+) Function {
+	if env == nil {
+		panic("ssa: nil closure environment")
+	}
+	return p.newFunc(name, sig, bg, env, instantiated)
+}
+
+func (p Package) newFunc(
+	name string, sig *types.Signature, bg Background, env *types.Var, instantiated bool,
+) Function {
 	if v, ok := p.fns[name]; ok {
+		if v.NeedsEnv() != (env != nil) {
+			panic("ssa: conflicting closure environment ABI for " + name)
+		}
 		return v
 	}
 	t := p.Prog.FuncDecl(sig, bg)
-	if debugInstr {
-		log.Println("NewFunc", name, t.raw.Type, "hasFreeVars:", hasFreeVars)
+	var envType Type
+	if env != nil {
+		envType = p.Prog.Type(env.Type(), InGo)
+		rawEnv := types.NewParam(env.Pos(), env.Pkg(), env.Name(), envType.raw.Type)
+		entrySig := FuncAddCtx(rawEnv, t.raw.Type.(*types.Signature))
+		t = &aType{p.Prog.toLLVMFunc(entrySig), t.raw, vkFuncDecl}
 	}
-	fn := llvm.AddFunction(p.mod, name, t.ll)
+	dbgInstrln("NewFunc", name, t.raw.Type, "needsEnv:", envType != nil)
+	llvmName := name
+	if bg == InStdcall {
+		llvmName = p.Prog.stdcallSymbolName(name)
+	}
+	fn := llvm.AddFunction(p.mod, llvmName, t.ll)
+	switch name {
+	case "github.com/xgo-dev/llgo/runtime/internal/runtime.AllocU",
+		"github.com/xgo-dev/llgo/runtime/internal/runtime.AllocZ",
+		"github.com/xgo-dev/llgo/runtime/internal/runtime.AllocRoot":
+		// These runtime allocators return a non-null pointer, even for zero
+		// bytes, or panic. Attach the contract to declarations as well as
+		// definitions so every module can use it without LTO or inlining.
+		fn.AddAttributeAtIndex(0, p.Prog.ctx.CreateEnumAttribute(llvm.AttributeKindID("nonnull"), 0))
+	}
+	if bg == InStdcall {
+		fn.SetFunctionCallConv(p.Prog.stdcallCallConv())
+	}
+	if envType != nil {
+		p.Prog.markClosureEnvFunction(fn, 0)
+	}
+	if bg == InGo {
+		fn.AddFunctionAttr(p.nullPointerIsValidAttr)
+		// Keep frame pointers so the runtime can walk real stacks (FP chain)
+		// for Callers/panic tracebacks instead of shadow-stack bookkeeping.
+		// Only where that unwinder exists: on embedded targets the attribute
+		// is pure cost, and the changed stack layout can retain stale slots
+		// under the conservative GC (observed on ESP32-C3).
+		if p.Prog.NeedsFramePointer() {
+			fn.AddFunctionAttr(p.framePointerAttr)
+		}
+	}
 	if instantiated {
-		fn.SetLinkage(llvm.LinkOnceAnyLinkage)
+		p.setODRLinkage(fn, llvm.LinkOnceAnyLinkage)
 	}
-	ret := newFunction(fn, t, p, p.Prog, hasFreeVars)
+	if p.isPreservedName(name) {
+		p.markLLVMUsed(fn)
+	}
+	ret := newFunction(fn, t, p, p.Prog, envType)
 	p.fns[name] = ret
 	return ret
 }
@@ -221,19 +425,17 @@ func (p Package) FuncOf(name string) Function {
 	return p.fns[name]
 }
 
-func newFunction(fn llvm.Value, t Type, pkg Package, prog Program, hasFreeVars bool) Function {
+func newFunction(fn llvm.Value, t Type, pkg Package, prog Program, env Type) Function {
 	params, hasVArg := newParams(t, prog)
-	base := 0
-	if hasFreeVars {
-		base = 1
-	}
 	return &aFunction{
-		Expr:    Expr{fn, t},
-		Pkg:     pkg,
-		Prog:    prog,
-		params:  params,
-		base:    base,
-		hasVArg: hasVArg,
+		Expr:       Expr{fn, t},
+		Pkg:        pkg,
+		Prog:       prog,
+		params:     params,
+		env:        env,
+		hasVArg:    hasVArg,
+		fakeUses:   make([]llvm.Value, 0, 4),
+		fakeUseSet: make(map[llvm.Value]struct{}),
 	}
 }
 
@@ -259,16 +461,38 @@ func (p Function) Name() string {
 
 // Params returns the function's ith parameter.
 func (p Function) Param(i int) Expr {
-	i += p.base // skip if hasFreeVars
-	return Expr{p.impl.Param(i), p.params[i]}
+	physical := i
+	if p.env != nil {
+		physical++
+	}
+	return Expr{p.impl.Param(physical), p.params[i]}
+}
+
+// NeedsEnv reports whether the physical function entry takes a compiler-owned
+// closure environment parameter.
+func (p Function) NeedsEnv() bool {
+	return p.env != nil
+}
+
+// EnvType returns the physical closure environment pointer type, or nil.
+func (p Function) EnvType() Type {
+	return p.env
+}
+
+// Env returns the physical closure environment parameter.
+func (p Function) Env() Expr {
+	if p.env == nil {
+		panic("ssa: function has no closure environment")
+	}
+	return Expr{p.impl.Param(0), p.env}
 }
 
 func (p Function) closureCtx(b Builder) Expr {
 	if p.freeVars.IsNil() {
-		if p.base == 0 {
+		if p.env == nil {
 			panic("ssa: function has no free variables")
 		}
-		ptr := Expr{p.impl.Param(0), p.params[0]}
+		ptr := p.Env()
 		if b.blk.Index() != 0 {
 			blk := b.impl.GetInsertBlock()
 			b.SetBlockEx(p.blks[0], AtStart, false)
@@ -293,8 +517,13 @@ func (p Function) NewBuilder() Builder {
 	b := prog.ctx.NewBuilder()
 	// TODO(xsw): Finalize may cause panic, so comment it.
 	// b.Finalize()
-	return &aBuilder{b, nil, p, p.Pkg, prog,
-		make(map[Expr]dbgExpr), make(map[*types.Scope]DIScope)}
+	return &aBuilder{
+		impl:         b,
+		Func:         p,
+		Pkg:          p.Pkg,
+		Prog:         prog,
+		diScopeCache: make(map[*types.Scope]DIScope),
+	}
 }
 
 // HasBody reports whether the function has a body.
@@ -326,7 +555,7 @@ func (p Function) MakeBlocks(nblk int) []BasicBlock {
 
 func (p Function) addBlock(idx int) BasicBlock {
 	label := "_llgo_" + strconv.Itoa(idx)
-	blk := llvm.AddBasicBlock(p.impl, label)
+	blk := p.Prog.ctx.AddBasicBlock(p.impl, label)
 	ret := &aBasicBlock{blk, blk, p, idx}
 	p.blks = append(p.blks, ret)
 	return ret
@@ -365,6 +594,19 @@ func (p Function) Inline(inline inlineAttr) {
 	}[inline]
 	inlineAttr := p.Pkg.mod.Context().CreateEnumAttribute(llvm.AttributeKindID(inlineAttrName), 0)
 	p.impl.AddFunctionAttr(inlineAttr)
+}
+
+func (p Function) DisableTailCalls() {
+	attr := p.Pkg.mod.Context().CreateStringAttribute("disable-tail-calls", "true")
+	p.impl.AddFunctionAttr(attr)
+}
+
+// SetWasmImport maps an external function declaration to a WebAssembly host
+// import. LLVM preserves these attributes through the final wasm link.
+func (p Function) SetWasmImport(module, name string) {
+	ctx := p.Pkg.mod.Context()
+	p.impl.AddFunctionAttr(ctx.CreateStringAttribute("wasm-import-module", module))
+	p.impl.AddFunctionAttr(ctx.CreateStringAttribute("wasm-import-name", name))
 }
 
 // -----------------------------------------------------------------------------

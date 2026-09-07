@@ -7,6 +7,7 @@
 *.dll
 *.so
 *.dylib
+*.a
 
 test.db
 demo.ll
@@ -16,14 +17,18 @@ stories*.bin
 err.log
 numpy.txt
 result.txt
+expect.txt.new
 
 _go/
 _runtime/
 _tinygo/
 _output/
 build.dir/
+ltoplugin/build/
 .vscode/
 .venv/
+__pycache__/
+*.pyc
 
 # Test binary, built with `go test -c`
 *.test
@@ -44,6 +49,7 @@ go.work*
 # GoReleaser
 .dist/
 .sysroot/
+.windows-dist/
 
 # Embedded firmware files
 *.bin

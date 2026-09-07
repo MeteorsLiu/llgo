@@ -1,8 +1,8 @@
-//go:build wasip1 || js
-// +build wasip1 js
+//go:build wasip1 || (js && wasm && !llgo.wasm.emscripten.memory64)
+// +build wasip1 js,wasm,!llgo.wasm.emscripten.memory64
 
 /*
- * Copyright (c) 2024 The GoPlus Authors (goplus.org). All rights reserved.
+ * Copyright (c) 2024 The XGo Authors (xgo.dev). All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -19,7 +19,7 @@
 
 package c
 
-// For WebAssembly targets, Long is 32-bit per the spec
+// WASI Preview 1 and Emscripten's default wasm32 ABI use 32-bit C long.
 type (
 	Long  = int32
 	Ulong = uint32

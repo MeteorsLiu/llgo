@@ -1,27 +1,80 @@
 // Copyright 2009 The Go Authors. All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Use of this source code is governed by a BSD-style license.
+// See LICENSES/Go-BSD-3-Clause.txt at this module root for license terms.
 
 package runtime
 
 import (
-	"github.com/goplus/llgo/runtime/internal/clite/debug"
+	clitedebug "github.com/xgo-dev/llgo/runtime/internal/clite/debug"
+	rtdebug "github.com/xgo-dev/llgo/runtime/internal/runtime"
 )
 
-func Caller(skip int) (pc uintptr, file string, line int, ok bool) {
-	panic("todo: runtime.Caller")
+// callerLocation substitutes gc's placeholders for missing position info:
+// "???" for an unknown file and line 1 for an unknown line.
+func callerLocation(file string, line int) (string, int) {
+	if file == "" {
+		file = "???"
+	}
+	if line == 0 {
+		line = 1
+	}
+	return file, line
 }
 
+//go:noinline
+func Caller(skip int) (pc uintptr, file string, line int, ok bool) {
+	ensureRuntimePCLN()
+	if fpUnwindAvailable() {
+		var pcs [1]uintptr
+		if callersWithPanicSplice(skip+1, pcs[:]) >= 1 {
+			// Caller returns the call-instruction PC (matching Go), whereas
+			// Callers returns return PCs. Keeping the adjusted value matters
+			// when the return address equals the next function's entry.
+			pc = pcs[0] - 1
+			sym := frameSymbol(pc)
+			file, line = callerLocation(sym.file, sym.line)
+			return pc, file, line, true
+		}
+	}
+	if frame, ok := rtdebug.Caller(skip); ok {
+		file, line = callerLocation(frame.File, frame.Line)
+		return frame.PC, file, line, true
+	}
+	var pcs [1]uintptr
+	if Callers(skip+2, pcs[:]) < 1 {
+		return 0, "", 0, false
+	}
+	sym := frameSymbol(pcs[0])
+	file, line = callerLocation(sym.file, sym.line)
+	return pcs[0], file, line, true
+}
+
+//go:noinline
 func Callers(skip int, pc []uintptr) int {
+	ensureRuntimePCLN()
+	if fpUnwindAvailable() {
+		if n := callersWithPanicSplice(skip, pc); n > 0 {
+			return n
+		}
+	}
+	if n := rtdebug.Callers(skip, pc); n > 0 {
+		return n
+	}
+	return callers(skip+1, pc)
+}
+
+func callers(skip int, pc []uintptr) int {
 	if len(pc) == 0 {
 		return 0
 	}
 	n := 0
-	debug.StackTrace(skip, func(fr *debug.Frame) bool {
+	clitedebug.StackTrace(skip, func(fr *clitedebug.Frame) bool {
 		if n >= len(pc) {
 			return false
 		}
 		pc[n] = fr.PC
+		recordFrameSymbol(fr.PC, fr.Offset, fr.Name)
+		rtdebug.BindCallerLocation(fr.PC, fr.Name)
 		n++
 		return true
 	})

@@ -3,7 +3,10 @@ package crosscompile
 import (
 	"archive/tar"
 	"archive/zip"
+	"bytes"
 	"compress/gzip"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"net/http"
@@ -11,9 +14,13 @@ import (
 	"os/exec"
 	"path"
 	"path/filepath"
+	"runtime"
 	"strings"
-	"syscall"
+
+	"github.com/xgo-dev/llgo/internal/env"
 )
+
+const espClangLicenseFile = "XGo-LLVM-Apache-2.0-WITH-LLVM-exception.txt"
 
 // checkDownloadAndExtractWasiSDK downloads and extracts WASI SDK
 func checkDownloadAndExtractWasiSDK(dir string) (wasiSdkRoot string, err error) {
@@ -42,7 +49,7 @@ func checkDownloadAndExtractWasiSDK(dir string) (wasiSdkRoot string, err error) 
 }
 
 // checkDownloadAndExtractESPClang downloads and extracts ESP Clang binaries and libraries
-func checkDownloadAndExtractESPClang(platformSuffix, dir string) error {
+func checkDownloadAndExtractESPClang(baseURL, version, platformSuffix, expectedSHA256, dir string) error {
 	// Check if already exists
 	if _, err := os.Stat(dir); err == nil {
 		return nil
@@ -61,22 +68,40 @@ func checkDownloadAndExtractESPClang(platformSuffix, dir string) error {
 		return nil
 	}
 
-	clangUrl := fmt.Sprintf("%s/clang-esp-%s-%s.tar.xz", espClangBaseUrl, espClangVersion, platformSuffix)
-	description := fmt.Sprintf("ESP Clang %s-%s", espClangVersion, platformSuffix)
+	clangUrl := fmt.Sprintf("%s/clang-esp-%s-%s.tar.xz", baseURL, version, platformSuffix)
+	description := fmt.Sprintf("ESP Clang %s-%s", version, platformSuffix)
 
 	// Use temporary extraction directory for ESP Clang special handling
 	tempExtractDir := dir + ".extract"
-	if err := downloadAndExtractArchive(clangUrl, tempExtractDir, description); err != nil {
+	if err := downloadAndExtractArchiveWithChecksum(clangUrl, tempExtractDir, description, expectedSHA256); err != nil {
 		return err
 	}
 	defer os.RemoveAll(tempExtractDir)
 
 	// ESP Clang needs special handling: move esp-clang subdirectory to final destination
 	espClangDir := filepath.Join(tempExtractDir, "esp-clang")
+	if err := installESPClangLicense(espClangDir); err != nil {
+		return err
+	}
 	if err := os.Rename(espClangDir, dir); err != nil {
 		return fmt.Errorf("failed to rename esp-clang directory: %w", err)
 	}
 
+	return nil
+}
+
+// installESPClangLicense places LLGo's canonical LLVM license next to an ESP
+// Clang toolchain. LLVM 22 payloads also preserve their component license
+// bundle, while this root-level file keeps the existing LLGo installation
+// contract stable for older payloads and consumers.
+func installESPClangLicense(clangDir string) error {
+	license, err := os.ReadFile(filepath.Join(env.LLGoROOT(), "LICENSES", espClangLicenseFile))
+	if err != nil {
+		return fmt.Errorf("read ESP Clang license: %w", err)
+	}
+	if err := os.WriteFile(filepath.Join(clangDir, "LICENSE-LLVM.txt"), license, 0o644); err != nil {
+		return fmt.Errorf("install ESP Clang license: %w", err)
+	}
 	return nil
 }
 
@@ -124,6 +149,10 @@ func checkDownloadAndExtractLib(url, dstDir, internalArchiveSrcDir string) error
 
 // acquireLock creates and locks a file to prevent concurrent operations
 func acquireLock(lockPath string) (*os.File, error) {
+	return acquireLockWith(lockPath, lockFileHandle)
+}
+
+func acquireLockWith(lockPath string, lock func(*os.File) error) (*os.File, error) {
 	// Ensure the parent directory exists
 	if err := os.MkdirAll(filepath.Dir(lockPath), 0755); err != nil {
 		return nil, fmt.Errorf("failed to create lock directory: %w", err)
@@ -133,27 +162,41 @@ func acquireLock(lockPath string) (*os.File, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to create lock file: %w", err)
 	}
-	if err := syscall.Flock(int(lockFile.Fd()), syscall.LOCK_EX); err != nil {
-		lockFile.Close()
+	if err := lock(lockFile); err != nil {
+		_ = lockFile.Close()
 		return nil, fmt.Errorf("failed to acquire lock: %w", err)
 	}
 	return lockFile, nil
 }
 
-// releaseLock unlocks and removes the lock file
+// releaseLock unlocks and closes the lock file. The file must remain in place:
+// removing it could let a new caller lock a different file while another caller
+// still holds the original one.
 func releaseLock(lockFile *os.File) error {
 	if lockFile == nil {
 		return nil
 	}
-	lockPath := lockFile.Name()
-	syscall.Flock(int(lockFile.Fd()), syscall.LOCK_UN)
-	lockFile.Close()
-	os.Remove(lockPath)
+	unlockErr := unlockFileHandle(lockFile)
+	closeErr := lockFile.Close()
+	return lockReleaseError(unlockErr, closeErr)
+}
+
+func lockReleaseError(unlockErr, closeErr error) error {
+	if unlockErr != nil {
+		return fmt.Errorf("failed to release lock: %w", unlockErr)
+	}
+	if closeErr != nil {
+		return fmt.Errorf("failed to close lock file: %w", closeErr)
+	}
 	return nil
 }
 
 // downloadAndExtractArchive downloads and extracts an archive to the destination directory (without locking)
 func downloadAndExtractArchive(url, destDir, description string) error {
+	return downloadAndExtractArchiveWithChecksum(url, destDir, description, "")
+}
+
+func downloadAndExtractArchiveWithChecksum(url, destDir, description, expectedSHA256 string) error {
 	fmt.Fprintf(os.Stderr, "Downloading %s...\n", description)
 
 	// Use temporary extraction directory
@@ -170,6 +213,15 @@ func downloadAndExtractArchive(url, destDir, description string) error {
 	localFile := filepath.Join(tempDir, filename)
 	if err := downloadFile(url, localFile); err != nil {
 		return fmt.Errorf("failed to download %s from %s: %w", description, url, err)
+	}
+	if expectedSHA256 != "" {
+		actualSHA256, err := fileSHA256(localFile)
+		if err != nil {
+			return fmt.Errorf("calculate %s checksum: %w", description, err)
+		}
+		if !strings.EqualFold(actualSHA256, expectedSHA256) {
+			return fmt.Errorf("%s checksum mismatch: got %s, want %s", description, actualSHA256, expectedSHA256)
+		}
 	}
 
 	// Extract the archive
@@ -199,6 +251,19 @@ func downloadAndExtractArchive(url, destDir, description string) error {
 
 	fmt.Fprintf(os.Stderr, "%s downloaded and extracted successfully.\n", description)
 	return nil
+}
+
+func fileSHA256(filename string) (string, error) {
+	file, err := os.Open(filename)
+	if err != nil {
+		return "", err
+	}
+	defer file.Close()
+	hash := sha256.New()
+	if _, err := io.Copy(hash, file); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(hash.Sum(nil)), nil
 }
 
 func downloadFile(url, filepath string) error {
@@ -267,9 +332,90 @@ func extractTarGz(tarGzFile, dest string) error {
 }
 
 func extractTarXz(tarXzFile, dest string) error {
-	// Use external tar command to extract .tar.xz files
-	cmd := exec.Command("tar", "-xf", tarXzFile, "-C", dest)
-	return cmd.Run()
+	return extractTarXzForGOOS(runtime.GOOS, os.Getenv("ProgramFiles"), os.Getenv("SystemRoot"), tarXzFile, dest)
+}
+
+func extractTarXzForGOOS(goos, programFiles, systemRoot, tarXzFile, dest string) error {
+	tarCommand := "tar"
+	tarArgs := []string{"-xf", tarXzFile, "-C", dest}
+	if goos == "windows" {
+		if sevenZip := windowsSevenZip(programFiles); sevenZip != "" {
+			return extractTarXzWith7Zip(sevenZip, tarXzFile, dest)
+		}
+		tarCommand = windowsTarCommand(systemRoot)
+	}
+	cmd := exec.Command(tarCommand, tarArgs...)
+	if output, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("tar -xf: %w: %s", err, strings.TrimSpace(string(output)))
+	}
+	return nil
+}
+
+func extractTarXzWith7Zip(sevenZip, tarXzFile, dest string) error {
+	return extractTarXzWith7ZipCommand(sevenZip, tarXzFile, dest, exec.Command)
+}
+
+func extractTarXzWith7ZipCommand(sevenZip, tarXzFile, dest string, command func(string, ...string) *exec.Cmd) error {
+	decompress := command(sevenZip, "x", "-so", tarXzFile)
+	extract := command(sevenZip, "x", "-si", "-ttar", "-y", "-o"+dest)
+	pipe, err := decompress.StdoutPipe()
+	if err != nil {
+		return fmt.Errorf("7-Zip xz pipe: %w", err)
+	}
+	extract.Stdin = pipe
+	var decompressStderr, extractStderr bytes.Buffer
+	decompress.Stderr = &decompressStderr
+	extract.Stdout = io.Discard
+	extract.Stderr = &extractStderr
+
+	// Start the consumer first so the decompressor can stream a multi-gigabyte
+	// tar without writing a second archive to the comparatively small Windows
+	// hosted-runner disk.
+	if err := extract.Start(); err != nil {
+		return fmt.Errorf("start 7-Zip tar extraction: %w", err)
+	}
+	if err := decompress.Start(); err != nil {
+		_ = extract.Process.Kill()
+		_ = extract.Wait()
+		return fmt.Errorf("start 7-Zip xz decompression: %w", err)
+	}
+	extractErr := extract.Wait()
+	decompressErr := decompress.Wait()
+	if decompressErr != nil {
+		return fmt.Errorf("7-Zip xz decompression: %w: %s", decompressErr, strings.TrimSpace(decompressStderr.String()))
+	}
+	if extractErr != nil {
+		return fmt.Errorf("7-Zip tar extraction: %w: %s", extractErr, strings.TrimSpace(extractStderr.String()))
+	}
+	return nil
+}
+
+func windowsSevenZip(programFiles string) string {
+	if programFiles != "" {
+		sevenZip := filepath.Join(programFiles, "7-Zip", "7z.exe")
+		if fileExists(sevenZip) {
+			return sevenZip
+		}
+	}
+	if sevenZip, err := exec.LookPath("7z.exe"); err == nil {
+		return sevenZip
+	}
+	return ""
+}
+
+func windowsTarCommand(systemRoot string) string {
+	if systemRoot != "" {
+		nativeTar := filepath.Join(systemRoot, "System32", "tar.exe")
+		if fileExists(nativeTar) {
+			return nativeTar
+		}
+	}
+	return "tar"
+}
+
+func fileExists(name string) bool {
+	_, err := os.Stat(name)
+	return err == nil
 }
 
 func extractZip(zipFile, dest string) error {

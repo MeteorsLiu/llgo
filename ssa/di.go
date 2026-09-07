@@ -5,10 +5,9 @@ import (
 	"fmt"
 	"go/token"
 	"go/types"
-	"path/filepath"
-	"unsafe"
 
-	"github.com/goplus/llvm"
+	"github.com/xgo-dev/llgo/internal/debuginfo"
+	"github.com/xgo-dev/llvm"
 )
 
 type Positioner interface {
@@ -16,53 +15,123 @@ type Positioner interface {
 }
 
 type aDIBuilder struct {
-	di         *llvm.DIBuilder
+	di         *debuginfo.Builder
 	prog       Program
 	types      map[Type]DIType
 	positioner Positioner
-	m          llvm.Module // Add this field
 }
 
 type diBuilder = *aDIBuilder
 
 func newDIBuilder(prog Program, pkg Package, positioner Positioner) diBuilder {
-	m := pkg.mod
-	ctx := m.Context()
-
-	b := &aDIBuilder{
-		di:         llvm.NewDIBuilder(m),
+	return &aDIBuilder{
+		di: debuginfo.New(pkg.mod, debuginfo.Config{
+			Producer:     "LLGo",
+			Optimized:    prog.debugInfoOptimized,
+			EmitCodeView: prog.emitCodeViewDebugInfo,
+		}),
 		prog:       prog,
 		types:      make(map[*aType]DIType),
 		positioner: positioner,
-		m:          m, // Initialize the m field
 	}
-
-	b.addNamedMetadataOperand("llvm.module.flags", 2, "Debug Info Version", 3)
-	b.addNamedMetadataOperand("llvm.module.flags", 7, "Dwarf Version", 4)
-	b.addNamedMetadataOperand("llvm.module.flags", 1, "wchar_size", 4)
-	b.addNamedMetadataOperand("llvm.module.flags", 8, "PIC Level", 2)
-	b.addNamedMetadataOperand("llvm.module.flags", 7, "uwtable", 1)
-	b.addNamedMetadataOperand("llvm.module.flags", 7, "frame-pointer", 1)
-
-	// Add llvm.ident metadata
-	identNode := ctx.MDNode([]llvm.Metadata{
-		ctx.MDString("LLGo Compiler"),
-	})
-	m.AddNamedMetadataOperand("llvm.ident", identNode)
-
-	return b
 }
 
-// New method to add named metadata operand
-func (b diBuilder) addNamedMetadataOperand(name string, intValue int, stringValue string, intValue2 int) {
-	ctx := b.m.Context()
-	b.m.AddNamedMetadataOperand(name,
-		ctx.MDNode([]llvm.Metadata{
-			llvm.ConstInt(ctx.Int32Type(), uint64(intValue), false).ConstantAsMetadata(),
-			ctx.MDString(stringValue),
-			llvm.ConstInt(ctx.Int32Type(), uint64(intValue2), false).ConstantAsMetadata(),
-		}),
-	)
+func (b diBuilder) finalize() {
+	if b == nil || b.di == nil {
+		return
+	}
+	b.di.Finalize()
+	b.di = nil
+}
+
+func hasTypeParam(typ types.Type) bool {
+	visited := make(map[types.Type]bool)
+	var visit func(types.Type) bool
+	visit = func(tt types.Type) bool {
+		if tt == nil {
+			return false
+		}
+		if visited[tt] {
+			return false
+		}
+		visited[tt] = true
+		switch t := tt.(type) {
+		case *types.TypeParam:
+			return true
+		case *types.Named:
+			if tp := t.TypeParams(); tp != nil && tp.Len() > 0 {
+				if ta := t.TypeArgs(); ta == nil || ta.Len() == 0 {
+					return true
+				}
+			}
+			if ta := t.TypeArgs(); ta != nil {
+				for i := 0; i < ta.Len(); i++ {
+					if visit(ta.At(i)) {
+						return true
+					}
+				}
+			}
+			return visit(t.Underlying())
+		case *types.Pointer:
+			return visit(t.Elem())
+		case *types.Slice:
+			return visit(t.Elem())
+		case *types.Array:
+			return visit(t.Elem())
+		case *types.Map:
+			return visit(t.Key()) || visit(t.Elem())
+		case *types.Chan:
+			return visit(t.Elem())
+		case *types.Signature:
+			if tp := t.TypeParams(); tp != nil && tp.Len() > 0 {
+				return true
+			}
+			if params := t.Params(); params != nil {
+				for i := 0; i < params.Len(); i++ {
+					if visit(params.At(i).Type()) {
+						return true
+					}
+				}
+			}
+			if results := t.Results(); results != nil {
+				for i := 0; i < results.Len(); i++ {
+					if visit(results.At(i).Type()) {
+						return true
+					}
+				}
+			}
+			return false
+		case *types.Tuple:
+			for i := 0; i < t.Len(); i++ {
+				if visit(t.At(i).Type()) {
+					return true
+				}
+			}
+			return false
+		case *types.Struct:
+			for i := 0; i < t.NumFields(); i++ {
+				if visit(t.Field(i).Type()) {
+					return true
+				}
+			}
+			return false
+		case *types.Interface:
+			for i := 0; i < t.NumMethods(); i++ {
+				if visit(t.Method(i).Type()) {
+					return true
+				}
+			}
+			for i := 0; i < t.NumEmbeddeds(); i++ {
+				if visit(t.EmbeddedType(i)) {
+					return true
+				}
+			}
+			return false
+		default:
+			return false
+		}
+	}
+	return visit(typ)
 }
 
 // ----------------------------------------------------------------------------
@@ -77,19 +146,8 @@ func (c CompilationUnit) scopeMeta(b diBuilder, pos token.Position) DIScopeMeta 
 	return &aDIScopeMeta{c.ll}
 }
 
-var DWARF_LANG_C llvm.DwarfLang = 0x2
-var DWARF_LANG_GO llvm.DwarfLang = 0x16
-
 func (b diBuilder) createCompileUnit(filename, dir string) CompilationUnit {
-	return &aCompilationUnit{ll: b.di.CreateCompileUnit(llvm.DICompileUnit{
-		// TODO(lijie): use C language for now, change after Go plugin of LLDB is ready
-		Language:       DWARF_LANG_C - 1,
-		File:           filename,
-		Dir:            dir,
-		Producer:       "LLGo",
-		Optimized:      true,
-		RuntimeVersion: 1,
-	})}
+	return &aCompilationUnit{ll: b.di.CompileUnit(filename, dir)}
 }
 
 // ----------------------------------------------------------------------------
@@ -113,8 +171,7 @@ type aDIFile struct {
 type DIFile = *aDIFile
 
 func (b diBuilder) createFile(filename string) DIFile {
-	dir, file := filepath.Split(filename)
-	return &aDIFile{ll: b.di.CreateFile(file, dir)}
+	return &aDIFile{ll: b.di.File(filename)}
 }
 
 func (f DIFile) scopeMeta(b diBuilder, pos token.Position) DIScopeMeta {
@@ -152,23 +209,40 @@ func (b diBuilder) createType(name string, ty Type, pos token.Position) DIType {
 		} else if t.Info()&types.IsFloat != 0 {
 			encoding = llvm.DW_ATE_float
 		} else if t.Info()&types.IsComplex != 0 {
-			return b.createComplexType(ty)
+			encoding = llvm.DW_ATE_complex_float
 		} else if t.Info()&types.IsString != 0 {
 			return b.createStringType()
 		} else {
 			panic(fmt.Errorf("can't create debug info of basic type: %v, %T", ty.RawType(), ty.RawType()))
 		}
 
+		basicName := name
+		if b.prog.Target().effectiveGOOS() == "windows" {
+			switch t.Kind() {
+			case types.Int:
+				basicName = fmt.Sprintf("int%d", b.prog.SizeOf(ty)*8)
+			case types.Uint, types.Uintptr:
+				basicName = fmt.Sprintf("uint%d", b.prog.SizeOf(ty)*8)
+			}
+		}
 		typ = b.di.CreateBasicType(llvm.DIBasicType{
-			Name:       name,
+			Name:       basicName,
 			SizeInBits: b.prog.SizeOf(b.prog.rawType(t)) * 8,
 			Encoding:   encoding,
 		})
+		if basicName != name {
+			typ = b.di.CreateTypedef(llvm.DITypedef{
+				Name:        name,
+				Type:        typ,
+				File:        b.file(pos.Filename).ll,
+				Line:        pos.Line,
+				AlignInBits: uint32(b.prog.sizes.Alignof(t) * 8),
+			})
+		}
 	case *types.Pointer:
 		return b.createPointerType(name, b.prog.rawType(t.Elem()), pos)
 	case *types.Named:
-		// Create typedef type for named types
-		return b.createTypedefType(name, ty, pos)
+		return b.createTypedefType(name, ty, b.typeDeclarationPosition(t, pos))
 	case *types.Interface:
 		ty := b.prog.rtType("Iface")
 		return b.createInterfaceType(name, ty)
@@ -179,21 +253,28 @@ func (b diBuilder) createType(name string, ty Type, pos token.Position) DIType {
 	case *types.Struct:
 		return b.createStructType(name, ty, pos)
 	case *types.Signature:
-		tyFn := b.prog.Closure(t)
-		return b.createFuncPtrType(name, tyFn, pos)
+		return b.createFuncPtrType(name, ty, pos)
 	case *types.Array:
 		return b.createArrayType(ty, t.Len())
 	case *types.Chan:
-		return b.createChanType(name, ty, pos)
+		return b.createOpaquePointerType(name, ty)
 	case *types.Map:
-		ty := b.prog.rtType("Map")
-		return b.createMapType(name, ty, pos)
+		return b.createOpaquePointerType(name, ty)
 	case *types.Tuple:
 		return b.createTupleType(name, ty, pos)
 	default:
 		panic(fmt.Errorf("can't create debug info of type: %v, %T", ty.RawType(), ty.RawType()))
 	}
 	return &aDIType{typ}
+}
+
+func (b diBuilder) typeDeclarationPosition(typ *types.Named, fallback token.Position) token.Position {
+	if obj := typ.Obj(); obj != nil && obj.Pos().IsValid() {
+		if pos := b.positioner.Position(obj.Pos()); pos.IsValid() {
+			return pos
+		}
+	}
+	return fallback
 }
 
 // ----------------------------------------------------------------------------
@@ -285,15 +366,31 @@ func (b diBuilder) createAutoVariable(scope DIScope, pos token.Position, name st
 }
 
 func (b diBuilder) createTypedefType(name string, ty Type, pos token.Position) DIType {
+	scope := b.file(pos.Filename)
+	ret := &aDIType{ll: b.di.CreateReplaceableCompositeType(
+		scope.ll,
+		llvm.DIReplaceableCompositeType{
+			Tag:         dwarf.TagStructType,
+			Name:        name,
+			File:        scope.ll,
+			Line:        pos.Line,
+			SizeInBits:  b.prog.SizeOf(ty) * 8,
+			AlignInBits: uint32(b.prog.sizes.Alignof(ty.RawType()) * 8),
+		},
+	)}
+	b.types[ty] = ret
+
 	underlyingType := b.diType(b.prog.rawType(ty.RawType().(*types.Named).Underlying()), pos)
 	typ := b.di.CreateTypedef(llvm.DITypedef{
 		Name:        name,
 		Type:        underlyingType.ll,
-		File:        b.file(pos.Filename).ll,
+		File:        scope.ll,
 		Line:        pos.Line,
 		AlignInBits: uint32(b.prog.sizes.Alignof(ty.RawType()) * 8),
 	})
-	return &aDIType{typ}
+	ret.ll.ReplaceAllUsesWith(typ)
+	ret.ll = typ
+	return ret
 }
 
 func (b diBuilder) createStringType() DIType {
@@ -363,40 +460,12 @@ func (b diBuilder) createMemberTypeEx(name string, tyStruct, tyField Type, idxFi
 	)
 }
 
-func (b diBuilder) createMapType(name string, tyMap Type, pos token.Position) DIType {
-	// ty := tyMap.RawType().(*types.Map)
-	// tk := b.prog.rawType(ty.Key())
-	// tv := b.prog.rawType(ty.Elem())
-	tyCount := b.prog.Int()
-	return b.doCreateStructType(name, tyMap, pos, func(ditStruct DIType) []llvm.Metadata {
-		return []llvm.Metadata{
-			b.createMemberType("count", tyMap, tyCount, 0),
-		}
-	})
-}
-
-func (b diBuilder) createChanType(name string, t Type, pos token.Position) DIType {
-	return b.doCreateStructType(name, t, pos, func(ditStruct DIType) []llvm.Metadata {
-		return []llvm.Metadata{}
-	})
-}
-
-func (b diBuilder) createComplexType(t Type) DIType {
-	var tfield Type
-	var tyName string
-	if t.RawType().(*types.Basic).Kind() == types.Complex128 {
-		tfield = b.prog.Float64()
-		tyName = "complex128"
-	} else {
-		tfield = b.prog.Float32()
-		tyName = "complex64"
-	}
-	return b.doCreateStructType(tyName, t, token.Position{}, func(ditStruct DIType) []llvm.Metadata {
-		return []llvm.Metadata{
-			b.createMemberType("real", t, tfield, 0),
-			b.createMemberType("imag", t, tfield, 1),
-		}
-	})
+func (b diBuilder) createOpaquePointerType(name string, ty Type) DIType {
+	return &aDIType{ll: b.di.CreatePointerType(llvm.DIPointerType{
+		Name:        name,
+		SizeInBits:  b.prog.SizeOf(ty) * 8,
+		AlignInBits: uint32(b.prog.sizes.Alignof(ty.RawType()) * 8),
+	})}
 }
 
 func (b diBuilder) createPointerType(name string, ty Type, pos token.Position) DIType {
@@ -480,10 +549,22 @@ func (b diBuilder) createTupleType(name string, ty Type, pos token.Position) DIT
 }
 
 func (b diBuilder) createFuncPtrType(name string, ty Type, pos token.Position) DIType {
+	sig := ty.RawType().(*types.Signature)
+	params := make([]llvm.Metadata, sig.Params().Len()+1)
+	if results := sig.Results(); results.Len() != 0 {
+		params[0] = b.diType(b.prog.rawType(results), pos).ll
+	}
+	for i := 0; i < sig.Params().Len(); i++ {
+		params[i+1] = b.diType(b.prog.rawType(sig.Params().At(i).Type()), pos).ll
+	}
+	subroutine := b.di.CreateSubroutineType(llvm.DISubroutineType{
+		File:       b.file(pos.Filename).ll,
+		Parameters: params,
+	})
 	ptr := b.prog.VoidPtr()
 	return &aDIType{ll: b.di.CreatePointerType(llvm.DIPointerType{
 		Name:        name,
-		Pointee:     b.diType(ptr, pos).ll,
+		Pointee:     subroutine,
 		SizeInBits:  b.prog.SizeOf(ptr) * 8,
 		AlignInBits: uint32(b.prog.sizes.Alignof(ptr.RawType()) * 8),
 	})}
@@ -522,6 +603,9 @@ func (b diBuilder) dbgValue(v Expr, dv DIVar, scope DIScope, pos token.Position,
 }
 
 func (b diBuilder) diType(t Type, pos token.Position) DIType {
+	if hasTypeParam(t.RawType()) {
+		return &aDIType{}
+	}
 	name := t.RawType().String()
 	return b.diTypeEx(name, t, pos)
 }
@@ -569,14 +653,8 @@ func (b diBuilder) createExpression(ops []uint64) DIExpression {
 
 // Copy to alloca'd memory to get declareable address.
 func (b Builder) constructDebugAddr(v Expr) (dbgPtr Expr, dbgVal Expr, exists bool) {
-	if v, ok := b.dbgVars[v]; ok {
-		return v.ptr, v.val, true
-	}
 	t := v.Type.RawType().Underlying()
 	dbgPtr, dbgVal = b.doConstructDebugAddr(v, t)
-	dbgExpr := dbgExpr{dbgPtr, dbgVal}
-	b.dbgVars[v] = dbgExpr
-	b.dbgVars[dbgVal] = dbgExpr
 	return dbgPtr, dbgVal, false
 }
 
@@ -620,6 +698,14 @@ func (b Builder) di() diBuilder {
 }
 
 func (b Builder) DIParam(variable *types.Var, v Expr, dv DIVar, scope DIScope, pos token.Position, blk BasicBlock) {
+	if b.Prog.Target().effectiveGOOS() == "windows" {
+		if _, ok := v.Type.RawType().Underlying().(*types.Pointer); ok {
+			addr := b.AllocaT(v.Type)
+			b.Store(addr, v)
+			b.DIDeclare(variable, addr, dv, scope, pos, blk)
+			return
+		}
+	}
 	b.DIValue(variable, v, dv, scope, pos, blk)
 }
 
@@ -630,7 +716,7 @@ func (b Builder) DIDeclare(variable *types.Var, v Expr, dv DIVar, scope DIScope,
 
 func (b Builder) DIValue(variable *types.Var, v Expr, dv DIVar, scope DIScope, pos token.Position, blk BasicBlock) {
 	ty := v.Type.RawType().Underlying()
-	if !needConstructAddr(ty) {
+	if !b.needDebugAddr(ty, v.Type) {
 		expr := b.di().createExpression(nil)
 		b.di().dbgValue(v, dv, scope, pos, expr, blk)
 	} else {
@@ -638,6 +724,20 @@ func (b Builder) DIValue(variable *types.Var, v Expr, dv DIVar, scope DIScope, p
 		expr := b.di().createExpression([]uint64{opDeref})
 		b.di().dbgValue(dbgPtr, dv, scope, pos, expr, blk)
 	}
+}
+
+func (b Builder) needDebugAddr(underlying types.Type, ssaType Type) bool {
+	if needConstructAddr(underlying) {
+		return true
+	}
+	// On 32-bit Windows, LLVM can lower a wide integer constant to a single
+	// address-sized DWARF stack value. That loses its upper half (notably for
+	// unsigned values), so debuggers report the variable as unavailable. Keep
+	// the complete value in addressable storage and describe it by dereference.
+	basic, ok := underlying.(*types.Basic)
+	return ok && basic.Info()&types.IsInteger != 0 &&
+		b.Prog.Target().effectiveGOOS() == "windows" &&
+		b.Prog.PointerSize() == 4 && b.Prog.SizeOf(ssaType) > uint64(b.Prog.PointerSize())
 }
 
 const (
@@ -670,47 +770,39 @@ func (b Builder) DIVarAuto(scope DIScope, pos token.Position, varName string, vt
 	return b.di().varAuto(scope, pos, varName, t)
 }
 
-// hack for types.Scope
-type hackScope struct {
-	parent   *types.Scope
-	children []*types.Scope
-	number   int                     // parent.children[number-1] is this scope; 0 if there is no parent
-	elems    map[string]types.Object // lazily allocated
-	pos, end token.Pos               // scope extent; may be invalid
-	comment  string                  // for debugging only
-	isFunc   bool                    // set if this is a function scope (internal use only)
-}
-
-func isFunc(scope *types.Scope) bool {
-	hs := (*hackScope)(unsafe.Pointer(scope))
-	return hs.isFunc
-}
-
 func (b Builder) DIScope(f Function, scope *types.Scope) DIScope {
+	if scope == nil || b.diFuncScope == nil {
+		return f
+	}
 	if cachedScope, ok := b.diScopeCache[scope]; ok {
 		return cachedScope
 	}
-	pos := b.di().positioner.Position(scope.Pos())
-	// skip package and universe scope
-	// if scope.Parent().Parent() == nil {
-	// 	return b.di().file(pos.Filename)
-	// }
-
-	var result DIScope
-	if isFunc(scope) {
-		// TODO(lijie): should check scope == function scope
-		result = f
-	} else {
-		parentScope := b.DIScope(f, scope.Parent())
-		result = &aDILexicalBlock{b.di().di.CreateLexicalBlock(parentScope.scopeMeta(b.di(), pos).ll, llvm.DILexicalBlock{
-			File:   b.di().file(pos.Filename).ll,
-			Line:   pos.Line,
-			Column: pos.Column,
-		})}
+	if scope == b.diFuncScope {
+		b.diScopeCache[scope] = f
+		return f
+	}
+	if !isScopeWithin(scope, b.diFuncScope) {
+		return f
 	}
 
+	pos := b.di().positioner.Position(scope.Pos())
+	parentScope := b.DIScope(f, scope.Parent())
+	result := &aDILexicalBlock{b.di().di.CreateLexicalBlock(parentScope.scopeMeta(b.di(), pos).ll, llvm.DILexicalBlock{
+		File:   b.di().file(pos.Filename).ll,
+		Line:   pos.Line,
+		Column: pos.Column,
+	})}
 	b.diScopeCache[scope] = result
 	return result
+}
+
+func isScopeWithin(scope, root *types.Scope) bool {
+	for current := scope; current != nil; current = current.Parent() {
+		if current == root {
+			return true
+		}
+	}
+	return false
 }
 
 const (
@@ -718,6 +810,11 @@ const (
 )
 
 func (b Builder) DIGlobal(v Expr, name string, pos token.Position) {
+	// Frontend pseudo-variables, such as Python module attributes, have no
+	// native storage to describe or attach metadata to.
+	if v.impl.IsNil() {
+		return
+	}
 	if _, ok := b.Pkg.glbDbgVars[v]; ok {
 		return
 	}
@@ -726,7 +823,7 @@ func (b Builder) DIGlobal(v Expr, name string, pos token.Position) {
 		pos,
 		name,
 		name,
-		v.Type,
+		b.Prog.Elem(v.Type),
 		false,
 	)
 	v.impl.AddMetadata(MD_dbg, gv.ll)
@@ -742,7 +839,8 @@ func (b Builder) DISetCurrentDebugLocation(diScope DIScope, pos token.Position) 
 	)
 }
 
-func (b Builder) DebugFunction(f Function, pos token.Position, bodyPos token.Position) {
+func (b Builder) DebugFunction(f Function, funcScope *types.Scope, pos token.Position, bodyPos token.Position) {
+	b.diFuncScope = funcScope
 	p := f
 	if p.diFunc == nil {
 		sig := p.Type.raw.Type.(*types.Signature)
@@ -765,7 +863,6 @@ func (b Builder) DebugFunction(f Function, pos token.Position, bodyPos token.Pos
 			ScopeLine:    bodyPos.Line,
 			IsDefinition: true,
 			LocalToUnit:  true,
-			Optimized:    true,
 		}
 		p.diFunc = &aDIFunction{
 			b.di().di.CreateFunction(b.di().file(pos.Filename).ll, dif),
@@ -776,16 +873,12 @@ func (b Builder) DebugFunction(f Function, pos token.Position, bodyPos token.Pos
 		uint(bodyPos.Line),
 		uint(bodyPos.Column),
 		p.diFunc.ll,
-		f.impl.InstructionDebugLoc(),
+		llvm.Metadata{},
 	)
 }
 
 func (b Builder) Param(idx int) Expr {
-	p := b.Func.Param(idx)
-	if v, ok := b.dbgVars[p]; ok {
-		return v.val
-	}
-	return p
+	return b.Func.Param(idx)
 }
 
 // -----------------------------------------------------------------------------

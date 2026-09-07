@@ -3,13 +3,17 @@ package ffi
 import (
 	"unsafe"
 
-	c "github.com/goplus/llgo/runtime/internal/clite"
-	"github.com/goplus/llgo/runtime/internal/clite/ffi"
+	c "github.com/xgo-dev/llgo/runtime/internal/clite"
+	"github.com/xgo-dev/llgo/runtime/internal/clite/ffi"
 )
 
 type Type = ffi.Type
 
 type Signature = ffi.Cif
+
+type ABI = c.Uint
+
+const DefaultABI ABI = ffi.DefaultAbi
 
 type Error int
 
@@ -28,12 +32,19 @@ func (s Error) Error() string {
 }
 
 func NewSignature(ret *Type, args ...*Type) (*Signature, error) {
+	return NewSignatureWithABI(DefaultABI, ret, args...)
+}
+
+// NewSignatureWithABI prepares a native call signature using abi. Most calls
+// should use NewSignature; the explicit form is needed for platforms such as
+// windows/386 that expose more than one C calling convention.
+func NewSignatureWithABI(abi ABI, ret *Type, args ...*Type) (*Signature, error) {
 	var cif Signature
 	var atype **Type
 	if len(args) > 0 {
 		atype = &args[0]
 	}
-	status := ffi.PrepCif(&cif, ffi.DefaultAbi, c.Uint(len(args)), ret, atype)
+	status := ffi.PrepCif(&cif, abi, c.Uint(len(args)), ret, atype)
 	if status == 0 {
 		return &cif, nil
 	}
@@ -46,7 +57,7 @@ func NewSignatureVar(ret *Type, fixed int, args ...*Type) (*Signature, error) {
 	if len(args) > 0 {
 		atype = &args[0]
 	}
-	status := ffi.PrepCifVar(&cif, ffi.DefaultAbi, c.Uint(fixed), c.Uint(len(args)), ret, atype)
+	status := ffi.PrepCifVar(&cif, DefaultABI, c.Uint(fixed), c.Uint(len(args)), ret, atype)
 	if status == ffi.OK {
 		return &cif, nil
 	}

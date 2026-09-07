@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2024 The GoPlus Authors (goplus.org). All rights reserved.
+ * Copyright (c) 2024 The XGo Authors (xgo.dev). All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -21,10 +21,10 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/goplus/llgo/cmd/internal/base"
-	"github.com/goplus/llgo/cmd/internal/flags"
-	"github.com/goplus/llgo/internal/build"
-	"github.com/goplus/llgo/internal/mockable"
+	"github.com/xgo-dev/llgo/cmd/internal/base"
+	"github.com/xgo-dev/llgo/cmd/internal/flags"
+	"github.com/xgo-dev/llgo/internal/build"
+	"github.com/xgo-dev/llgo/internal/mockable"
 )
 
 // llgo install
@@ -33,8 +33,11 @@ var Cmd = &base.Command{
 	Short:     "Compile and install packages and dependencies",
 }
 
+var goBuildFlags *base.PassArgs
+
 func init() {
 	Cmd.Run = runCmd
+	goBuildFlags = flags.CaptureGoBuildFlags(Cmd)
 	flags.AddCommonFlags(&Cmd.Flag)
 	flags.AddBuildFlags(&Cmd.Flag)
 	flags.AddEmbeddedFlags(&Cmd.Flag)
@@ -47,7 +50,14 @@ func runCmd(cmd *base.Command, args []string) {
 	}
 
 	conf := build.NewDefaultConf(build.ModeInstall)
-	flags.UpdateConfig(conf)
+	if err := flags.UpdateConfig(conf); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		mockable.Exit(1)
+	}
+	if err := flags.ApplyGoBuildFlags(conf, goBuildFlags.Args); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		mockable.Exit(1)
+	}
 
 	args = cmd.Flag.Args()
 	_, err := build.Do(args, conf)

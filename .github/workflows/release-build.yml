@@ -2,74 +2,53 @@ name: Release Build
 
 on:
   push:
-    branches: ["**"]
-    tags: ["*"]
+    branches:
+      - main
+    tags:
+      - "*"
   pull_request:
     branches: ["**"]
+
+permissions:
+  contents: read
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
+env:
+  # goreleaser-cross tags follow the bundled Go release. Keep release builds
+  # on the same Go 1.27 line as .go-version.
+  GORELEASER_CROSS_IMAGE: ghcr.io/goreleaser/goreleaser-cross:v1.27.0-1
+
 jobs:
   setup:
     runs-on: ubuntu-latest
     outputs:
-      darwin-cache-key: ${{ steps.cache-keys.outputs.darwin-key }}
       linux-cache-key: ${{ steps.cache-keys.outputs.linux-key }}
     steps:
       - name: Check out code
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
       - name: Calculate cache keys
         id: cache-keys
         run: |
-          DARWIN_KEY="darwin-sysroot-${{ hashFiles('.github/workflows/populate_darwin_sysroot.sh', '.github/workflows/release-build.yml') }}-v1.0.0"
           LINUX_KEY="linux-sysroot-${{ hashFiles('.github/workflows/populate_linux_sysroot.sh', '.github/workflows/release-build.yml') }}-v1.0.0"
-          echo "darwin-key=$DARWIN_KEY" >> $GITHUB_OUTPUT
           echo "linux-key=$LINUX_KEY" >> $GITHUB_OUTPUT
-
-  populate-darwin-sysroot:
-    runs-on: macos-latest
-    timeout-minutes: 30
-    needs: setup
-    steps:
-      - name: Check out code
-        uses: actions/checkout@v5
-      - name: Check Darwin sysroot cache
-        id: cache-darwin-sysroot
-        uses: actions/cache/restore@v4
-        with:
-          path: .sysroot/darwin.tar.gz
-          key: ${{ needs.setup.outputs.darwin-cache-key }}
-          lookup-only: true
-      - name: Populate Darwin sysroot
-        if: steps.cache-darwin-sysroot.outputs.cache-hit != 'true'
-        run: bash .github/workflows/populate_darwin_sysroot.sh
-      - name: Create Darwin sysroot tarball
-        if: steps.cache-darwin-sysroot.outputs.cache-hit != 'true'
-        run: tar -czvf .sysroot/darwin.tar.gz -C .sysroot darwin
-      - name: Save Darwin sysroot cache
-        if: steps.cache-darwin-sysroot.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v4
-        with:
-          path: .sysroot/darwin.tar.gz
-          key: ${{ needs.setup.outputs.darwin-cache-key }}
   populate-linux-sysroot:
     runs-on: ubuntu-latest
     needs: setup
     timeout-minutes: 30
     steps:
       - name: Check out code
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
       - name: Check Linux sysroot cache
         id: cache-linux-sysroot
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v6
         with:
           path: .sysroot/linux.tar.gz
           key: ${{ needs.setup.outputs.linux-cache-key }}
-          lookup-only: true
       - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
+        uses: docker/setup-qemu-action@v4
         if: steps.cache-linux-sysroot.outputs.cache-hit != 'true'
         with:
           image: tonistiigi/binfmt:qemu-v7.0.0-28
@@ -79,38 +58,56 @@ jobs:
       - name: Create Linux sysroot tarball
         if: steps.cache-linux-sysroot.outputs.cache-hit != 'true'
         run: tar -czvf .sysroot/linux.tar.gz -C .sysroot linux
+      # Keep the producer lookup-only so a hit does not download this large
+      # archive merely to discard it. A miss therefore needs an explicit save.
       - name: Save Linux sysroot cache
         if: steps.cache-linux-sysroot.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v6
         with:
           path: .sysroot/linux.tar.gz
           key: ${{ needs.setup.outputs.linux-cache-key }}
+      # The cache is only a cross-run optimization: repository cache pressure
+      # may evict it while a downstream job is queued. Use an artifact as the
+      # required, run-scoped handoff so release correctness never depends on it.
+      - name: Upload Linux sysroot artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: linux-sysroot
+          path: .sysroot/linux.tar.gz
+          if-no-files-found: error
+          include-hidden-files: true
+          compression-level: 0
+          retention-days: 3
   build:
     runs-on: ubuntu-latest
-    needs: [setup, populate-darwin-sysroot, populate-linux-sysroot]
+    needs: [setup, populate-linux-sysroot]
     steps:
       - name: Check out code
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
+      - name: Download Linux sysroot artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: linux-sysroot
+          path: .sysroot
       - name: Set up Release
         uses: ./.github/actions/setup-goreleaser
-        with:
-          darwin-cache-key: ${{ needs.setup.outputs.darwin-cache-key }}
-          linux-cache-key: ${{ needs.setup.outputs.linux-cache-key }}
       - name: Run GoReleaser (Build & Test)
         env:
           GITHUB_TOKEN: ${{github.token}}
         run: |
+          docker run --rm --entrypoint go "${GORELEASER_CROSS_IMAGE}" version
+          docker run --rm "${GORELEASER_CROSS_IMAGE}" --version
           docker run \
             --rm \
             -e GITHUB_TOKEN=${GITHUB_TOKEN} \
             -v /var/run/docker.sock:/var/run/docker.sock \
             -v $(pwd):/go/src/llgo \
             -w /go/src/llgo \
-            ghcr.io/goreleaser/goreleaser-cross:v1.22 \
-            release --skip=publish,nfpm,snapcraft --snapshot --clean
+            "${GORELEASER_CROSS_IMAGE}" \
+            release --verbose --skip=publish,nfpm,snapcraft --snapshot --clean
 
       - name: Upload Darwin AMD64 Artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: llgo-darwin-amd64
           path: .dist/*darwin-amd64.tar.gz
@@ -118,7 +115,7 @@ jobs:
           include-hidden-files: true
 
       - name: Upload Darwin ARM64 Artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: llgo-darwin-arm64
           path: .dist/*darwin-arm64.tar.gz
@@ -126,7 +123,7 @@ jobs:
           include-hidden-files: true
 
       - name: Upload Linux AMD64 Artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: llgo-linux-amd64
           path: .dist/*linux-amd64.tar.gz
@@ -134,7 +131,7 @@ jobs:
           include-hidden-files: true
 
       - name: Upload Linux ARM64 Artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: llgo-linux-arm64
           path: .dist/*linux-arm64.tar.gz
@@ -142,49 +139,166 @@ jobs:
           include-hidden-files: true
 
       - name: Upload Checksums
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: llgo-checksums
           path: .dist/*checksums.txt
           retention-days: 3
           include-hidden-files: true
 
+      - name: Upload release metadata
+        uses: actions/upload-artifact@v7
+        with:
+          name: llgo-release-metadata
+          path: .dist/metadata.json
+          if-no-files-found: error
+          retention-days: 3
+          include-hidden-files: true
+
+  build-windows:
+    needs: build
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        abi: [msvc, mingw]
+        goarch: [amd64, arm64]
+        include:
+          - goarch: amd64
+            os: windows-2022
+          - goarch: arm64
+            os: windows-11-arm
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install build dependencies
+        uses: ./.github/actions/setup-deps
+        with:
+          windows-abi: ${{ matrix.abi }}
+          windows-arch: ${{ matrix.goarch }}
+      - name: Set up Go
+        uses: ./.github/actions/setup-go
+        with:
+          # MSVC uses the x64 bootstrap Clang, with architecture-matched LLVM
+          # libraries and SDK for the resulting llgo.exe. MinGW builds natively.
+          architecture: ${{ matrix.abi == 'mingw' && matrix.goarch == 'arm64' && 'arm64' || 'x64' }}
+      - name: Cache ARM64 MSVC release SDK archive
+        if: matrix.abi == 'msvc' && matrix.goarch == 'arm64'
+        uses: actions/cache@v6
+        with:
+          path: ${{ runner.tool_cache }}/llgo-release-downloads/llvm-arm64
+          key: llgo-release-llvm-archive-v1-de718c58ebbc5f61d58c17b90457fcf42983bc2c4a4aba3e010d108713bfd7f1
+      - name: Cache ESP release archive
+        uses: actions/cache@v6
+        with:
+          path: ${{ runner.tool_cache }}/llgo-release-downloads/esp
+          key: llgo-release-esp-archive-v1-3d32533daec8be08e608496eff817798eb7d3c25f07a02de1f1c94c0a0bbb8b3
+          enableCrossOsArchive: true
+      - name: Download release metadata
+        uses: actions/download-artifact@v8
+        with:
+          name: llgo-release-metadata
+          path: .windows-dist
+      - name: Test Windows packaging checks
+        shell: pwsh
+        run: |
+          ./.github/windows/release-lib_test.ps1
+          ./.github/windows/release-build_test.ps1
+      - name: Build integrated Windows archive
+        shell: pwsh
+        run: >-
+          ./.github/windows/build-release.ps1
+          -Profile '${{ matrix.abi }}' -GoArch '${{ matrix.goarch }}'
+      - name: Upload Windows archive
+        uses: actions/upload-artifact@v7
+        with:
+          name: llgo-windows-${{ matrix.goarch }}-${{ matrix.abi }}
+          path: |
+            .windows-dist/*.windows-${{ matrix.goarch }}-${{ matrix.abi }}.tar.gz
+            .windows-dist/*.windows-${{ matrix.goarch }}-${{ matrix.abi }}.tar.gz.sha256
+          if-no-files-found: error
+          retention-days: 3
+          include-hidden-files: true
+          compression-level: 0
+
+  test-windows-artifacts:
+    needs: build-windows
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        abi: [msvc, mingw]
+        goarch: [amd64, arm64]
+        include:
+          - goarch: amd64
+            os: windows-2022
+          - goarch: arm64
+            os: windows-11-arm
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Set up Go
+        uses: ./.github/actions/setup-go
+      - name: Download Windows archive
+        uses: actions/download-artifact@v8
+        with:
+          name: llgo-windows-${{ matrix.goarch }}-${{ matrix.abi }}
+          path: .windows-dist
+      # Execute the unpacked compiler before installing any LLVM or native
+      # dependencies: this catches missing DLLs that the build runner can mask.
+      - name: Verify standalone compiler and archive
+        shell: pwsh
+        run: >-
+          ./.github/windows/test-release.ps1 -CheckOnly
+          -Profile '${{ matrix.abi }}' -GoArch '${{ matrix.goarch }}'
+      - name: Install native target dependencies
+        uses: ./.github/actions/setup-deps
+        with:
+          windows-abi: ${{ matrix.abi }}
+          windows-arch: ${{ matrix.goarch }}
+      - name: Activate native Windows target
+        uses: ./.github/actions/activate-windows-target
+        with:
+          windows-abi: ${{ matrix.abi }}
+          windows-arch: ${{ matrix.goarch }}
+      - name: Test extracted native and embedded compiler
+        shell: pwsh
+        run: >-
+          ./.github/windows/test-release.ps1
+          -Profile '${{ matrix.abi }}' -GoArch '${{ matrix.goarch }}'
+
   test-artifacts:
     needs: build
     strategy:
       matrix:
         include:
-          - os: macos-13
+          - os: macos-15-intel
             goos: darwin
             goarch: amd64
-            go-version: "1.24.2"
-            go-mod-version: "1.24"
+            go-mod-version: "1.27"
           - os: macos-latest
             goos: darwin
             goarch: arm64
-            go-version: "1.24.2"
-            go-mod-version: "1.24"
+            go-mod-version: "1.27"
           - os: ubuntu-latest
             goos: linux
             goarch: amd64
-            go-version: "1.24.2"
-            go-mod-version: "1.24"
+            go-mod-version: "1.27"
           - os: ubuntu-24.04-arm
             goos: linux
             goarch: arm64
-            go-version: "1.24.2"
-            go-mod-version: "1.24"
+            go-mod-version: "1.27"
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - name: Install dependencies
         uses: ./.github/actions/setup-deps
-      - name: Set up Go
-        uses: actions/setup-go@v6
         with:
-          go-version: ${{ matrix.go-version }}
+          install-llvm: false
+      - name: Set up Go
+        uses: ./.github/actions/setup-go
       - name: Download Platform Artifact
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@v8
         with:
           name: llgo-${{ matrix.goos }}-${{ matrix.goarch }}
           path: .
@@ -201,34 +315,60 @@ jobs:
       - name: Test Hello World
         uses: ./.github/actions/test-helloworld
         with:
-          go-version: ${{matrix.go-version}}
           mod-version: ${{ matrix.go-mod-version }}
 
   release:
-    needs: [setup, build, test-artifacts]
+    permissions:
+      contents: write
+    needs: [setup, test-artifacts, test-windows-artifacts, populate-linux-sysroot]
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/')
     steps:
       - name: Check out code
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
+      - name: Download Linux sysroot artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: linux-sysroot
+          path: .sysroot
       - name: Set up Release
         uses: ./.github/actions/setup-goreleaser
+      - name: Download tested Windows archives
+        uses: actions/download-artifact@v8
         with:
-          darwin-cache-key: ${{ needs.setup.outputs.darwin-cache-key }}
-          linux-cache-key: ${{ needs.setup.outputs.linux-cache-key }}
+          pattern: llgo-windows-*
+          merge-multiple: true
+          path: .windows-dist
+      - name: Verify all four Windows archives
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          cd .windows-dist
+          archives=(llgo*.windows-*.tar.gz)
+          test "${#archives[@]}" = 4
+          for arch in amd64 arm64; do
+            for abi in msvc mingw; do
+              archive="llgo${version}.windows-${arch}-${abi}.tar.gz"
+              test -s "$archive"
+              sha256sum -c "$archive.sha256"
+            done
+          done
       - name: Run GoReleaser (Release)
         env:
           GITHUB_TOKEN: ${{github.token}}
         run: |
           echo "Publishing release for tag: ${{ github.ref }}"
           echo "All artifact tests passed, proceeding with release..."
+          docker run --rm --entrypoint go "${GORELEASER_CROSS_IMAGE}" version
+          docker run --rm "${GORELEASER_CROSS_IMAGE}" --version
           docker run \
             --rm \
             -e GITHUB_TOKEN=${GITHUB_TOKEN} \
             -v /var/run/docker.sock:/var/run/docker.sock \
             -v $(pwd):/go/src/llgo \
             -w /go/src/llgo \
-            ghcr.io/goreleaser/goreleaser-cross:v1.22 \
-            release --clean --skip nfpm,snapcraft
+            "${GORELEASER_CROSS_IMAGE}" \
+            release --clean --verbose --skip nfpm,snapcraft

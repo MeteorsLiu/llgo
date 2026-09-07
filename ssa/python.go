@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2024 The GoPlus Authors (goplus.org). All rights reserved.
+ * Copyright (c) 2024 The XGo Authors (xgo.dev). All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -23,7 +23,7 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/goplus/llvm"
+	"github.com/xgo-dev/llvm"
 )
 
 // -----------------------------------------------------------------------------
@@ -310,7 +310,7 @@ func (p Package) PyNewModVar(name string, doInit bool) Global {
 	g := p.NewVar(name, objPtr, InC)
 	if doInit {
 		g.InitNil()
-		g.impl.SetLinkage(llvm.LinkOnceAnyLinkage)
+		p.setODRLinkage(g.impl, llvm.LinkOnceAnyLinkage)
 	}
 	p.pymods[name] = g
 	return g
@@ -484,7 +484,7 @@ func (b Builder) PyVal(v Expr) (ret Expr) {
 func (b Builder) PyBool(bVal Expr) (ret Expr) {
 	fn := b.Pkg.pyFunc("PyBool_FromLong", b.Prog.tyBoolFromLong())
 	typ := b.Prog.Int32()
-	return b.Call(fn, Expr{castInt(b, bVal.impl, typ), typ})
+	return b.Call(fn, Expr{castInt(b, bVal.impl, bVal.Type, typ), typ})
 }
 
 // PyFloat(fltVal float64) *Object
@@ -591,7 +591,7 @@ func (p Package) PyNewFunc(name string, sig *types.Signature, doInit bool) PyObj
 	if doInit {
 		p.NeedPyInit = true
 		obj.InitNil()
-		obj.impl.SetLinkage(llvm.LinkOnceAnyLinkage)
+		p.setODRLinkage(obj.impl, llvm.LinkOnceAnyLinkage)
 	}
 	ty := &aType{obj.ll, rawType{types.NewPointer(sig)}, vkPyFuncRef}
 	expr := Expr{obj.impl, ty}

@@ -7,14 +7,19 @@ import (
 	"archive/tar"
 	"archive/zip"
 	"compress/gzip"
+	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
+	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -50,6 +55,236 @@ func createTestTarGz(t *testing.T, files map[string]string) string {
 	return tempFile.Name()
 }
 
+func createTestTarXz(t *testing.T, files map[string]string) string {
+	t.Helper()
+	_, xzErr := exec.LookPath("xz")
+	if runtime.GOOS == "windows" && xzErr != nil {
+		// Windows CI provides xz through MSYS2. Windows 11's bundled bsdtar is
+		// a fallback for local development VMs that do not install xz separately.
+		sourceDir := t.TempDir()
+		for name, content := range files {
+			file := filepath.Join(sourceDir, filepath.FromSlash(name))
+			if err := os.MkdirAll(filepath.Dir(file), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(file, []byte(content), 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}
+		xzFile := filepath.Join(t.TempDir(), "test.tar.xz")
+		tarCommand := filepath.Join(os.Getenv("SystemRoot"), "System32", "tar.exe")
+		if output, err := exec.Command(tarCommand, "-cJf", xzFile, "-C", sourceDir, ".").CombinedOutput(); err != nil {
+			t.Fatalf("compress test tar.xz: %v: %s", err, strings.TrimSpace(string(output)))
+		}
+		return xzFile
+	}
+
+	tarFile, err := os.CreateTemp("", "test*.tar")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tw := tar.NewWriter(tarFile)
+	for name, content := range files {
+		hdr := &tar.Header{Name: name, Mode: 0o644, Size: int64(len(content))}
+		if err := tw.WriteHeader(hdr); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := tw.Write([]byte(content)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := tarFile.Close(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Remove(tarFile.Name()) })
+
+	compressed, err := exec.Command("xz", "-c", tarFile.Name()).Output()
+	if err != nil {
+		t.Fatalf("compress test tar.xz: %v", err)
+	}
+	xzFile := tarFile.Name() + ".xz"
+	if err := os.WriteFile(xzFile, compressed, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Remove(xzFile) })
+	return xzFile
+}
+
+func TestWindowsArchiveTools(t *testing.T) {
+	touch := func(t *testing.T, name string) {
+		t.Helper()
+		if err := os.MkdirAll(filepath.Dir(name), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(name, nil, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	t.Run("7-Zip", func(t *testing.T) {
+		root := t.TempDir()
+		sevenZip := filepath.Join(root, "7-Zip", "7z.exe")
+		touch(t, sevenZip)
+		if got := windowsSevenZip(root); got != sevenZip {
+			t.Fatalf("windowsSevenZip() = %q, want %q", got, sevenZip)
+		}
+	})
+
+	t.Run("7-ZipFromPath", func(t *testing.T) {
+		binDir := t.TempDir()
+		sevenZip := filepath.Join(binDir, "7z.exe")
+		touch(t, sevenZip)
+		t.Setenv("PATH", binDir)
+		if got := windowsSevenZip(""); got != sevenZip {
+			t.Fatalf("windowsSevenZip() = %q, want %q", got, sevenZip)
+		}
+	})
+
+	t.Run("NativeFallback", func(t *testing.T) {
+		systemRoot := t.TempDir()
+		nativeTar := filepath.Join(systemRoot, "System32", "tar.exe")
+		touch(t, nativeTar)
+
+		if got := windowsTarCommand(systemRoot); got != nativeTar {
+			t.Fatalf("windowsTarCommand() = %q, want %q", got, nativeTar)
+		}
+	})
+
+	t.Run("PathFallback", func(t *testing.T) {
+		if got := windowsTarCommand(""); got != "tar" {
+			t.Fatalf("windowsTarCommand() = %q, want tar", got)
+		}
+	})
+}
+
+func TestExtractTarXzWith7ZipCommand(t *testing.T) {
+	if mode := os.Getenv("LLGO_7ZIP_HELPER"); mode != "" {
+		switch mode {
+		case "decompress":
+			if os.Getenv("LLGO_7ZIP_FAIL") == mode {
+				os.Exit(2)
+			}
+			_, _ = os.Stdout.WriteString("streamed tar payload")
+		case "extract":
+			payload, err := io.ReadAll(os.Stdin)
+			if err != nil {
+				os.Exit(3)
+			}
+			if err := os.WriteFile(os.Getenv("LLGO_7ZIP_OUTPUT"), payload, 0o644); err != nil {
+				os.Exit(4)
+			}
+			if os.Getenv("LLGO_7ZIP_FAIL") == mode {
+				os.Exit(5)
+			}
+		default:
+			os.Exit(6)
+		}
+		os.Exit(0)
+	}
+
+	output := filepath.Join(t.TempDir(), "payload")
+	t.Setenv("LLGO_7ZIP_OUTPUT", output)
+	command := func(_ string, args ...string) *exec.Cmd {
+		mode := "extract"
+		if slices.Contains(args, "-so") {
+			mode = "decompress"
+		}
+		cmd := exec.Command(os.Args[0], "-test.run=^TestExtractTarXzWith7ZipCommand$")
+		cmd.Env = append(os.Environ(), "LLGO_7ZIP_HELPER="+mode)
+		return cmd
+	}
+
+	if err := extractTarXzWith7ZipCommand("7z", "input.tar.xz", "output", command); err != nil {
+		t.Fatal(err)
+	}
+	payload, err := os.ReadFile(output)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := string(payload), "streamed tar payload"; got != want {
+		t.Fatalf("streamed payload = %q, want %q", got, want)
+	}
+
+	for _, test := range []struct {
+		mode string
+		want string
+	}{
+		{mode: "decompress", want: "7-Zip xz decompression"},
+		{mode: "extract", want: "7-Zip tar extraction"},
+	} {
+		t.Run(test.mode+" failure", func(t *testing.T) {
+			t.Setenv("LLGO_7ZIP_FAIL", test.mode)
+			if err := extractTarXzWith7ZipCommand("7z", "input.tar.xz", "output", command); err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("error = %v, want substring %q", err, test.want)
+			}
+		})
+	}
+
+	t.Run("extract start failure", func(t *testing.T) {
+		calls := 0
+		factory := func(_ string, _ ...string) *exec.Cmd {
+			calls++
+			if calls == 2 {
+				return exec.Command(filepath.Join(t.TempDir(), "missing"))
+			}
+			return command("7z", "-so")
+		}
+		if err := extractTarXzWith7ZipCommand("7z", "input.tar.xz", "output", factory); err == nil || !strings.Contains(err.Error(), "start 7-Zip tar extraction") {
+			t.Fatalf("error = %v, want extract start failure", err)
+		}
+	})
+
+	t.Run("decompress start failure", func(t *testing.T) {
+		calls := 0
+		factory := func(_ string, _ ...string) *exec.Cmd {
+			calls++
+			if calls == 1 {
+				return exec.Command(filepath.Join(t.TempDir(), "missing"))
+			}
+			return command("7z", "-si")
+		}
+		if err := extractTarXzWith7ZipCommand("7z", "input.tar.xz", "output", factory); err == nil || !strings.Contains(err.Error(), "start 7-Zip xz decompression") {
+			t.Fatalf("error = %v, want decompressor start failure", err)
+		}
+	})
+}
+
+func TestExtractTarXzForWindowsUses7Zip(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("the test helper is a POSIX shell script")
+	}
+	programFiles := t.TempDir()
+	sevenZip := filepath.Join(programFiles, "7-Zip", "7z.exe")
+	if err := os.MkdirAll(filepath.Dir(sevenZip), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	script := `#!/bin/sh
+if [ "$2" = "-so" ]; then
+  printf 'streamed tar payload'
+else
+  cat > "$LLGO_7ZIP_OUTPUT"
+fi
+`
+	if err := os.WriteFile(sevenZip, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	output := filepath.Join(t.TempDir(), "payload")
+	t.Setenv("LLGO_7ZIP_OUTPUT", output)
+	if err := extractTarXzForGOOS("windows", programFiles, "", "input.tar.xz", "output"); err != nil {
+		t.Fatal(err)
+	}
+	payload, err := os.ReadFile(output)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := string(payload), "streamed tar payload"; got != want {
+		t.Fatalf("streamed payload = %q, want %q", got, want)
+	}
+}
+
 // Helper function to create a test HTTP server
 func createTestServer(t *testing.T, files map[string]string) *httptest.Server {
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -64,6 +299,10 @@ func createTestServer(t *testing.T, files map[string]string) *httptest.Server {
 }
 
 func TestAcquireAndReleaseLock(t *testing.T) {
+	if err := releaseLock(nil); err != nil {
+		t.Fatalf("releaseLock(nil) = %v, want nil", err)
+	}
+
 	tempDir := t.TempDir()
 	lockPath := filepath.Join(tempDir, "test.lock")
 
@@ -83,9 +322,80 @@ func TestAcquireAndReleaseLock(t *testing.T) {
 		t.Errorf("Failed to release lock: %v", err)
 	}
 
-	// Check lock file is removed
-	if _, err := os.Stat(lockPath); !os.IsNotExist(err) {
-		t.Error("Lock file should be removed after release")
+	// The lock file remains so every caller continues to lock the same file.
+	if _, err := os.Stat(lockPath); err != nil {
+		t.Fatalf("Lock file should remain after release: %v", err)
+	}
+
+	// A retained lock file can be acquired again.
+	lockFile, err = acquireLock(lockPath)
+	if err != nil {
+		t.Fatalf("Failed to reacquire lock: %v", err)
+	}
+	if err := releaseLock(lockFile); err != nil {
+		t.Errorf("Failed to release reacquired lock: %v", err)
+	}
+
+	// A closed handle exercises the platform unlock failure path and verifies
+	// that releaseLock preserves enough context for callers to diagnose it.
+	closedLock, err := acquireLock(filepath.Join(tempDir, "closed.lock"))
+	if err != nil {
+		t.Fatalf("Failed to acquire lock for error test: %v", err)
+	}
+	if err := closedLock.Close(); err != nil {
+		t.Fatalf("Failed to close lock for error test: %v", err)
+	}
+	if err := releaseLock(closedLock); err == nil {
+		t.Fatal("Expected release of a closed lock to fail")
+	} else if !strings.Contains(err.Error(), "failed to release lock") {
+		t.Fatalf("Unexpected closed lock release error: %v", err)
+	}
+}
+
+func TestAcquireAndReleaseLockErrors(t *testing.T) {
+	wantErr := errors.New("injected lock failure")
+	var opened *os.File
+	got, err := acquireLockWith(filepath.Join(t.TempDir(), "failed.lock"), func(file *os.File) error {
+		opened = file
+		return wantErr
+	})
+	if got != nil || !errors.Is(err, wantErr) {
+		t.Fatalf("acquireLockWith = (%v, %v), want (nil, %v)", got, err, wantErr)
+	}
+	if opened == nil {
+		t.Fatal("lock callback did not receive the opened file")
+	}
+	if err := opened.Close(); err == nil {
+		t.Fatal("failed lock file remained open")
+	}
+}
+
+func TestLockReleaseError(t *testing.T) {
+	unlockErr := errors.New("unlock")
+	closeErr := errors.New("close")
+	for _, test := range []struct {
+		name      string
+		unlockErr error
+		closeErr  error
+		want      string
+	}{
+		{name: "success"},
+		{name: "unlock", unlockErr: unlockErr, want: "failed to release lock: unlock"},
+		{name: "close", closeErr: closeErr, want: "failed to close lock file: close"},
+		{name: "unlock takes precedence", unlockErr: unlockErr, closeErr: closeErr, want: "failed to release lock: unlock"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			err := lockReleaseError(test.unlockErr, test.closeErr)
+			if test.want == "" {
+				if err != nil {
+					t.Fatalf("lockReleaseError() = %v, want nil", err)
+				}
+				return
+			}
+			if err == nil || err.Error() != test.want {
+				t.Fatalf("lockReleaseError() = %v, want %q", err, test.want)
+			}
+		})
 	}
 }
 
@@ -96,6 +406,7 @@ func TestAcquireLockConcurrency(t *testing.T) {
 	var wg sync.WaitGroup
 	var results []int
 	var resultsMu sync.Mutex
+	var active atomic.Int32
 
 	// Start multiple goroutines trying to acquire the same lock
 	for i := 0; i < 5; i++ {
@@ -109,12 +420,17 @@ func TestAcquireLockConcurrency(t *testing.T) {
 				return
 			}
 
-			// Hold the lock for a short time
+			if n := active.Add(1); n != 1 {
+				t.Errorf("Goroutine %d entered an occupied critical section (%d active)", id, n)
+			}
+
+			// Hold the lock for a short time.
 			resultsMu.Lock()
 			results = append(results, id)
 			resultsMu.Unlock()
 
 			time.Sleep(10 * time.Millisecond)
+			active.Add(-1)
 
 			if err := releaseLock(lockFile); err != nil {
 				t.Errorf("Goroutine %d failed to release lock: %v", id, err)
@@ -173,7 +489,6 @@ func TestExtractTarGz(t *testing.T) {
 	}
 
 	archivePath := createTestTarGz(t, files)
-	defer os.Remove(archivePath)
 
 	// Extract to temp directory
 	tempDir := t.TempDir()
@@ -513,7 +828,7 @@ func TestESPClangExtractionLogic(t *testing.T) {
 	}
 
 	// Test that function skips download for existing directory
-	err = checkDownloadAndExtractESPClang("linux", espClangDir)
+	err = checkDownloadAndExtractESPClang("", "", "", "", espClangDir)
 	if err != nil {
 		t.Fatalf("checkDownloadAndExtractESPClang failed: %v", err)
 	}
@@ -595,8 +910,7 @@ func TestESPClangDownloadWhenNotExists(t *testing.T) {
 		"esp-clang/include/esp32.h": "#define ESP32 1",
 	}
 
-	archivePath := createTestTarGz(t, files)
-	defer os.Remove(archivePath)
+	archivePath := createTestTarXz(t, files)
 
 	// Read the archive content
 	archiveContent, err := os.ReadFile(archivePath)
@@ -604,9 +918,8 @@ func TestESPClangDownloadWhenNotExists(t *testing.T) {
 		t.Fatalf("Failed to read test archive: %v", err)
 	}
 
-	server := createTestServer(t, map[string]string{
-		"clang-esp-19.1.2_20250820-linux.tar.xz": string(archiveContent),
-	})
+	const filename = "clang-esp-test-linux.tar.xz"
+	server := createTestServer(t, map[string]string{filename: string(archiveContent)})
 	defer server.Close()
 
 	// Override cacheRoot to use a temporary directory
@@ -615,16 +928,14 @@ func TestESPClangDownloadWhenNotExists(t *testing.T) {
 	cacheRoot = func() string { return tempCacheRoot }
 	defer func() { cacheRoot = originalCacheRoot }()
 
-	// Override espClangBaseUrl to use our test server
-	originalEspClangBaseUrl := espClangBaseUrl
-	espClangBaseUrl = server.URL
-	defer func() { espClangBaseUrl = originalEspClangBaseUrl }()
-
 	// Use a fresh temp directory that doesn't have ESP Clang
 	espClangDir := filepath.Join(tempCacheRoot, "esp-clang-test")
-
+	checksum, err := fileSHA256(archivePath)
+	if err != nil {
+		t.Fatal(err)
+	}
 	// Test download and extract when directory doesn't exist
-	err = checkDownloadAndExtractESPClang("linux", espClangDir)
+	err = checkDownloadAndExtractESPClang(server.URL, "test", "linux", checksum, espClangDir)
 	if err != nil {
 		t.Fatalf("checkDownloadAndExtractESPClang failed: %v", err)
 	}
@@ -647,6 +958,178 @@ func TestESPClangDownloadWhenNotExists(t *testing.T) {
 		if string(content) != expectedContent {
 			t.Errorf("File %s: expected content %q, got %q", relativePath, expectedContent, string(content))
 		}
+	}
+}
+
+func TestExtractTarXzError(t *testing.T) {
+	err := extractTarXz(filepath.Join(t.TempDir(), "missing.tar.xz"), t.TempDir())
+	if err == nil {
+		t.Fatal("extractTarXz succeeded for a missing archive")
+	}
+	want := "tar -xf:"
+	if runtime.GOOS == "windows" && windowsSevenZip(os.Getenv("ProgramFiles")) != "" {
+		want = "7-Zip xz decompression:"
+	}
+	if !strings.Contains(err.Error(), want) {
+		t.Fatalf("extractTarXz error = %q, want %q command context", err, want)
+	}
+}
+
+func TestESPClangDownloadLicenseFailure(t *testing.T) {
+	archivePath := createTestTarXz(t, map[string]string{
+		"esp-clang/bin/clang": "fake esp clang binary",
+	})
+	defer os.Remove(archivePath)
+	archiveContent, err := os.ReadFile(archivePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const filename = "clang-esp-test-linux.tar.xz"
+	server := createTestServer(t, map[string]string{filename: string(archiveContent)})
+	defer server.Close()
+	checksum, err := fileSHA256(archivePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	llgoRoot := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(llgoRoot, "runtime"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(
+		filepath.Join(llgoRoot, "runtime", "go.mod"),
+		[]byte("module github.com/xgo-dev/llgo/runtime\n"), 0o644,
+	); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("LLGO_ROOT", llgoRoot)
+
+	destDir := filepath.Join(t.TempDir(), "esp-clang")
+	err = checkDownloadAndExtractESPClang(server.URL, "test", "linux", checksum, destDir)
+	if err == nil || !strings.Contains(err.Error(), "read ESP Clang license") {
+		t.Fatalf("checkDownloadAndExtractESPClang() error = %v, want license read error", err)
+	}
+	if _, err := os.Stat(destDir); !os.IsNotExist(err) {
+		t.Fatalf("destination status after failed install = %v, want not exist", err)
+	}
+	if _, err := os.Stat(destDir + ".extract"); !os.IsNotExist(err) {
+		t.Fatalf("temporary extraction directory status = %v, want not exist", err)
+	}
+}
+
+func TestInstallESPClangLicense(t *testing.T) {
+	llgoRoot := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(llgoRoot, "runtime"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(
+		filepath.Join(llgoRoot, "runtime", "go.mod"),
+		[]byte("module github.com/xgo-dev/llgo/runtime\n"), 0o644,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(llgoRoot, "LICENSES"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	const want = "complete LLVM license\n"
+	if err := os.WriteFile(
+		filepath.Join(llgoRoot, "LICENSES", espClangLicenseFile),
+		[]byte(want), 0o644,
+	); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("LLGO_ROOT", llgoRoot)
+
+	clangDir := t.TempDir()
+	if err := installESPClangLicense(clangDir); err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(filepath.Join(clangDir, "LICENSE-LLVM.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != want {
+		t.Fatalf("installed license = %q, want %q", got, want)
+	}
+}
+
+func TestInstallESPClangLicenseMissing(t *testing.T) {
+	llgoRoot := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(llgoRoot, "runtime"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(
+		filepath.Join(llgoRoot, "runtime", "go.mod"),
+		[]byte("module github.com/xgo-dev/llgo/runtime\n"), 0o644,
+	); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("LLGO_ROOT", llgoRoot)
+
+	err := installESPClangLicense(t.TempDir())
+	if err == nil || !strings.Contains(err.Error(), espClangLicenseFile) {
+		t.Fatalf("installESPClangLicense() error = %v, want missing license error", err)
+	}
+}
+
+func TestInstallESPClangLicenseWriteFailure(t *testing.T) {
+	llgoRoot := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(llgoRoot, "runtime"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(
+		filepath.Join(llgoRoot, "runtime", "go.mod"),
+		[]byte("module github.com/xgo-dev/llgo/runtime\n"), 0o644,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(llgoRoot, "LICENSES"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(
+		filepath.Join(llgoRoot, "LICENSES", espClangLicenseFile),
+		[]byte("complete LLVM license\n"), 0o644,
+	); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("LLGO_ROOT", llgoRoot)
+
+	notDir := filepath.Join(t.TempDir(), "not-a-directory")
+	if err := os.WriteFile(notDir, []byte("file"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	err := installESPClangLicense(notDir)
+	if err == nil || !strings.Contains(err.Error(), "install ESP Clang license") {
+		t.Fatalf("installESPClangLicense() error = %v, want write error", err)
+	}
+}
+
+func TestFileSHA256Errors(t *testing.T) {
+	for _, filename := range []string{filepath.Join(t.TempDir(), "missing"), t.TempDir()} {
+		if checksum, err := fileSHA256(filename); err == nil || checksum != "" {
+			t.Errorf("fileSHA256(%q) = %q, %v; want no checksum and an error", filename, checksum, err)
+		}
+	}
+}
+
+func TestESPClangRejectsChecksumMismatch(t *testing.T) {
+	archivePath := createTestTarGz(t, map[string]string{"esp-clang/bin/clang": "fake"})
+	defer os.Remove(archivePath)
+
+	archiveContent, err := os.ReadFile(archivePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := createTestServer(t, map[string]string{"clang-esp-test-linux.tar.xz": string(archiveContent)})
+	defer server.Close()
+
+	destination := filepath.Join(t.TempDir(), "esp-clang")
+	err = checkDownloadAndExtractESPClang(server.URL, "test", "linux", strings.Repeat("0", 64), destination)
+	if err == nil || !strings.Contains(err.Error(), "checksum mismatch") {
+		t.Fatalf("checksum mismatch error = %v", err)
+	}
+	if _, statErr := os.Stat(destination); !os.IsNotExist(statErr) {
+		t.Fatalf("destination exists after rejected download: %v", statErr)
 	}
 }
 
@@ -685,22 +1168,22 @@ func TestExtractZip(t *testing.T) {
 		}
 	})
 
-	// 3. Test non-writable destination
-	t.Run("UnwritableDestination", func(t *testing.T) {
+	// 3. Test a destination that cannot contain extracted files. Unlike Unix
+	// permission bits, this remains deterministic on Windows and as root.
+	t.Run("NonDirectoryDestination", func(t *testing.T) {
 		// Create test ZIP file
 		if err := createTestZip(zipPath); err != nil {
 			t.Fatal(err)
 		}
 
-		// Create read-only destination directory
-		readOnlyDir := filepath.Join(tempDir, "readonly")
-		if err := os.MkdirAll(readOnlyDir, 0400); err != nil {
+		notDirectory := filepath.Join(tempDir, "not-a-directory")
+		if err := os.WriteFile(notDirectory, nil, 0o644); err != nil {
 			t.Fatal(err)
 		}
 
 		// Execute extraction and expect error
-		if err := extractZip(zipPath, readOnlyDir); err == nil {
-			t.Error("Expected error for unwritable destination, got nil")
+		if err := extractZip(zipPath, notDirectory); err == nil {
+			t.Error("Expected error for non-directory destination, got nil")
 		}
 	})
 }

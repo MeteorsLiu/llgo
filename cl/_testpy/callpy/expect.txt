@@ -1,0 +1,6 @@
+bool = 0
+float = true
+pow = true
+long = 5
+max = true
+max again = true

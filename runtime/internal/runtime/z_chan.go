@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2024 The GoPlus Authors (goplus.org). All rights reserved.
+ * Copyright (c) 2024 The XGo Authors (xgo.dev). All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -19,38 +19,140 @@ package runtime
 import (
 	"unsafe"
 
-	c "github.com/goplus/llgo/runtime/internal/clite"
-	"github.com/goplus/llgo/runtime/internal/clite/pthread/sync"
+	c "github.com/xgo-dev/llgo/runtime/internal/clite"
+	"github.com/xgo-dev/llgo/runtime/internal/runtime/math"
 )
 
 // -----------------------------------------------------------------------------
 
+type Chan struct {
+	mutex chanMutex
+
+	qcount   int
+	dataqsiz int
+	buf      unsafe.Pointer
+	elemsize int
+	closed   bool
+	recvx    int
+	sendx    int
+
+	sendq chanWaitq
+	recvq chanWaitq
+}
+
+type chanWaitq struct {
+	first *chanWaiter
+	last  *chanWaiter
+}
+
+type chanWaiter struct {
+	prev *chanWaiter
+	next *chanWaiter
+	all  *chanWaiter
+
+	ch   *Chan
+	elem unsafe.Pointer
+	size int
+	send bool
+
+	queued bool
+	status waitStatus
+
+	signal chanSignal
+
+	sel       *selectState
+	caseIndex int
+}
+
+type selectState struct {
+	signal chanSignal
+
+	status waitStatus
+	chosen int
+}
+
+type waitStatus uint8
+
 const (
-	chanNoSendRecv = 0
-	chanHasRecv    = 1
+	waitPending waitStatus = iota
+	waitClaimed
+	waitRecvOK
+	waitRecvClosed
+	waitSendOK
+	waitSendClosed
 )
 
-type Chan struct {
-	mutex sync.Mutex
-	cond  sync.Cond
-	data  unsafe.Pointer
-	getp  int
-	len   int
-	cap   int
-	sops  []*selectOp
-	sends uint16
-	close bool
+func (s waitStatus) done() bool {
+	return s >= waitRecvOK
+}
+
+func (s waitStatus) recvOK() bool {
+	return s == waitRecvOK || s == waitSendOK
+}
+
+func (s waitStatus) panicOnWake() bool {
+	return s == waitSendClosed
+}
+
+func (q *chanWaitq) enqueue(w *chanWaiter) {
+	w.prev = q.last
+	w.next = nil
+	w.queued = true
+	if q.last == nil {
+		q.first = w
+	} else {
+		q.last.next = w
+	}
+	q.last = w
+}
+
+func (q *chanWaitq) dequeue() *chanWaiter {
+	w := q.first
+	if w != nil {
+		q.remove(w)
+	}
+	return w
+}
+
+func (q *chanWaitq) remove(w *chanWaiter) {
+	if !w.queued {
+		return
+	}
+	if w.prev == nil {
+		q.first = w.next
+	} else {
+		w.prev.next = w.next
+	}
+	if w.next == nil {
+		q.last = w.prev
+	} else {
+		w.next.prev = w.prev
+	}
+	w.prev = nil
+	w.next = nil
+	w.queued = false
 }
 
 func NewChan(eltSize, cap int) *Chan {
-	ret := new(Chan)
-	if cap > 0 {
-		ret.data = AllocU(uintptr(cap * eltSize))
-		ret.cap = cap
+	if cap < 0 {
+		panicMakeChanSize()
 	}
-	ret.mutex.Init(nil)
-	ret.cond.Init(nil)
+	mem, overflow := math.MulUintptr(uintptr(eltSize), uintptr(cap))
+	if overflow || mem > maxAlloc {
+		panicMakeChanSize()
+	}
+	ret := new(Chan)
+	ret.elemsize = eltSize
+	ret.dataqsiz = cap
+	if cap > 0 {
+		ret.buf = AllocU(mem)
+	}
+	ret.mutex.init()
 	return ret
+}
+
+func panicMakeChanSize() {
+	panic(errorString("makechan: size out of range"))
 }
 
 func ChanLen(p *Chan) (n int) {
@@ -58,7 +160,7 @@ func ChanLen(p *Chan) (n int) {
 		return 0
 	}
 	p.mutex.Lock()
-	n = p.len
+	n = p.qcount
 	p.mutex.Unlock()
 	return
 }
@@ -67,202 +169,333 @@ func ChanCap(p *Chan) int {
 	if p == nil {
 		return 0
 	}
-	return p.cap
+	return p.dataqsiz
 }
 
-func notifyOps(p *Chan) {
-	for _, sop := range p.sops {
-		sop.notify()
+func panicSendOnClosedChan() {
+	panic("send on closed channel")
+}
+
+func zeroChanRecv(v unsafe.Pointer, eltSize int) {
+	if v != nil && eltSize > 0 {
+		c.Memset(v, 0, uintptr(eltSize))
 	}
 }
 
-func ChanClose(p *Chan) {
-	p.mutex.Lock()
-	p.close = true
-	notifyOps(p)
-	p.mutex.Unlock()
-	p.cond.Broadcast()
+func copyChanElem(dst, src unsafe.Pointer, eltSize int) {
+	if dst != nil && src != nil && eltSize > 0 {
+		c.Memcpy(dst, src, uintptr(eltSize))
+	}
+}
+
+func chanBuf(p *Chan, i int) unsafe.Pointer {
+	return c.Advance(p.buf, i*p.elemsize)
+}
+
+func newChanWaiter(ch *Chan, elem unsafe.Pointer, eltSize int, send bool) *chanWaiter {
+	w := new(chanWaiter)
+	w.ch = ch
+	w.elem = elem
+	w.size = eltSize
+	w.send = send
+	w.signal.init()
+	w.signal.lock()
+	return w
+}
+
+func newSelectState() *selectState {
+	state := (*selectState)(c.Malloc(unsafe.Sizeof(selectState{})))
+	if state == nil {
+		panic("out of memory")
+	}
+	c.Memset(unsafe.Pointer(state), 0, unsafe.Sizeof(selectState{}))
+	state.chosen = -1
+	state.signal.init()
+	return state
+}
+
+func freeSelectState(state *selectState) {
+	state.signal.destroy()
+	c.Free(unsafe.Pointer(state))
+}
+
+func newSelectWaiter(ch *Chan, elem unsafe.Pointer, eltSize int, send bool, state *selectState, caseIndex int) *chanWaiter {
+	w := (*chanWaiter)(c.Malloc(unsafe.Sizeof(chanWaiter{})))
+	if w == nil {
+		panic("out of memory")
+	}
+	c.Memset(unsafe.Pointer(w), 0, unsafe.Sizeof(chanWaiter{}))
+	w.ch = ch
+	w.elem = elem
+	w.size = eltSize
+	w.send = send
+	w.sel = state
+	w.caseIndex = caseIndex
+	return w
+}
+
+func freeSelectWaiters(w *chanWaiter) {
+	for w != nil {
+		next := w.all
+		c.Free(unsafe.Pointer(w))
+		w = next
+	}
+}
+
+func (w *chanWaiter) wait() {
+	for !w.status.done() {
+		w.signal.park()
+	}
+	w.signal.unlock()
+	w.signal.destroy()
+}
+
+func (w *chanWaiter) finish(status waitStatus) {
+	if w.sel != nil {
+		w.sel.signal.lock()
+		w.sel.status = status
+		w.sel.signal.unlock()
+		w.sel.signal.ready()
+		return
+	}
+	w.signal.lock()
+	w.status = status
+	w.signal.unlock()
+	w.signal.ready()
+}
+
+func claimWaiter(w *chanWaiter) bool {
+	if w.sel != nil {
+		w.sel.signal.lock()
+		if w.sel.status != waitPending {
+			w.sel.signal.unlock()
+			return false
+		}
+		w.sel.status = waitClaimed
+		w.sel.chosen = w.caseIndex
+		w.sel.signal.unlock()
+		return true
+	}
+	return true
+}
+
+func completeRecvWaiter(w *chanWaiter, src unsafe.Pointer, eltSize int, status waitStatus) bool {
+	if !claimWaiter(w) {
+		return false
+	}
+	if status.recvOK() {
+		copyChanElem(w.elem, src, eltSize)
+	} else {
+		zeroChanRecv(w.elem, eltSize)
+	}
+	w.finish(status)
+	return true
+}
+
+func completeSendWaiter(w *chanWaiter, status waitStatus) bool {
+	if !claimWaiter(w) {
+		return false
+	}
+	w.finish(status)
+	return true
+}
+
+func recvFromSendWaiter(dst unsafe.Pointer, w *chanWaiter, eltSize int) bool {
+	if !claimWaiter(w) {
+		return false
+	}
+	copyChanElem(dst, w.elem, eltSize)
+	w.finish(waitSendOK)
+	return true
+}
+
+func dequeueRecvAndComplete(p *Chan, src unsafe.Pointer, eltSize int, status waitStatus) bool {
+	for {
+		w := p.recvq.dequeue()
+		if w == nil {
+			return false
+		}
+		if completeRecvWaiter(w, src, eltSize, status) {
+			return true
+		}
+	}
+}
+
+func dequeueSendAndRecv(p *Chan, dst unsafe.Pointer, eltSize int) bool {
+	for {
+		w := p.sendq.dequeue()
+		if w == nil {
+			return false
+		}
+		if recvFromSendWaiter(dst, w, eltSize) {
+			return true
+		}
+	}
+}
+
+func chanTrySendLocked(p *Chan, v unsafe.Pointer, eltSize int) (tryOK bool, closed bool) {
+	elemSize := p.elemsize
+	if p.closed {
+		return false, true
+	}
+	if dequeueRecvAndComplete(p, v, elemSize, waitRecvOK) {
+		return true, false
+	}
+	if p.qcount < p.dataqsiz {
+		copyChanElem(chanBuf(p, p.sendx), v, elemSize)
+		p.sendx++
+		if p.sendx == p.dataqsiz {
+			p.sendx = 0
+		}
+		p.qcount++
+		return true, false
+	}
+	return false, false
 }
 
 func ChanTrySend(p *Chan, v unsafe.Pointer, eltSize int) bool {
-	n := p.cap
-	p.mutex.Lock()
-	if n == 0 {
-		if p.getp != chanHasRecv || p.close {
-			p.mutex.Unlock()
-			return false
-		}
-		if p.data != nil {
-			c.Memcpy(p.data, v, uintptr(eltSize))
-		}
-		p.getp = chanNoSendRecv
-	} else {
-		if p.len == n || p.close {
-			p.mutex.Unlock()
-			return false
-		}
-		off := (p.getp + p.len) % n
-		c.Memcpy(c.Advance(p.data, off*eltSize), v, uintptr(eltSize))
-		p.len++
+	if p == nil {
+		return false
 	}
-	notifyOps(p)
+	p.mutex.Lock()
+	ok, closed := chanTrySendLocked(p, v, eltSize)
 	p.mutex.Unlock()
-	p.cond.Broadcast()
-	return true
+	if closed {
+		panicSendOnClosedChan()
+	}
+	return ok
 }
 
 func ChanSend(p *Chan, v unsafe.Pointer, eltSize int) bool {
-	n := p.cap
-	p.mutex.Lock()
-	if n == 0 {
-		for p.getp != chanHasRecv && !p.close {
-			p.sends++
-			p.cond.Wait(&p.mutex)
-			p.sends--
-		}
-		if p.close {
-			p.mutex.Unlock()
-			return false
-		}
-		if p.data != nil {
-			c.Memcpy(p.data, v, uintptr(eltSize))
-		}
-		p.getp = chanNoSendRecv
-	} else {
-		for p.len == n {
-			p.cond.Wait(&p.mutex)
-		}
-		if p.close {
-			p.mutex.Unlock()
-			return false
-		}
-		off := (p.getp + p.len) % n
-		c.Memcpy(c.Advance(p.data, off*eltSize), v, uintptr(eltSize))
-		p.len++
+	if p == nil {
+		blockForever()
+		return false
 	}
-	notifyOps(p)
+	p.mutex.Lock()
+	ok, closed := chanTrySendLocked(p, v, eltSize)
+	if closed {
+		p.mutex.Unlock()
+		panicSendOnClosedChan()
+	}
+	if ok {
+		p.mutex.Unlock()
+		return true
+	}
+	w := newChanWaiter(p, v, eltSize, true)
+	p.sendq.enqueue(w)
 	p.mutex.Unlock()
-	p.cond.Broadcast()
+
+	w.wait()
+	if w.status.panicOnWake() {
+		panicSendOnClosedChan()
+	}
 	return true
 }
 
+func chanTryRecvLocked(p *Chan, v unsafe.Pointer, eltSize int) (recvOK bool, tryOK bool) {
+	elemSize := p.elemsize
+	if p.dataqsiz == 0 {
+		if dequeueSendAndRecv(p, v, elemSize) {
+			return true, true
+		}
+	} else if p.qcount > 0 {
+		copyChanElem(v, chanBuf(p, p.recvx), elemSize)
+		zeroChanRecv(chanBuf(p, p.recvx), elemSize)
+		p.recvx++
+		if p.recvx == p.dataqsiz {
+			p.recvx = 0
+		}
+		p.qcount--
+		for p.qcount < p.dataqsiz {
+			w := p.sendq.dequeue()
+			if w == nil {
+				break
+			}
+			if !claimWaiter(w) {
+				continue
+			}
+			copyChanElem(chanBuf(p, p.sendx), w.elem, elemSize)
+			p.sendx++
+			if p.sendx == p.dataqsiz {
+				p.sendx = 0
+			}
+			p.qcount++
+			w.finish(waitSendOK)
+			break
+		}
+		return true, true
+	}
+	if p.closed {
+		zeroChanRecv(v, elemSize)
+		return false, true
+	}
+	return false, false
+}
+
 func ChanTryRecv(p *Chan, v unsafe.Pointer, eltSize int) (recvOK bool, tryOK bool) {
-	n := p.cap
+	if p == nil {
+		return false, false
+	}
 	p.mutex.Lock()
-	if n == 0 {
-		if p.sends == 0 || p.getp == chanHasRecv || p.close {
-			tryOK = p.close
-			p.mutex.Unlock()
-			return
-		}
-		p.getp = chanHasRecv
-		p.data = v
-	} else {
-		if p.len == 0 {
-			tryOK = p.close
-			p.mutex.Unlock()
-			return
-		}
-		if v != nil {
-			c.Memcpy(v, c.Advance(p.data, p.getp*eltSize), uintptr(eltSize))
-		}
-		p.getp = (p.getp + 1) % n
-		p.len--
-	}
-	notifyOps(p)
+	recvOK, tryOK = chanTryRecvLocked(p, v, eltSize)
 	p.mutex.Unlock()
-	p.cond.Broadcast()
-	if n == 0 {
-		p.mutex.Lock()
-		for p.getp == chanHasRecv && !p.close {
-			p.cond.Wait(&p.mutex)
-		}
-		recvOK = !p.close
-		tryOK = recvOK
-		p.mutex.Unlock()
-	} else {
-		recvOK, tryOK = true, true
-	}
 	return
 }
 
 func ChanRecv(p *Chan, v unsafe.Pointer, eltSize int) (recvOK bool) {
-	n := p.cap
+	if p == nil {
+		blockForever()
+		return false
+	}
 	p.mutex.Lock()
-	if n == 0 {
-		for p.getp == chanHasRecv && !p.close {
-			p.cond.Wait(&p.mutex)
-		}
-		if p.close {
-			p.mutex.Unlock()
-			return false
-		}
-		p.getp = chanHasRecv
-		p.data = v
-	} else {
-		for p.len == 0 {
-			if p.close {
-				p.mutex.Unlock()
-				return false
-			}
-			p.cond.Wait(&p.mutex)
-		}
-		if v != nil {
-			c.Memcpy(v, c.Advance(p.data, p.getp*eltSize), uintptr(eltSize))
-		}
-		p.getp = (p.getp + 1) % n
-		p.len--
-	}
-	notifyOps(p)
-	p.mutex.Unlock()
-	p.cond.Broadcast()
-	if n == 0 {
-		p.mutex.Lock()
-		for p.getp == chanHasRecv && !p.close {
-			p.cond.Wait(&p.mutex)
-		}
-		recvOK = !p.close
+	if recvOK, tryOK := chanTryRecvLocked(p, v, eltSize); tryOK {
 		p.mutex.Unlock()
-	} else {
-		recvOK = true
+		return recvOK
 	}
-	return
+	w := newChanWaiter(p, v, eltSize, false)
+	p.recvq.enqueue(w)
+	p.mutex.Unlock()
+
+	w.wait()
+	return w.status.recvOK()
+}
+
+func ChanClose(p *Chan) {
+	if p == nil {
+		panic("close of nil channel")
+	}
+	p.mutex.Lock()
+	if p.closed {
+		p.mutex.Unlock()
+		panic("close of closed channel")
+	}
+	p.closed = true
+	for {
+		w := p.recvq.dequeue()
+		if w == nil {
+			break
+		}
+		if completeRecvWaiter(w, nil, p.elemsize, waitRecvClosed) {
+			continue
+		}
+	}
+	for {
+		w := p.sendq.dequeue()
+		if w == nil {
+			break
+		}
+		if completeSendWaiter(w, waitSendClosed) {
+			continue
+		}
+	}
+	p.mutex.Unlock()
+}
+
+func blockForever() {
+	chanBlockForever()
 }
 
 // -----------------------------------------------------------------------------
-
-type selectOp struct {
-	mutex sync.Mutex
-	cond  sync.Cond
-	sem   bool
-}
-
-func (p *selectOp) init() {
-	p.mutex.Init(nil)
-	p.cond.Init(nil)
-	p.sem = false
-}
-
-func (p *selectOp) end() {
-	p.mutex.Destroy()
-	p.cond.Destroy()
-}
-
-func (p *selectOp) notify() {
-	p.mutex.Lock()
-	p.sem = true
-	p.mutex.Unlock()
-	p.cond.Signal()
-}
-
-func (p *selectOp) wait() {
-	p.mutex.Lock()
-	if !p.sem {
-		p.cond.Wait(&p.mutex)
-	}
-	p.sem = false
-	p.mutex.Unlock()
-}
 
 // ChanOp represents a channel operation.
 type ChanOp struct {
@@ -274,18 +507,97 @@ type ChanOp struct {
 	Send bool
 }
 
+const selectInlineChanCount = 8
+
+type selectChanList struct {
+	len    int
+	inline [selectInlineChanCount]*Chan
+	extra  []*Chan
+}
+
+func (l *selectChanList) get(i int) *Chan {
+	if l.extra != nil {
+		return l.extra[i]
+	}
+	return l.inline[i]
+}
+
+func (l *selectChanList) set(i int, ch *Chan) {
+	if l.extra != nil {
+		l.extra[i] = ch
+		return
+	}
+	l.inline[i] = ch
+}
+
+func (l *selectChanList) insert(pos int, ch *Chan) {
+	if l.extra != nil {
+		l.extra = append(l.extra, nil)
+		copy(l.extra[pos+1:], l.extra[pos:])
+		l.extra[pos] = ch
+		l.len++
+		return
+	}
+	if l.len == selectInlineChanCount {
+		extra := make([]*Chan, selectInlineChanCount+1, selectInlineChanCount*2)
+		copy(extra, l.inline[:pos])
+		extra[pos] = ch
+		copy(extra[pos+1:], l.inline[pos:])
+		l.extra = extra
+		l.len++
+		return
+	}
+	l.len++
+	for i := l.len - 1; i > pos; i-- {
+		l.set(i, l.get(i-1))
+	}
+	l.set(pos, ch)
+}
+
+func (l *selectChanList) add(ch *Chan) {
+	addr := uintptr(unsafe.Pointer(ch))
+	pos := 0
+	for pos < l.len {
+		cur := uintptr(unsafe.Pointer(l.get(pos)))
+		if cur == addr {
+			return
+		}
+		if cur > addr {
+			break
+		}
+		pos++
+	}
+	l.insert(pos, ch)
+}
+
 // TrySelect executes a non-blocking select operation.
 func TrySelect(ops ...ChanOp) (isel int, recvOK, tryOK bool) {
-	for isel = range ops {
+	n := len(ops)
+	if n == 0 {
+		return
+	}
+	start := selectStart(n)
+	for i := 0; i < n; i++ {
+		isel = (start + i) % n
 		op := ops[isel]
+		if op.C == nil {
+			continue
+		}
+		op.C.mutex.Lock()
 		if op.Send {
-			if tryOK = ChanTrySend(op.C, op.Val, int(op.Size)); tryOK {
-				return
+			var closed bool
+			tryOK, closed = chanTrySendLocked(op.C, op.Val, int(op.Size))
+			recvOK = true
+			op.C.mutex.Unlock()
+			if closed {
+				panicSendOnClosedChan()
 			}
 		} else {
-			if recvOK, tryOK = ChanTryRecv(op.C, op.Val, int(op.Size)); tryOK {
-				return
-			}
+			recvOK, tryOK = chanTryRecvLocked(op.C, op.Val, int(op.Size))
+			op.C.mutex.Unlock()
+		}
+		if tryOK {
+			return
 		}
 	}
 	return
@@ -293,40 +605,125 @@ func TrySelect(ops ...ChanOp) (isel int, recvOK, tryOK bool) {
 
 // Select executes a blocking select operation.
 func Select(ops ...ChanOp) (isel int, recvOK bool) {
-	selOp := new(selectOp) // TODO(xsw): use c.AllocaNew[selectOp]()
-	selOp.init()
-	for _, op := range ops {
-		prepareSelect(op.C, selOp)
+	if isel, recvOK, ok := TrySelect(ops...); ok {
+		return isel, recvOK
 	}
-	var tryOK bool
-	for {
-		if isel, recvOK, tryOK = TrySelect(ops...); tryOK {
-			break
+
+	var chans selectChanList
+	for _, op := range ops {
+		ch := op.C
+		if ch == nil {
+			continue
 		}
-		selOp.wait()
+		chans.add(ch)
 	}
-	for _, op := range ops {
-		endSelect(op.C, selOp)
+	if chans.len == 0 {
+		blockForever()
 	}
-	selOp.end()
+	lockSelectChannels(&chans)
+
+	start := selectStart(len(ops))
+	for n := 0; n < len(ops); n++ {
+		i := (start + n) % len(ops)
+		op := ops[i]
+		if op.C == nil {
+			continue
+		}
+		ch := op.C
+		var ready bool
+		if op.Send {
+			var closed bool
+			ready, closed = chanTrySendLocked(ch, op.Val, int(op.Size))
+			if closed {
+				unlockSelectChannels(&chans)
+				panicSendOnClosedChan()
+			}
+			if ready {
+				unlockSelectChannels(&chans)
+				return i, true
+			}
+		} else {
+			recvOK, ready = chanTryRecvLocked(ch, op.Val, int(op.Size))
+			if ready {
+				unlockSelectChannels(&chans)
+				return i, recvOK
+			}
+		}
+	}
+
+	state := newSelectState()
+
+	var waiters *chanWaiter
+	var lastWaiter *chanWaiter
+	for n := 0; n < len(ops); n++ {
+		i := (start + n) % len(ops)
+		op := ops[i]
+		if op.C == nil {
+			continue
+		}
+		w := newSelectWaiter(op.C, op.Val, int(op.Size), op.Send, state, i)
+		if op.Send {
+			op.C.sendq.enqueue(w)
+		} else {
+			op.C.recvq.enqueue(w)
+		}
+		if lastWaiter == nil {
+			waiters = w
+		} else {
+			lastWaiter.all = w
+		}
+		lastWaiter = w
+	}
+	unlockSelectChannels(&chans)
+
+	state.signal.lock()
+	for !state.status.done() {
+		state.signal.park()
+	}
+	isel = state.chosen
+	status := state.status
+	recvOK = status.recvOK()
+	state.signal.unlock()
+
+	for w := waiters; w != nil; w = w.all {
+		cleanupSelectWaiter(w)
+	}
+	freeSelectState(state)
+	freeSelectWaiters(waiters)
+	if status.panicOnWake() {
+		panicSendOnClosedChan()
+	}
 	return
 }
 
-func prepareSelect(c *Chan, selOp *selectOp) {
-	c.mutex.Lock()
-	c.sops = append(c.sops, selOp)
-	c.mutex.Unlock()
+func lockSelectChannels(chans *selectChanList) {
+	for i := 0; i < chans.len; i++ {
+		ch := chans.get(i)
+		ch.mutex.Lock()
+	}
 }
 
-func endSelect(c *Chan, selOp *selectOp) {
-	c.mutex.Lock()
-	for i, op := range c.sops {
-		if op == selOp {
-			c.sops = append(c.sops[:i], c.sops[i+1:]...)
-			break
-		}
+func unlockSelectChannels(chans *selectChanList) {
+	for i := chans.len - 1; i >= 0; i-- {
+		chans.get(i).mutex.Unlock()
 	}
-	c.mutex.Unlock()
+}
+
+func cleanupSelectWaiter(w *chanWaiter) {
+	w.ch.mutex.Lock()
+	if w.send {
+		w.ch.sendq.remove(w)
+	} else {
+		w.ch.recvq.remove(w)
+	}
+	w.ch.mutex.Unlock()
+}
+
+func selectStart(n int) int {
+	if n <= 1 {
+		return 0
+	}
+	return int(fastrand() % uint32(n))
 }
 
 // -----------------------------------------------------------------------------

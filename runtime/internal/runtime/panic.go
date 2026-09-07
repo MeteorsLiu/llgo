@@ -1,6 +1,6 @@
 // Copyright 2014 The Go Authors. All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Use of this source code is governed by a BSD-style license.
+// See LICENSES/Go-BSD-3-Clause.txt at this module root for license terms.
 
 package runtime
 
@@ -809,7 +809,7 @@ type PanicNilError struct {
 	_ [0]*PanicNilError
 }
 
-func (*PanicNilError) Error() string { return "panic called with nil argument" }
+func (*PanicNilError) Error() string { return panicNilErrorMessage() }
 func (*PanicNilError) RuntimeError() {}
 
 var panicnil = &godebugInc{name: "panicnil"}

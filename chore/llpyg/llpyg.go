@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2024 The GoPlus Authors (goplus.org). All rights reserved.
+ * Copyright (c) 2024 The XGo Authors (xgo.dev). All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -29,8 +29,8 @@ import (
 	"strings"
 
 	"github.com/goplus/gogen"
-	"github.com/goplus/llgo/chore/llpyg/pysig"
-	"github.com/goplus/llgo/ssa"
+	"github.com/xgo-dev/llgo/chore/llpyg/pysig"
+	"github.com/xgo-dev/llgo/ssa"
 )
 
 type symbol struct {
@@ -94,7 +94,7 @@ func main() {
 
 	obj := py.Ref("Object").(*types.TypeName).Type().(*types.Named)
 	objPtr := types.NewPointer(obj)
-	ret := types.NewTuple(pkg.NewParam(0, "", objPtr))
+	ret := types.NewTuple(pkg.NewParam(0, "", objPtr, false))
 
 	ctx := &context{pkg, obj, objPtr, ret, nil, py}
 	ctx.genMod(pkg, &mod)
@@ -201,7 +201,7 @@ func (ctx *context) genParams(pkg *gogen.Package, sig string) (*types.Tuple, boo
 			}
 			return types.NewTuple(list...), false
 		}
-		list = append(list, pkg.NewParam(0, genName(name, 0), objPtr))
+		list = append(list, pkg.NewParam(0, genName(name, 0), objPtr, false))
 	}
 	return types.NewTuple(list...), false
 }

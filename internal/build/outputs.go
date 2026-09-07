@@ -6,8 +6,8 @@ import (
 	"slices"
 	"strings"
 
-	"github.com/goplus/llgo/internal/crosscompile"
-	"github.com/goplus/llgo/internal/firmware"
+	"github.com/xgo-dev/llgo/internal/crosscompile"
+	"github.com/xgo-dev/llgo/internal/firmware"
 )
 
 // OutputCfg contains the generated output paths and conversion configuration
@@ -19,6 +19,14 @@ type OutputCfg struct {
 	BinFmt    string // Binary format for firmware conversion (may have -img suffix)
 	NeedFwGen bool   // Whether firmware image generation is needed
 	DirectGen bool   // True if can generate firmware directly without intermediate file
+}
+
+const pclnSidecarSuffix = ".pclntab"
+
+// pclnSidecarPath returns the conventional optional runtime-symbolization
+// artifact owned by an executable output.
+func pclnSidecarPath(executable string) string {
+	return executable + pclnSidecarSuffix
 }
 
 func genTempOutputFile(prefix, ext string) (string, error) {
@@ -47,45 +55,163 @@ func setOutFmt(conf *Config, formatName string) {
 }
 
 // buildOutFmts creates OutFmtDetails based on package, configuration and multi-package status
+// determineBaseNameAndDir extracts the base name and directory from configuration
+func determineBaseNameAndDir(pkgName string, conf *Config, multiPkg bool) (baseName, dir string) {
+	switch conf.Mode {
+	case ModeInstall:
+		return pkgName, conf.BinPath
+	case ModeBuild:
+		if conf.OutFile != "" && isDir(conf.OutFile) {
+			return pkgName, conf.OutFile
+		}
+		if !multiPkg && conf.OutFile != "" {
+			dir = filepath.Dir(conf.OutFile)
+			baseName = strings.TrimSuffix(filepath.Base(conf.OutFile), conf.AppExt)
+			if dir == "." {
+				dir = ""
+			}
+			return baseName, dir
+		}
+		return pkgName, ""
+	case ModeTest:
+		if conf.OutFile != "" {
+			// Handle -o flag for test mode
+			if strings.HasSuffix(conf.OutFile, "/") ||
+				strings.HasSuffix(conf.OutFile, `\`) || isDir(conf.OutFile) {
+				// If OutFile ends in / or is a directory, write pkg.test in that directory
+				// pkgName for test packages already includes .test suffix
+				return pkgName, conf.OutFile
+			}
+			// Otherwise, use the specified file path
+			dir = filepath.Dir(conf.OutFile)
+			baseName = strings.TrimSuffix(filepath.Base(conf.OutFile), conf.AppExt)
+			// Don't convert "." to "" for test mode with explicit output
+			// This preserves the information that user specified an output file
+			return baseName, dir
+		}
+		if conf.CompileOnly {
+			// -c without -o: write pkg.test in current directory
+			// pkgName for test packages already includes .test suffix
+			return pkgName, "."
+		}
+		// Default test mode without -c or -o: use temp file
+		return pkgName, ""
+	}
+	// Other modes (run, etc.)
+	return pkgName, ""
+}
+
+// isDir checks if path is a directory
+func isDir(path string) bool {
+	info, err := os.Stat(path)
+	return err == nil && info.IsDir()
+}
+
+// applyPrefix applies build mode specific naming conventions
+func applyPrefix(baseName string, buildMode BuildMode, target string, goos string) string {
+	// Determine the effective OS for naming conventions
+	effectiveGoos := goos
+	if target != "" {
+		// Embedded targets follow Linux conventions
+		effectiveGoos = "linux"
+	}
+
+	switch buildMode {
+	case BuildModeCArchive:
+		// Static libraries: libname.a (add lib prefix if missing)
+		if !strings.HasPrefix(baseName, "lib") {
+			return "lib" + baseName
+		}
+		return baseName
+
+	case BuildModeCShared:
+		// Shared libraries: libname.so/libname.dylib (add lib prefix if missing, except on Windows)
+		if effectiveGoos != "windows" && !strings.HasPrefix(baseName, "lib") {
+			return "lib" + baseName
+		}
+		return baseName
+
+	case BuildModeExe:
+		// Executables: name or name.exe (no lib prefix)
+		if strings.HasPrefix(baseName, "lib") {
+			return strings.TrimPrefix(baseName, "lib")
+		}
+		return baseName
+	}
+
+	return baseName
+}
+
+// buildOutputPath creates the final output path from baseName, dir and other parameters
+func buildOutputPath(baseName, dir string, conf *Config, multiPkg bool, appExt string) (string, error) {
+	// As with cmd/go, an explicit native -o file name is exact. Default
+	// executable and library suffixes apply only to implicit outputs (or to an
+	// output directory), while named embedded targets retain LLGo's existing
+	// format-specific extension behavior.
+	if conf.Target == "" && !multiPkg && conf.OutFile != "" &&
+		!strings.HasSuffix(conf.OutFile, "/") &&
+		!strings.HasSuffix(conf.OutFile, `\`) && !isDir(conf.OutFile) {
+		switch conf.Mode {
+		case ModeBuild, ModeTest:
+			return conf.OutFile, nil
+		}
+	}
+	baseName = applyPrefix(baseName, conf.BuildMode, conf.Target, conf.Goos)
+
+	if dir != "" {
+		// dir == "." means current directory (explicit user specification)
+		// other dir values are actual directory paths
+		if dir == "." {
+			return baseName + appExt, nil
+		}
+		return filepath.Join(dir, baseName+appExt), nil
+	} else if (conf.Mode == ModeBuild && multiPkg) || (conf.Mode != ModeBuild && conf.Mode != ModeInstall && conf.Mode != ModeTest) {
+		return genTempOutputFile(baseName, appExt)
+	} else if conf.Mode == ModeTest && !conf.CompileOnly && conf.OutFile == "" {
+		// Only create temp file for test mode when:
+		// - Not compile-only (-c flag not set)
+		// - No output file specified (-o flag not set)
+		return genTempOutputFile(baseName, appExt)
+	} else {
+		return baseName + appExt, nil
+	}
+}
+
 func buildOutFmts(pkgName string, conf *Config, multiPkg bool, crossCompile *crosscompile.Export) (*OutFmtDetails, error) {
 	details := &OutFmtDetails{}
-	var err error
-	if conf.Target == "" {
-		// Native target
-		if conf.Mode == ModeInstall {
-			details.Out = filepath.Join(conf.BinPath, pkgName+conf.AppExt)
-		} else if conf.Mode == ModeBuild && !multiPkg && conf.OutFile != "" {
-			base := strings.TrimSuffix(conf.OutFile, conf.AppExt)
-			details.Out = base + conf.AppExt
-		} else if conf.Mode == ModeBuild && !multiPkg {
-			details.Out = pkgName + conf.AppExt
-		} else {
-			details.Out, err = genTempOutputFile(pkgName, conf.AppExt)
-			if err != nil {
-				return nil, err
-			}
+
+	// Determine base name and directory
+	baseName, dir := determineBaseNameAndDir(pkgName, conf, multiPkg)
+	if conf.Target == "" && conf.Mode == ModeTest && !conf.CompileOnly && conf.OutFile == "" {
+		// codesign examines an executable's parent directory while deciding
+		// whether it belongs to a bundle. Keep each implicit test binary in a
+		// small LLGo-owned directory instead of making every link scan the shared
+		// system temp directory. The directory is removed after the test runs.
+		var err error
+		details.tempDir, err = os.MkdirTemp("", "llgo-test-*")
+		if err != nil {
+			return nil, err
 		}
+		dir = details.tempDir
+	}
+
+	// Build output path
+	outputPath, err := buildOutputPath(baseName, dir, conf, multiPkg, conf.AppExt)
+	if err != nil {
+		removeOutFmts(details)
+		return nil, err
+	}
+	details.Out = outputPath
+	if conf.PCLNMode == PCLNExternal {
+		details.PCLN = pclnSidecarPath(details.Out)
+	}
+
+	if conf.Target == "" {
+		// Native target - we're done
 		return details, nil
 	}
 
 	needRun := slices.Contains([]Mode{ModeRun, ModeTest, ModeCmpTest, ModeInstall}, conf.Mode)
-
-	if multiPkg {
-		details.Out, err = genTempOutputFile(pkgName, conf.AppExt)
-		if err != nil {
-			return nil, err
-		}
-	} else if conf.OutFile != "" {
-		base := strings.TrimSuffix(conf.OutFile, conf.AppExt)
-		details.Out = base + conf.AppExt
-	} else if conf.Mode == ModeBuild {
-		details.Out = pkgName + conf.AppExt
-	} else {
-		details.Out, err = genTempOutputFile(pkgName, conf.AppExt)
-		if err != nil {
-			return nil, err
-		}
-	}
 
 	// Check emulator format if emulator mode is enabled
 	outFmt := ""
@@ -160,6 +286,63 @@ func (details *OutFmtDetails) ToEnvMap() map[string]string {
 	if details.Zip != "" {
 		envMap["zip"] = details.Zip
 	}
+	if details.PCLN != "" {
+		envMap["pclntab"] = details.PCLN
+	}
 
 	return envMap
+}
+
+func defaultAppExt(conf *Config) string {
+	// Handle build mode specific extensions first
+	switch conf.BuildMode {
+	case BuildModeCArchive:
+		return ".a"
+	case BuildModeCShared:
+		switch conf.Goos {
+		case "windows":
+			return ".dll"
+		case "darwin":
+			return ".dylib"
+		default:
+			return ".so"
+		}
+	case BuildModeExe:
+		if conf.Goos == "js" && conf.OutFile != "" {
+			switch ext := filepath.Ext(conf.OutFile); ext {
+			case ".js", ".mjs":
+				return ext
+			}
+		}
+		// For executable mode, handle target-specific logic
+		if conf.Target != "" {
+			switch conf.Target {
+			case "emscripten", "emscripten-memory64", "wasm":
+				// Emscripten uses the requested output suffix to select its
+				// product. ES-module glue is the executable; emcc emits the
+				// sibling .wasm module that it loads.
+				return ".mjs"
+			case "wasi", "wasip1", "wasip2", "wasm-unknown":
+				return ".wasm"
+			}
+			// Preserve the historical extension for custom/future WASI and
+			// WebAssembly profiles. Emscripten profiles are listed above because
+			// their executable is JavaScript glue rather than the sibling module.
+			if strings.HasPrefix(conf.Target, "wasi") || strings.HasPrefix(conf.Target, "wasm") {
+				return ".wasm"
+			}
+			return ".elf"
+		}
+
+		switch conf.Goos {
+		case "windows":
+			return ".exe"
+		case "wasi", "wasip1", "js":
+			return ".wasm"
+		}
+		return ""
+	}
+
+	// This should not be reached, but kept for safety
+	return ""
 }

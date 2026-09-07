@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2024 The GoPlus Authors (goplus.org). All rights reserved.
+ * Copyright (c) 2024 The XGo Authors (xgo.dev). All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -19,7 +19,7 @@ package runtime
 import (
 	"unsafe"
 
-	c "github.com/goplus/llgo/runtime/internal/clite"
+	c "github.com/xgo-dev/llgo/runtime/internal/clite"
 )
 
 func CString(s string) *int8 {
@@ -34,10 +34,16 @@ func CBytes(b []byte) *int8 {
 }
 
 func GoString(p *int8) string {
+	if p == nil {
+		return ""
+	}
 	return GoStringN(p, int(c.Strlen(p)))
 }
 
 func GoStringN(p *int8, n int) string {
+	if n <= 0 {
+		return ""
+	}
 	return string((*[1 << 30]byte)(unsafe.Pointer(p))[:n:n])
 }
 

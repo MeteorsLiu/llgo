@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2024 The GoPlus Authors (goplus.org). All rights reserved.
+ * Copyright (c) 2024 The XGo Authors (xgo.dev). All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -23,7 +23,7 @@ import (
 	"path/filepath"
 	"runtime"
 
-	"github.com/goplus/llgo/internal/packages"
+	"github.com/xgo-dev/llgo/internal/packages"
 )
 
 /*
@@ -71,12 +71,17 @@ func cleanMainPkg(pkg *packages.Package, conf *Config, verbose bool) {
 	name := path.Base(pkgPath)
 	fname := name + conf.AppExt
 	app := filepath.Join(conf.BinPath, fname)
-	removeFile(app, verbose)
+	removeExecutableArtifacts(app, verbose)
 	if len(pkg.CompiledGoFiles) > 0 {
 		dir := filepath.Dir(pkg.CompiledGoFiles[0])
 		buildApp := filepath.Join(dir, fname)
-		removeFile(buildApp, verbose)
+		removeExecutableArtifacts(buildApp, verbose)
 	}
+}
+
+func removeExecutableArtifacts(executable string, verbose bool) {
+	removeFile(executable, verbose)
+	removeFile(pclnSidecarPath(executable), verbose)
 }
 
 func cleanPkgs(initial []*packages.Package, verbose bool) {

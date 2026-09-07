@@ -21,14 +21,13 @@ builds:
     flags:
       - -tags=darwin,amd64,byollvm
     ldflags:
-      - -X github.com/goplus/llgo/internal/env.buildVersion=v{{.Version}}
-      - -X github.com/goplus/llgo/internal/env.buildTime={{.Date}}
-      - -X github.com/goplus/llgo/xtool/env/llvm.ldLLVMConfigBin=/usr/local/opt/llvm@19/bin/llvm-config
+      - -X github.com/xgo-dev/llgo/internal/env.buildVersion=v{{.Version}}
+      - -X github.com/xgo-dev/llgo/internal/env.buildTime={{.Date}}
     env:
       - CC=o64-clang
       - CXX=o64-clang++
-      - CGO_CPPFLAGS=-I{{.Env.SYSROOT_DARWIN_AMD64}}/usr/local/opt/llvm@19/include -mmacosx-version-min=10.13 -D__STDC_CONSTANT_MACROS -D__STDC_FORMAT_MACROS -D__STDC_LIMIT_MACROS
-      - CGO_LDFLAGS=-L{{.Env.SYSROOT_DARWIN_AMD64}}/usr/local/opt/llvm@19/lib -mmacosx-version-min=10.13 -Wl,-search_paths_first -Wl,-headerpad_max_install_names -lLLVM-19 -lz -lm
+      - CGO_CPPFLAGS=-I{{.Env.SYSROOT_DARWIN_AMD64}}/crosscompile/clang/include -mmacosx-version-min=10.13 -D__STDC_CONSTANT_MACROS -D__STDC_FORMAT_MACROS -D__STDC_LIMIT_MACROS
+      - CGO_LDFLAGS=-L{{.Env.SYSROOT_DARWIN_AMD64}}/crosscompile/clang/lib -mmacosx-version-min=10.13 -Wl,-search_paths_first -Wl,-headerpad_max_install_names -lLLVM-22 -lz -lm -Wl,-rpath,@executable_path/../crosscompile/clang/lib
     targets:
       - darwin_amd64
     mod_timestamp: "{{.CommitTimestamp}}"
@@ -38,14 +37,13 @@ builds:
     flags:
       - -tags=darwin,arm64,byollvm
     ldflags:
-      - -X github.com/goplus/llgo/internal/env.buildVersion=v{{.Version}}
-      - -X github.com/goplus/llgo/internal/env.buildTime={{.Date}}
-      - -X github.com/goplus/llgo/xtool/env/llvm.ldLLVMConfigBin=/opt/homebrew/opt/llvm@19/bin/llvm-config
+      - -X github.com/xgo-dev/llgo/internal/env.buildVersion=v{{.Version}}
+      - -X github.com/xgo-dev/llgo/internal/env.buildTime={{.Date}}
     env:
       - CC=oa64-clang
       - CXX=oa64-clang++
-      - CGO_CPPFLAGS=-I{{.Env.SYSROOT_DARWIN_ARM64}}/opt/homebrew/opt/llvm@19/include -mmacosx-version-min=10.13 -D__STDC_CONSTANT_MACROS -D__STDC_FORMAT_MACROS -D__STDC_LIMIT_MACROS
-      - CGO_LDFLAGS=-L{{.Env.SYSROOT_DARWIN_ARM64}}/opt/homebrew/opt/llvm@19/lib -mmacosx-version-min=10.13 -Wl,-search_paths_first -Wl,-headerpad_max_install_names -lLLVM-19 -lz -lm
+      - CGO_CPPFLAGS=-I{{.Env.SYSROOT_DARWIN_ARM64}}/crosscompile/clang/include -mmacosx-version-min=10.13 -D__STDC_CONSTANT_MACROS -D__STDC_FORMAT_MACROS -D__STDC_LIMIT_MACROS
+      - CGO_LDFLAGS=-L{{.Env.SYSROOT_DARWIN_ARM64}}/crosscompile/clang/lib -mmacosx-version-min=10.13 -Wl,-search_paths_first -Wl,-headerpad_max_install_names -lLLVM-22 -lz -lm -Wl,-rpath,@executable_path/../crosscompile/clang/lib
     targets:
       - darwin_arm64
     mod_timestamp: "{{.CommitTimestamp}}"
@@ -55,14 +53,17 @@ builds:
     flags:
       - -tags=linux,amd64,byollvm
     ldflags:
-      - -X github.com/goplus/llgo/internal/env.buildVersion=v{{.Version}}
-      - -X github.com/goplus/llgo/internal/env.buildTime={{.Date}}
-      - -X github.com/goplus/llgo/xtool/env/llvm.ldLLVMConfigBin=/usr/lib/llvm-19/bin/llvm-config
+      - -X github.com/xgo-dev/llgo/internal/env.buildVersion=v{{.Version}}
+      - -X github.com/xgo-dev/llgo/internal/env.buildTime={{.Date}}
+      - "-extldflags=-Wl,-rpath,$ORIGIN/../crosscompile/clang/lib"
     env:
-      - CC=x86_64-linux-gnu-gcc
-      - CXX=x86_64-linux-gnu-g++
-      - CGO_CPPFLAGS=--sysroot={{.Env.SYSROOT_LINUX_AMD64}} -I{{.Env.SYSROOT_LINUX_AMD64}}/usr/include/llvm-19 -I{{.Env.SYSROOT_LINUX_AMD64}}/usr/include/llvm-c-19 -D_GNU_SOURCE -D__STDC_CONSTANT_MACROS -D__STDC_FORMAT_MACROS -D__STDC_LIMIT_MACROS
-      - CGO_LDFLAGS=--sysroot={{.Env.SYSROOT_LINUX_AMD64}} -L{{.Env.SYSROOT_LINUX_AMD64}}/usr/lib/llvm-19/lib -lLLVM-19
+      # Use the packaged host Clang with the Debian 12 sysroot and GCC 12 headers.
+      - CC={{.Env.SYSROOT_LINUX_AMD64}}/crosscompile/clang/bin/clang
+      - CXX={{.Env.SYSROOT_LINUX_AMD64}}/crosscompile/clang/bin/clang++
+      - CGO_CPPFLAGS=--target=x86_64-linux-gnu --gcc-toolchain={{.Env.SYSROOT_LINUX_AMD64}}/usr --sysroot={{.Env.SYSROOT_LINUX_AMD64}} -I{{.Env.SYSROOT_LINUX_AMD64}}/crosscompile/clang/include -D_GNU_SOURCE -D__STDC_CONSTANT_MACROS -D__STDC_FORMAT_MACROS -D__STDC_LIMIT_MACROS
+      - CGO_CXXFLAGS=-std=c++17 -nostdinc++ -isystem {{.Env.SYSROOT_LINUX_AMD64}}/usr/include/c++/12 -isystem {{.Env.SYSROOT_LINUX_AMD64}}/usr/include/x86_64-linux-gnu/c++/12 -isystem {{.Env.SYSROOT_LINUX_AMD64}}/usr/include/c++/12/backward
+      - CGO_LDFLAGS=--target=x86_64-linux-gnu --gcc-toolchain={{.Env.SYSROOT_LINUX_AMD64}}/usr --sysroot={{.Env.SYSROOT_LINUX_AMD64}} -L{{.Env.SYSROOT_LINUX_AMD64}}/crosscompile/clang/lib -L{{.Env.SYSROOT_LINUX_AMD64}}/usr/lib/gcc/x86_64-linux-gnu/12 -L{{.Env.SYSROOT_LINUX_AMD64}}/usr/lib/x86_64-linux-gnu -L{{.Env.SYSROOT_LINUX_AMD64}}/lib/x86_64-linux-gnu -lLLVM-22 -lz
+      - CGO_LDFLAGS_ALLOW=(--target=.*|--gcc-toolchain=.*|--sysroot.*)
     targets:
       - linux_amd64
     mod_timestamp: "{{.CommitTimestamp}}"
@@ -72,35 +73,49 @@ builds:
     flags:
       - -tags=linux,arm64,byollvm
     ldflags:
-      - -X github.com/goplus/llgo/internal/env.buildVersion=v{{.Version}}
-      - -X github.com/goplus/llgo/internal/env.buildTime={{.Date}}
-      - -X github.com/goplus/llgo/xtool/env/llvm.ldLLVMConfigBin=/usr/lib/llvm-19/bin/llvm-config
+      - -X github.com/xgo-dev/llgo/internal/env.buildVersion=v{{.Version}}
+      - -X github.com/xgo-dev/llgo/internal/env.buildTime={{.Date}}
+      - "-extldflags=-Wl,-rpath,$ORIGIN/../crosscompile/clang/lib"
     env:
-      - CC=aarch64-linux-gnu-gcc
-      - CXX=aarch64-linux-gnu-g++
-      - CGO_CPPFLAGS=--sysroot={{.Env.SYSROOT_LINUX_ARM64}} -I{{.Env.SYSROOT_LINUX_ARM64}}/usr/include/llvm-19 -I{{.Env.SYSROOT_LINUX_ARM64}}/usr/include/llvm-c-19 -D_GNU_SOURCE -D__STDC_CONSTANT_MACROS -D__STDC_FORMAT_MACROS -D__STDC_LIMIT_MACROS
-      - CGO_LDFLAGS=--sysroot={{.Env.SYSROOT_LINUX_ARM64}} -L{{.Env.SYSROOT_LINUX_ARM64}}/usr/lib/llvm-19/lib -lLLVM-19
+      # The amd64 Clang driver is multi-target; libraries and headers stay arm64.
+      - CC={{.Env.SYSROOT_LINUX_AMD64}}/crosscompile/clang/bin/clang
+      - CXX={{.Env.SYSROOT_LINUX_AMD64}}/crosscompile/clang/bin/clang++
+      - CGO_CPPFLAGS=--target=aarch64-linux-gnu --gcc-toolchain={{.Env.SYSROOT_LINUX_ARM64}}/usr --sysroot={{.Env.SYSROOT_LINUX_ARM64}} -I{{.Env.SYSROOT_LINUX_ARM64}}/crosscompile/clang/include -D_GNU_SOURCE -D__STDC_CONSTANT_MACROS -D__STDC_FORMAT_MACROS -D__STDC_LIMIT_MACROS
+      - CGO_CXXFLAGS=-std=c++17 -nostdinc++ -isystem {{.Env.SYSROOT_LINUX_ARM64}}/usr/include/c++/12 -isystem {{.Env.SYSROOT_LINUX_ARM64}}/usr/include/aarch64-linux-gnu/c++/12 -isystem {{.Env.SYSROOT_LINUX_ARM64}}/usr/include/c++/12/backward
+      - CGO_LDFLAGS=--target=aarch64-linux-gnu --gcc-toolchain={{.Env.SYSROOT_LINUX_ARM64}}/usr --sysroot={{.Env.SYSROOT_LINUX_ARM64}} -L{{.Env.SYSROOT_LINUX_ARM64}}/crosscompile/clang/lib -L{{.Env.SYSROOT_LINUX_ARM64}}/usr/lib/gcc/aarch64-linux-gnu/12 -L{{.Env.SYSROOT_LINUX_ARM64}}/usr/lib/aarch64-linux-gnu -L{{.Env.SYSROOT_LINUX_ARM64}}/lib/aarch64-linux-gnu -lLLVM-22 -lz
+      - CGO_LDFLAGS_ALLOW=(--target=.*|--gcc-toolchain=.*|--sysroot.*)
     targets:
       - linux_arm64
     mod_timestamp: "{{.CommitTimestamp}}"
 
 archives:
-  - format: tar.gz
+  - formats: [tar.gz]
     name_template: >-
       {{.ProjectName}}{{.Version}}.{{.Os}}-{{.Arch}}
       {{- if .Arm}}v{{.Arm}}{{end}}
     files:
       - LICENSE
+      - LICENSES
       - README.md
+      - THIRD_PARTY_NOTICES.md
       - runtime
-
+      - targets
+      - src: ".sysroot/{{.Os}}/{{.Arch}}/crosscompile/clang"
+        dst: crosscompile/clang
+        info:
+          mode: 0755
 checksum:
   name_template: "{{.ProjectName}}{{.Version}}.checksums.txt"
+  # Windows CGO builds run on native Windows runners and arrive as tested
+  # integrated archives. The snapshot pass produces the Unix build metadata
+  # they consume; the tag pass includes all eight archives in one checksum file.
+  extra_files:
+    - glob: '{{ if not .IsSnapshot }}.windows-dist/llgo{{ .Version }}.windows-*.tar.gz{{ end }}'
 
 nfpms:
   - package_name: llgo
     vendor: goplus
-    homepage: https://github.com/goplus/llgo
+    homepage: https://github.com/xgo-dev/llgo
     maintainer: Aofei Sheng <aofei@aofeisheng.com>
     description: |
       LLGo is a Go compiler based on LLVM in order to better integrate Go with the C ecosystem including Python. It's a
@@ -121,6 +136,14 @@ nfpms:
       {{.ProjectName}}{{.Version}}.{{.Os}}-{{.Arch}}
       {{- if .Arm}}v{{.Arm}}{{end}}
     bindir: /usr/local/bin
+    contents:
+      - src: LICENSE
+        dst: /usr/share/doc/llgo/LICENSE
+      - src: THIRD_PARTY_NOTICES.md
+        dst: /usr/share/doc/llgo/THIRD_PARTY_NOTICES.md
+      - src: LICENSES/
+        dst: /usr/share/doc/llgo/LICENSES
+        type: tree
 
 snapcrafts:
   - name: llgo
@@ -139,12 +162,21 @@ snapcrafts:
       - ...
     license: Apache-2.0
     confinement: classic
+    extra_files:
+      - source: LICENSE
+        destination: usr/share/doc/llgo/LICENSE
+      - source: THIRD_PARTY_NOTICES.md
+        destination: usr/share/doc/llgo/THIRD_PARTY_NOTICES.md
+      - source: LICENSES
+        destination: usr/share/doc/llgo/LICENSES
     name_template: >-
       {{.ProjectName}}{{.Version}}.{{.Os}}-{{.Arch}}
       {{- if .Arm}}v{{.Arm}}{{end}}
 
 snapshot:
-  name_template: '{{trimprefix .Summary "v"}}'
+  version_template: '{{trimprefix .Summary "v"}}'
 
 release:
   prerelease: auto
+  extra_files:
+    - glob: '{{ if not .IsSnapshot }}.windows-dist/llgo{{ .Version }}.windows-*.tar.gz{{ end }}'

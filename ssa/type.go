@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2024 The GoPlus Authors (goplus.org). All rights reserved.
+ * Copyright (c) 2024 The XGo Authors (xgo.dev). All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -18,11 +18,12 @@ package ssa
 
 import (
 	"fmt"
+	"go/token"
 	"go/types"
 	"unsafe"
 
-	"github.com/goplus/llgo/ssa/abi"
-	"github.com/goplus/llvm"
+	"github.com/xgo-dev/llgo/ssa/abi"
+	"github.com/xgo-dev/llvm"
 )
 
 var (
@@ -47,6 +48,7 @@ const (
 	vkFuncDecl
 	vkFuncPtr
 	vkClosure
+	vkIfaceMethod
 	vkBuiltin
 	vkPyFuncRef
 	vkPyVarRef
@@ -99,6 +101,9 @@ func (p *goProgram) Alignof(T types.Type) int64 {
 func (p *goProgram) Offsetsof(fields []*types.Var) (ret []int64) {
 	prog := Program(unsafe.Pointer(p))
 	ptrSize := int64(prog.PointerSize())
+	if abi.IsClosureFields(fields) {
+		return []int64{0, ptrSize}
+	}
 	extra := int64(0)
 	ret = p.sizes.Offsetsof(fields)
 	for i, f := range fields {
@@ -126,14 +131,21 @@ func (p *goProgram) extraSize(typ types.Type, ptrSize int64) (ret int64) {
 retry:
 	switch t := typ.(type) {
 	case *types.Named:
-		if v, ok := p.gocvt.typbg.Load(namedLinkname(t)); ok && v.(Background) == InC {
+		prog := Program(unsafe.Pointer(p))
+		if background, ok := prog.packageTypeBackground(namedLinkname(t)); ok && isNativeFuncBackground(background) {
 			return 0
 		}
 		typ = t.Underlying()
 		goto retry
+	case *types.Alias:
+		typ = types.Unalias(t)
+		goto retry
 	case *types.Signature:
 		return ptrSize
 	case *types.Struct:
+		if IsClosure(t) {
+			return
+		}
 		n := t.NumFields()
 		for i := 0; i < n; i++ {
 			f := t.Field(i)
@@ -185,6 +197,11 @@ func (p Program) SizeOf(typ Type, n ...int64) uint64 {
 	return size
 }
 
+// AlignOf returns the ABI alignment of typ for the current target.
+func (p Program) AlignOf(typ Type) uint64 {
+	return uint64(p.td.ABITypeAlignment(typ.ll))
+}
+
 // OffsetOf returns the offset of a field in a struct.
 func (p Program) OffsetOf(typ Type, i int) uint64 {
 	return p.td.ElementOffset(typ.ll, i)
@@ -205,6 +222,11 @@ func OffsetOf(prog Program, t Type, i int) Expr {
 
 func (p Program) PointerSize() int {
 	return p.ptrSize
+}
+
+// IsRegularMemory reports whether values of typ may be compared bytewise.
+func (p Program) IsRegularMemory(typ types.Type) bool {
+	return p.abi.IsRegularMemory(typ)
 }
 
 func (p Program) Slice(typ Type) Type {
@@ -240,9 +262,23 @@ func (p Program) Field(typ Type, i int) Type {
 		}
 		panic("Field: basic type doesn't have fields")
 	default:
-		fld = t.(*types.Struct).Field(i)
+		st := t.(*types.Struct)
+		if i < 0 || i >= st.NumFields() {
+			panic(fmt.Sprintf("Field: struct index out of range: idx=%d fields=%d type=%s",
+				i, st.NumFields(), typeStringWithPkg(typ.raw.Type)))
+		}
+		fld = st.Field(i)
 	}
 	return p.rawType(fld.Type())
+}
+
+func typeStringWithPkg(t types.Type) string {
+	return types.TypeString(t, func(p *types.Package) string {
+		if p == nil {
+			return ""
+		}
+		return p.Path()
+	})
 }
 
 func (p Program) rawType(raw types.Type) Type {
@@ -256,7 +292,8 @@ func (p Program) rawType(raw types.Type) Type {
 
 func (p Program) tyVoidPtr() llvm.Type {
 	if p.voidPtrTy.IsNil() {
-		p.voidPtrTy = llvm.PointerType(p.tyVoid(), 0)
+		// No void* in llvm, all the pointers are opaque pointer.
+		p.voidPtrTy = llvm.PointerType(p.tyInt8(), 0)
 	}
 	return p.voidPtrTy
 }
@@ -324,6 +361,9 @@ func (p Program) toTuple(typ *types.Tuple) Type {
 */
 
 func (p Program) toType(raw types.Type) Type {
+	if typ, ok := cvtGoSSAOpaqueType(raw); ok {
+		return p.rawType(typ)
+	}
 	typ := rawType{raw}
 	switch t := raw.(type) {
 	case *types.Basic:
@@ -364,8 +404,10 @@ func (p Program) toType(raw types.Type) Type {
 			return &aType{p.tyVoidPtr(), typ, vkPtr}
 		}
 	case *types.Pointer:
-		elem := p.rawType(t.Elem())
-		return &aType{llvm.PointerType(elem.ll, 0), typ, vkPtr}
+		// LLVM pointers are opaque, so the element LLVM type is not needed here.
+		// Avoid expanding it eagerly: legal Go recursive types often close their
+		// cycle through a pointer.
+		return &aType{p.tyVoidPtr(), typ, vkPtr}
 	case *types.Interface:
 		if t.Empty() {
 			return &aType{p.rtEface(), typ, vkEface}
@@ -397,21 +439,22 @@ func (p Program) toType(raw types.Type) Type {
 	panic(fmt.Sprintf("toLLVMType: todo - %T\n", raw))
 }
 
-func (p Program) toLLVMNamedStruct(name string, raw *types.Struct) llvm.Type {
-	if typ, ok := p.named[name]; ok {
-		return typ
-	}
+func (p Program) toLLVMNamedStruct(name string, raw *types.Named, st *types.Struct, kind valueKind) Type {
 	t := p.ctx.StructCreateNamed(name)
-	p.named[name] = t
-	fields := p.toLLVMFields(raw)
+	typ := &aType{t, rawType{raw}, kind}
+	p.named[name] = typ
+	p.typs.Set(raw, typ)
+	fields, layout := p.toLLVMStructBody(st, p.hasNativeStructLayout(raw))
 	t.StructSetBody(fields, false)
-	return t
+	p.setStructLayout(raw, layout)
+	return typ
 }
 
 func (p Program) toLLVMStruct(raw *types.Struct) (ret llvm.Type, kind valueKind) {
-	fields := p.toLLVMFields(raw)
+	fields, layout := p.toLLVMStructBody(raw, false)
 	ret = p.ctx.StructType(fields, false)
-	if isClosure(raw) {
+	p.setStructLayout(raw, layout)
+	if IsClosure(raw) {
 		kind = vkClosure
 	} else {
 		kind = vkStruct
@@ -419,15 +462,8 @@ func (p Program) toLLVMStruct(raw *types.Struct) (ret llvm.Type, kind valueKind)
 	return
 }
 
-func isClosure(raw *types.Struct) bool {
-	n := raw.NumFields()
-	if n == 2 {
-		f1, f2 := raw.Field(0), raw.Field(1)
-		if _, ok := f1.Type().(*types.Signature); ok && f1.Name() == "$f" {
-			return f2.Type() == types.Typ[types.UnsafePointer] && f2.Name() == "$data"
-		}
-	}
-	return false
+func IsClosure(raw *types.Struct) bool {
+	return abi.IsClosure(raw)
 }
 
 func (p Program) toLLVMFields(raw *types.Struct) (fields []llvm.Type) {
@@ -442,7 +478,22 @@ func (p Program) toLLVMFields(raw *types.Struct) (fields []llvm.Type) {
 }
 
 func (p Program) toLLVMTuple(t *types.Tuple) llvm.Type {
-	return p.ctx.StructType(p.toLLVMTypes(t, t.Len()), false)
+	if p.target.effectiveGOARCH() != "386" {
+		return p.ctx.StructType(p.toLLVMTypes(t, t.Len()), false)
+	}
+	fields := make([]*types.Var, t.Len())
+	for i := range fields {
+		// Tuple result names are not part of their type and may be empty or
+		// repeated. Give the layout-only struct unique private field names.
+		fields[i] = types.NewField(token.NoPos, nil, fmt.Sprintf("_llgo%d", i), t.At(i).Type(), false)
+	}
+	// Multiple results are represented as an anonymous LLVM aggregate. Keep
+	// its physical layout identical to the equivalent Go struct: on 386,
+	// i64 and double fields are only four-byte aligned. Calls and returns are
+	// otherwise liable to disagree about offsets across package boundaries.
+	body, layout := p.toLLVMStructBody(types.NewStruct(fields, nil), false)
+	p.setStructLayout(t, layout)
+	return p.ctx.StructType(body, false)
 }
 
 func (p Program) toLLVMTypes(t *types.Tuple, n int) (ret []llvm.Type) {
@@ -476,9 +527,10 @@ func (p Program) toLLVMFunc(sig *types.Signature) llvm.Type {
 	return llvm.FunctionType(ret, params, hasVArg)
 }
 
-func (p Program) toLLVMFuncPtr(sig *types.Signature) llvm.Type {
-	ft := p.toLLVMFunc(sig)
-	return llvm.PointerType(ft, 0)
+func (p Program) toLLVMFuncPtr(_ *types.Signature) llvm.Type {
+	// LLVM opaque pointers don't retain the pointee function type. Avoid
+	// recursively expanding named function types such as F func(F) F.
+	return p.tyVoidPtr()
 }
 
 func (p Program) retType(raw *types.Signature) Type {
@@ -495,27 +547,114 @@ func (p Program) retType(raw *types.Signature) Type {
 
 func (p Program) llvmNameOf(named *types.Named) (name string) {
 	name = NameOf(named)
-	if obj := named.Obj(); obj != nil && obj.Parent() != nil && obj.Parent() != obj.Pkg().Scope() {
-		index := p.fnnamed[name]
-		p.fnnamed[name] = index + 1
-		name += fmt.Sprintf("#%v", index)
+	if obj := named.Obj(); obj != nil {
+		parent := obj.Parent()
+		pkg := obj.Pkg()
+		if parent != nil && pkg != nil && !isPkgScope(parent, pkg.Scope()) {
+			index := p.fnnamed[name]
+			p.fnnamed[name] = index + 1
+			name += fmt.Sprintf("#%v", index)
+		}
 	}
 	return name
 }
 
+func isPkgScope(parent, pkgScope *types.Scope) bool {
+	if parent == pkgScope {
+		return true
+	}
+	if parent == nil || pkgScope == nil {
+		return false
+	}
+	// Some importer paths can materialize equivalent package scopes as distinct
+	// pointers. Keep package-level names stable when scopes describe the same
+	// package scope textually.
+	return parent.String() == pkgScope.String()
+}
+
 func (p Program) toNamed(raw *types.Named) Type {
+	if background, ok := p.packageTypeBackground(namedLinkname(raw)); ok && background == InStdcall {
+		p.validateStdcallType(raw)
+	}
+	name := p.llvmNameOf(raw)
+	if typ, ok := p.named[name]; ok {
+		if namedTypeEquivalent(typ.raw.Type, raw) || p.namedStructLayoutEquivalent(typ, raw) {
+			return typ
+		}
+		// Some toolchains produce distinct instantiated named types that share
+		// the same object name (e.g. generic local helper structs in stdlib).
+		// Disambiguate instead of reusing an incompatible LLVM named struct.
+		base := name
+		for i := 0; ; i++ {
+			name = fmt.Sprintf("%s#%d", base, i)
+			if typ2, ok2 := p.named[name]; ok2 {
+				if namedTypeEquivalent(typ2.raw.Type, raw) || p.namedStructLayoutEquivalent(typ2, raw) {
+					return typ2
+				}
+				continue
+			}
+			break
+		}
+	}
 	switch t := raw.Underlying().(type) {
 	case *types.Struct:
-		name := p.llvmNameOf(raw)
 		kind := vkStruct
-		if isClosure(t) {
+		if IsClosure(t) {
 			kind = vkClosure
 		}
-		return &aType{p.toLLVMNamedStruct(name, t), rawType{raw}, kind}
+		return p.toLLVMNamedStruct(name, raw, t, kind)
 	default:
 		typ := p.rawType(t)
 		return &aType{typ.ll, rawType{raw}, typ.kind}
 	}
+}
+
+func namedTypeEquivalent(a, b types.Type) bool {
+	na, okA := types.Unalias(a).(*types.Named)
+	nb, okB := types.Unalias(b).(*types.Named)
+	if !okA || !okB {
+		return false
+	}
+	if types.Identical(na, nb) {
+		return true
+	}
+	if NameOf(na) != NameOf(nb) {
+		return false
+	}
+	_, sigA := na.Underlying().(*types.Signature)
+	_, sigB := nb.Underlying().(*types.Signature)
+	if sigA || sigB {
+		return false
+	}
+	// go/types may materialize the same package/type in distinct instances
+	// (e.g. mixed importer paths across toolchains). Reuse LLVM named structs
+	// when full-name and underlying shape are equivalent.
+	return typeStringWithPkg(na.Underlying()) == typeStringWithPkg(nb.Underlying())
+}
+
+func (p Program) namedStructLayoutEquivalent(existing Type, raw *types.Named) bool {
+	if existing == nil || raw == nil {
+		return false
+	}
+	en, ok := types.Unalias(existing.raw.Type).(*types.Named)
+	if !ok || NameOf(en) != NameOf(raw) {
+		return false
+	}
+	rs, ok := raw.Underlying().(*types.Struct)
+	if !ok {
+		return false
+	}
+	existingFields := existing.ll.StructElementTypes()
+	rawFields := p.toLLVMFields(rs)
+	if len(existingFields) != len(rawFields) {
+		return false
+	}
+	for i := range existingFields {
+		if existingFields[i].String() != rawFields[i].String() {
+			return false
+		}
+	}
+	return true
 }
 
 // NameOf returns the full name of a named type.
@@ -540,13 +679,17 @@ func FuncName(pkg *types.Package, name string, recv *types.Var, org bool) string
 	if recv != nil {
 		named, ptr := recvNamed(recv.Type())
 		var tName string
-		if org {
-			tName = named.Obj().Name()
+		if named != nil {
+			if org {
+				tName = named.Obj().Name()
+			} else {
+				tName = abi.NamedName(named)
+			}
+			if ptr {
+				tName = "(*" + tName + ")"
+			}
 		} else {
-			tName = abi.NamedName(named)
-		}
-		if ptr {
-			tName = "(*" + tName + ")"
+			tName = types.TypeString(recv.Type(), PathOf)
 		}
 		return PathOf(pkg) + "." + tName + "." + name
 	}
@@ -554,15 +697,32 @@ func FuncName(pkg *types.Package, name string, recv *types.Var, org bool) string
 	return ret
 }
 
+// MethodSymbolName qualifies an unexported method name when its declaring
+// package differs from the receiver package. Promoted methods need this extra
+// identity component to avoid colliding with same-named receiver methods.
+// Package identity intentionally uses PathOf rather than Package.Path: patched
+// runtime packages and their original counterparts must name the same symbol.
+func MethodSymbolName(receiverPkg *types.Package, method *types.Func, name string) string {
+	if receiverPkg == nil || method == nil || method.Exported() || method.Pkg() == nil ||
+		PathOf(receiverPkg) == PathOf(method.Pkg()) {
+		return name
+	}
+	return PathOf(method.Pkg()) + "." + name
+}
+
 func recvNamed(t types.Type) (typ *types.Named, ptr bool) {
-	if tp, ok := t.(*types.Pointer); ok {
-		t = tp.Elem()
+retry:
+	switch typ := t.(type) {
+	case *types.Named:
+		return typ, ptr
+	case *types.Pointer:
+		t = typ.Elem()
 		ptr = true
+		goto retry
+	case *types.Alias:
+		t = types.Unalias(typ)
+		goto retry
 	}
-	if _, ok := t.(*types.Alias); ok {
-		t = types.Unalias(t)
-	}
-	typ, _ = t.(*types.Named)
 	return
 }
 

@@ -1,150 +1,113 @@
+// LITTEST
+// Scope: common
 package main
 
 import (
 	"unsafe"
 
-	"github.com/goplus/lib/c"
-	q "github.com/goplus/llgo/cl/_testrt/qsortfn/qsort"
+	q "github.com/xgo-dev/llgo/cl/_testrt/qsortfn/qsort"
 )
 
 //llgo:type C
-type Comp func(a, b c.Pointer) c.Int
+type Comp func(a, b unsafe.Pointer) int32
 
-//go:linkname qsort C.qsort
-func qsort(base c.Pointer, count, elem uintptr, compar Comp)
+//go:linkname cstr llgo.cstr
+func cstr(string) *int8
 
-//go:linkname qsort2 C.qsort
-func qsort2(base c.Pointer, count, elem uintptr, compar func(a, b c.Pointer) c.Int)
+//go:linkname printf C.printf
+func printf(format *int8, __llgo_va_list ...any) int32
 
+//go:linkname qsortLocal C.qsort
+func qsortLocal(base unsafe.Pointer, count, elem uintptr, compar Comp)
+
+//go:linkname qsortUnnamed C.qsort
+func qsortUnnamed(base unsafe.Pointer, count, elem uintptr, compar func(a, b unsafe.Pointer) int32)
+
+// CHECK-LABEL: define void @main.main(){{.*}} {
+// CHECK: call void @main.sortLocalNamed()
+// CHECK: call void @main.sortLocalToUnnamed()
+// CHECK: call void @main.sortUnnamedToImported()
+// CHECK: call void @main.sortExplicitNamedConversion()
+
+// CHECK-LABEL: define void @main.sortExplicitNamedConversion(){{.*}} {
+// CHECK: call void @qsort({{.*}}ptr @"main.sortExplicitNamedConversion$1")
+// CHECK-LABEL: define i32 @"main.sortExplicitNamedConversion$1"(ptr %0, ptr %1){{.*}} {
+// CHECK: sub i64
+// CHECK: trunc i64 {{%[0-9]+}} to i32
+
+// CHECK-LABEL: define void @main.sortLocalNamed(){{.*}} {
+// CHECK: call void @qsort({{.*}}ptr @"main.sortLocalNamed$1")
+// CHECK-LABEL: define i32 @"main.sortLocalNamed$1"(ptr %0, ptr %1){{.*}} {
+// CHECK: [[LOCAL_A:%[0-9]+]] = load i64, ptr %0
+// CHECK-NEXT: [[LOCAL_B:%[0-9]+]] = load i64, ptr %1
+// CHECK-NEXT: [[LOCAL_DIFF:%[0-9]+]] = sub i64 [[LOCAL_A]], [[LOCAL_B]]
+// CHECK-NEXT: [[LOCAL_RESULT:%[0-9]+]] = trunc i64 [[LOCAL_DIFF]] to i32
+// CHECK-NEXT: ret i32 [[LOCAL_RESULT]]
+
+// CHECK-LABEL: define void @main.sortLocalToUnnamed(){{.*}} {
+// CHECK: call void @qsort({{.*}}ptr @"main.sortLocalToUnnamed$1")
+// CHECK-LABEL: define i32 @"main.sortLocalToUnnamed$1"(ptr %0, ptr %1){{.*}} {
+// CHECK: sub i64
+// CHECK: trunc i64 {{%[0-9]+}} to i32
+
+// CHECK-LABEL: define void @main.sortUnnamedToImported(){{.*}} {
+// CHECK: call void @qsort({{.*}}ptr @"main.sortUnnamedToImported$1")
+// CHECK-LABEL: define i32 @"main.sortUnnamedToImported$1"(ptr %0, ptr %1){{.*}} {
+// CHECK: sub i64
+// CHECK: trunc i64 {{%[0-9]+}} to i32
 func main() {
-	sort1a()
-	sort1b()
-	sort2a()
-	sort2b()
-	sort3a()
-	sort3b()
-	sort4a()
-	sort4b()
-	sort5a()
-	sort5b()
+	sortLocalNamed()
+	sortLocalToUnnamed()
+	sortUnnamedToImported()
+	sortExplicitNamedConversion()
 }
 
-func sort1a() {
-	c.Printf(c.Str("Comp => Comp\n"))
+// Local named callback passed to a local named C declaration.
+func sortLocalNamed() {
 	a := [...]int{100, 8, 23, 2, 7}
-	var fn Comp = func(a, b c.Pointer) c.Int {
-		return c.Int(*(*int)(a) - *(*int)(b))
+	var fn Comp = func(a, b unsafe.Pointer) int32 {
+		return int32(*(*int)(a) - *(*int)(b))
 	}
-	qsort(c.Pointer(&a[0]), 5, unsafe.Sizeof(0), fn)
-	for _, v := range a {
-		c.Printf(c.Str("%d\n"), v)
-	}
+	qsortLocal(unsafe.Pointer(&a[0]), uintptr(len(a)), unsafe.Sizeof(a[0]), fn)
+	zAssertSorted(&a)
+	printf(cstr("local named\n"))
 }
 
-func sort1b() {
-	c.Printf(c.Str("fn => Comp\n"))
+// A named callback is assignable to an unnamed callback parameter.
+func sortLocalToUnnamed() {
 	a := [...]int{100, 8, 23, 2, 7}
-	var fn = func(a, b c.Pointer) c.Int {
-		return c.Int(*(*int)(a) - *(*int)(b))
+	var fn Comp = func(a, b unsafe.Pointer) int32 {
+		return int32(*(*int)(a) - *(*int)(b))
 	}
-	qsort(c.Pointer(&a[0]), 5, unsafe.Sizeof(0), fn)
-	for _, v := range a {
-		c.Printf(c.Str("%d\n"), v)
-	}
+	qsortUnnamed(unsafe.Pointer(&a[0]), uintptr(len(a)), unsafe.Sizeof(a[0]), fn)
+	zAssertSorted(&a)
+	printf(cstr("named to unnamed\n"))
 }
 
-func sort2a() {
-	c.Printf(c.Str("Comp => fn\n"))
+// An unnamed literal is assignable to an imported named C callback.
+func sortUnnamedToImported() {
 	a := [...]int{100, 8, 23, 2, 7}
-	var fn Comp = func(a, b c.Pointer) c.Int {
-		return c.Int(*(*int)(a) - *(*int)(b))
+	fn := func(a, b unsafe.Pointer) int32 {
+		return int32(*(*int)(a) - *(*int)(b))
 	}
-	qsort2(c.Pointer(&a[0]), 5, unsafe.Sizeof(0), fn)
-	for _, v := range a {
-		c.Printf(c.Str("%d\n"), v)
-	}
+	q.Qsort(unsafe.Pointer(&a[0]), uintptr(len(a)), unsafe.Sizeof(a[0]), fn)
+	zAssertSorted(&a)
+	printf(cstr("unnamed to imported\n"))
 }
 
-func sort2b() {
-	c.Printf(c.Str("fn => fn\n"))
+// Distinct named callback types require an explicit conversion.
+func sortExplicitNamedConversion() {
 	a := [...]int{100, 8, 23, 2, 7}
-	var fn = func(a, b c.Pointer) c.Int {
-		return c.Int(*(*int)(a) - *(*int)(b))
+	var fn Comp = func(a, b unsafe.Pointer) int32 {
+		return int32(*(*int)(a) - *(*int)(b))
 	}
-	qsort2(c.Pointer(&a[0]), 5, unsafe.Sizeof(0), fn)
-	for _, v := range a {
-		c.Printf(c.Str("%d\n"), v)
-	}
+	q.Qsort(unsafe.Pointer(&a[0]), uintptr(len(a)), unsafe.Sizeof(a[0]), q.Comp(fn))
+	zAssertSorted(&a)
+	printf(cstr("explicit named conversion\n"))
 }
 
-func sort3a() {
-	c.Printf(c.Str("qsort.Comp => qsort.Comp\n"))
-	a := [...]int{100, 8, 23, 2, 7}
-	var fn q.Comp = func(a, b c.Pointer) c.Int {
-		return c.Int(*(*int)(a) - *(*int)(b))
-	}
-	q.Qsort(c.Pointer(&a[0]), 5, unsafe.Sizeof(0), fn)
-	for _, v := range a {
-		c.Printf(c.Str("%d\n"), v)
-	}
-}
-
-func sort3b() {
-	c.Printf(c.Str("fn => qsort.Comp\n"))
-	a := [...]int{100, 8, 23, 2, 7}
-	var fn = func(a, b c.Pointer) c.Int {
-		return c.Int(*(*int)(a) - *(*int)(b))
-	}
-	q.Qsort(c.Pointer(&a[0]), 5, unsafe.Sizeof(0), fn)
-	for _, v := range a {
-		c.Printf(c.Str("%d\n"), v)
-	}
-}
-
-func sort4a() {
-	c.Printf(c.Str("qsort.Comp => fn\n"))
-	a := [...]int{100, 8, 23, 2, 7}
-	var fn q.Comp = func(a, b c.Pointer) c.Int {
-		return c.Int(*(*int)(a) - *(*int)(b))
-	}
-	qsort2(c.Pointer(&a[0]), 5, unsafe.Sizeof(0), fn)
-	for _, v := range a {
-		c.Printf(c.Str("%d\n"), v)
-	}
-}
-
-func sort4b() {
-	c.Printf(c.Str("Comp => qsort.fn\n"))
-	a := [...]int{100, 8, 23, 2, 7}
-	var fn Comp = func(a, b c.Pointer) c.Int {
-		return c.Int(*(*int)(a) - *(*int)(b))
-	}
-	q.Qsort2(c.Pointer(&a[0]), 5, unsafe.Sizeof(0), fn)
-	for _, v := range a {
-		c.Printf(c.Str("%d\n"), v)
-	}
-}
-
-func sort5a() {
-	c.Printf(c.Str("qsort.Comp => Comp()\n"))
-	a := [...]int{100, 8, 23, 2, 7}
-	var fn q.Comp = func(a, b c.Pointer) c.Int {
-		return c.Int(*(*int)(a) - *(*int)(b))
-	}
-	qsort(c.Pointer(&a[0]), 5, unsafe.Sizeof(0), Comp(fn))
-	for _, v := range a {
-		c.Printf(c.Str("%d\n"), v)
-	}
-}
-
-func sort5b() {
-	c.Printf(c.Str("Comp => qsort.Comp()\n"))
-	a := [...]int{100, 8, 23, 2, 7}
-	var fn Comp = func(a, b c.Pointer) c.Int {
-		return c.Int(*(*int)(a) - *(*int)(b))
-	}
-	q.Qsort(c.Pointer(&a[0]), 5, unsafe.Sizeof(0), q.Comp(fn))
-	for _, v := range a {
-		c.Printf(c.Str("%d\n"), v)
+func zAssertSorted(a *[5]int) {
+	if *a != [5]int{2, 7, 8, 23, 100} {
+		panic("qsort did not sort")
 	}
 }

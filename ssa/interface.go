@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2024 The GoPlus Authors (goplus.org). All rights reserved.
+ * Copyright (c) 2024 The XGo Authors (xgo.dev). All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,25 +17,26 @@
 package ssa
 
 import (
-	"go/constant"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/binary"
 	"go/token"
 	"go/types"
-	"log"
 
-	"github.com/goplus/llgo/ssa/abi"
-	"github.com/goplus/llvm"
+	"github.com/xgo-dev/llgo/ssa/abi"
+	"github.com/xgo-dev/llvm"
 )
 
 // -----------------------------------------------------------------------------
 
 // unsafeEface(t *abi.Type, data unsafe.Pointer) Eface
 func (b Builder) unsafeEface(t, data llvm.Value) llvm.Value {
-	return aggregateValue(b.impl, b.Prog.rtEface(), t, data)
+	return b.aggregateValue(b.Prog.rtType("Eface"), t, data).impl
 }
 
 // unsafeIface(itab *runtime.Itab, data unsafe.Pointer) Eface
 func (b Builder) unsafeIface(itab, data llvm.Value) llvm.Value {
-	return aggregateValue(b.impl, b.Prog.rtIface(), itab, data)
+	return b.aggregateValue(b.Prog.rtType("Iface"), itab, data).impl
 }
 
 // func NewItab(tintf *InterfaceType, typ *Type) *runtime.Itab
@@ -43,21 +44,101 @@ func (b Builder) newItab(tintf, typ Expr) Expr {
 	return b.Call(b.Pkg.rtFunc("NewItab"), tintf, typ)
 }
 
-func (b Builder) unsafeInterface(rawIntf *types.Interface, t Expr, data llvm.Value) llvm.Value {
+func (b Builder) staticItab(rawIntf *types.Interface, concrete types.Type, tintf, typ Expr) (Expr, bool) {
+	prog := b.Prog
+	if !prog.enableGoGlobalDCE || !prog.enableLTOPluginMarker ||
+		rawIntf.NumMethods() == 0 || concrete == nil {
+		return Expr{}, false
+	}
+	if !types.AssignableTo(concrete, rawIntf) {
+		return Expr{}, false
+	}
+	mset := types.NewMethodSet(concrete)
+	methods := make([]*types.Selection, rawIntf.NumMethods())
+	for i := range methods {
+		im := rawIntf.Method(i)
+		method := mset.Lookup(im.Pkg(), im.Name())
+		if method == nil || prog.isNoInterfaceMethod(method.Obj().(*types.Func)) {
+			return Expr{}, false
+		}
+		methods[i] = method
+	}
+
+	intfName, _ := prog.abi.TypeName(rawIntf)
+	typeName, _ := prog.abi.TypeName(concrete)
+	sum := sha256.Sum256([]byte(intfName + "\x00" + typeName))
+	name := "_llgo_itab$" + base64.RawURLEncoding.EncodeToString(sum[:])
+	if global := b.Pkg.VarOf(name); global != nil {
+		return Expr{global.impl, prog.Pointer(prog.rtType("Itab"))}, true
+	}
+
+	ptr := prog.VoidPtr()
+	funArray := prog.rawType(types.NewArray(ptr.RawType(), int64(len(methods))))
+	staticType := prog.rawType(types.NewStruct([]*types.Var{
+		types.NewVar(token.NoPos, nil, "inter", ptr.RawType()),
+		types.NewVar(token.NoPos, nil, "typ", ptr.RawType()),
+		types.NewVar(token.NoPos, nil, "hash", types.Typ[types.Uint32]),
+		types.NewVar(token.NoPos, nil, "fun", funArray.RawType()),
+	}, nil))
+	global := b.Pkg.NewVarEx(name, prog.Pointer(staticType))
+	funcs := make([]llvm.Value, len(methods))
+	for i, method := range methods {
+		funcs[i], _ = b.abiMethodFuncs(concrete, method)
+	}
+	hashBytes := sha256.Sum256([]byte(typeName))
+	hash := binary.LittleEndian.Uint32(hashBytes[:4])
+	global.impl.SetInitializer(prog.ctx.ConstStruct([]llvm.Value{
+		tintf.impl,
+		typ.impl,
+		prog.IntVal(uint64(hash), prog.Uint32()).impl,
+		llvm.ConstArray(ptr.ll, funcs),
+	}, false))
+	global.impl.SetGlobalConstant(true)
+	b.Pkg.setODRLinkage(global.impl, llvm.WeakODRLinkage)
+
+	// Describe each function slot with private LLGo metadata. The template is a
+	// compile-time certificate, not a runtime vtable, so it must not participate
+	// in LLVM's type-test candidate sets before the plugin consumes it.
+	slotKind := prog.ctx.MDKindID("llgo.static.itab.slot")
+	funOffset := uint64(prog.td.ElementOffset(staticType.ll, 3))
+	stride := uint64(prog.td.TypeAllocSize(ptr.ll))
+	interfaceTypeID := prog.interfaceCapabilityKey(rawIntf)
+	for i := range methods {
+		offset := funOffset + uint64(i)*stride
+		typeID := interfaceMethodCapabilityKeyFromID(interfaceTypeID, i)
+		node := prog.ctx.MDNode([]llvm.Metadata{
+			llvm.ConstInt(prog.Int64().ll, offset, false).ConstantAsMetadata(),
+			prog.ctx.MDString(typeID),
+		})
+		global.impl.AddMetadata(slotKind, node)
+	}
+	// Keep the otherwise-dormant template through package optimization without
+	// perturbing function IR. The LTO plugin removes this compiler.used entry
+	// after using the template as a compile-time devirtualization certificate.
+	b.Pkg.markLLVMUsed(global.impl)
+	return Expr{global.impl, prog.Pointer(prog.rtType("Itab"))}, true
+}
+
+func (b Builder) unsafeInterface(rawIntf *types.Interface, concrete types.Type, t Expr, data llvm.Value) llvm.Value {
 	if rawIntf.Empty() {
 		return b.unsafeEface(t.impl, data)
 	}
 	tintf := b.abiType(rawIntf)
+	// Emit a constant template for LTO analysis. Keep the runtime NewItab call
+	// even after devirtualization so dynamically-created interfaces continue to
+	// share the runtime's canonical itab pointer. Every template disappears
+	// before GlobalDCE.
+	b.staticItab(rawIntf, concrete, tintf, t)
 	itab := b.newItab(tintf, t)
 	return b.unsafeIface(itab.impl, data)
 }
 
-func iMethodOf(rawIntf *types.Interface, name string) int {
+func iMethodOf(rawIntf *types.Interface, method *types.Func) int {
+	id := types.Id(method.Pkg(), method.Name())
 	n := rawIntf.NumMethods()
 	for i := 0; i < n; i++ {
 		m := rawIntf.Method(i)
-		if m.Name() == name {
-			// TODO(xsw): check signature
+		if types.Id(m.Pkg(), m.Name()) == id {
 			return i
 		}
 	}
@@ -66,16 +147,60 @@ func iMethodOf(rawIntf *types.Interface, name string) int {
 
 // Imethod returns closure of an interface method.
 func (b Builder) Imethod(intf Expr, method *types.Func) Expr {
+	return b.imethod(intf, method, false)
+}
+
+// ImethodWithRecoverToken returns an interface method invocation whose code
+// pointer may also be used as recover-frame bookkeeping data.
+func (b Builder) ImethodWithRecoverToken(intf Expr, method *types.Func) Expr {
+	return b.imethod(intf, method, true)
+}
+
+func (b Builder) imethod(intf Expr, method *types.Func, recoverToken bool) Expr {
 	prog := b.Prog
-	rawIntf := intf.raw.Type.Underlying().(*types.Interface)
-	tclosure := prog.Type(method.Type(), InGo)
-	i := iMethodOf(rawIntf, method.Name())
+	intfType := types.Unalias(intf.raw.Type)
+	patchedIntfType := prog.patch(intfType)
+	rawIntf := patchedIntfType.Underlying().(*types.Interface)
+	sig := method.Type().(*types.Signature)
+	if sig.Recv() == nil && sig.Params().Len() > 0 {
+		pt := types.Unalias(sig.Params().At(0).Type())
+		if types.Identical(pt, rawIntf) {
+			n := sig.Params().Len()
+			vars := make([]*types.Var, n-1)
+			for i := 1; i < n; i++ {
+				vars[i-1] = sig.Params().At(i)
+			}
+			sig = types.NewSignatureType(nil, nil, nil, types.NewTuple(vars...), sig.Results(), sig.Variadic())
+		}
+	}
+	tclosure := prog.Type(sig, InGo)
+	i := iMethodOf(rawIntf, method)
+	b.recordUseIfaceMethod(rawIntf, i)
 	data := b.InlineCall(b.Pkg.rtFunc("IfacePtrData"), intf)
 	impl := intf.impl
 	itab := Expr{b.faceItab(impl), prog.VoidPtrPtr()}
 	pfn := b.Advance(itab, prog.IntVal(uint64(i+3), prog.Int()))
-	fn := b.Load(pfn)
-	ret := b.aggregateValue(tclosure, fn.impl, data.impl)
+	var fn Expr
+	if prog.enableGoGlobalDCE && !recoverToken {
+		fnType := prog.Elem(pfn.Type)
+		fn = Expr{
+			prog.interfaceMethodCheckedLoad(b.impl, pfn.impl, rawIntf, i),
+			fnType,
+		}
+	} else {
+		fn = b.Load(pfn)
+		if prog.enableGoGlobalDCE {
+			// A type.checked.load result is a virtual-call capability, not a
+			// general-purpose pointer. Recover bookkeeping needs the same code
+			// address as ordinary data, so retain the capability check while
+			// carrying the raw itab load into the transient invocation pair.
+			prog.interfaceMethodCheckedLoad(b.impl, pfn.impl, rawIntf, i)
+		}
+	}
+	// This is a transient interface invocation pair, not a first-class
+	// funcval. The method receiver remains an ordinary ABI parameter.
+	tmethod := &aType{tclosure.ll, tclosure.raw, vkIfaceMethod}
+	ret := b.aggregateValue(tmethod, fn.impl, data.impl)
 	return ret
 }
 
@@ -97,22 +222,26 @@ func (b Builder) Imethod(intf Expr, method *types.Func) Expr {
 //	t2 = make Stringer <- t0
 func (b Builder) MakeInterface(tinter Type, x Expr) (ret Expr) {
 	rawIntf := tinter.raw.Type.Underlying().(*types.Interface)
-	if debugInstr {
-		log.Printf("MakeInterface %v, %v\n", rawIntf, x.impl)
-	}
+	dbgInstrf("MakeInterface %v, %v\n", rawIntf, x.impl)
 	if x.kind == vkFuncDecl {
 		typ := b.Prog.Type(x.raw.Type, InGo)
 		x = checkExpr(x, typ.raw.Type, b)
 	}
 	prog := b.Prog
 	typ := x.Type
+	b.recordUseIface(typ)
 	tabi := b.abiType(typ.raw.Type)
+	if !directIfaceType(typ.raw.Type) {
+		vptr := b.AllocU(typ)
+		b.Store(vptr, x)
+		return Expr{b.unsafeInterface(rawIntf, typ.raw.Type, tabi, vptr.impl), tinter}
+	}
 	kind, _, lvl := abi.DataKindOf(typ.raw.Type, 0, prog.is32Bits)
 	switch kind {
 	case abi.Indirect:
 		vptr := b.AllocU(typ)
 		b.Store(vptr, x)
-		return Expr{b.unsafeInterface(rawIntf, tabi, vptr.impl), tinter}
+		return Expr{b.unsafeInterface(rawIntf, typ.raw.Type, tabi, vptr.impl), tinter}
 	}
 	ximpl := x.impl
 	if lvl > 0 {
@@ -121,7 +250,7 @@ func (b Builder) MakeInterface(tinter Type, x Expr) (ret Expr) {
 	var u llvm.Value
 	switch kind {
 	case abi.Pointer:
-		return Expr{b.unsafeInterface(rawIntf, tabi, ximpl), tinter}
+		return Expr{b.unsafeInterface(rawIntf, typ.raw.Type, tabi, ximpl), tinter}
 	case abi.Integer:
 		tu := prog.Uintptr()
 		u = llvm.CreateIntCast(b.impl, ximpl, tu.ll)
@@ -136,11 +265,69 @@ func (b Builder) MakeInterface(tinter Type, x Expr) (ret Expr) {
 		panic("todo")
 	}
 	data := llvm.CreateIntToPtr(b.impl, u, prog.tyVoidPtr())
-	return Expr{b.unsafeInterface(rawIntf, tabi, data), tinter}
+	return Expr{b.unsafeInterface(rawIntf, typ.raw.Type, tabi, data), tinter}
+}
+
+func (b Builder) MakeInterfaceFromPtr(tinter Type, ptr Expr) (ret Expr) {
+	rawIntf := tinter.raw.Type.Underlying().(*types.Interface)
+	prog := b.Prog
+	b.AssertNilDeref(ptr)
+
+	typ := prog.Elem(ptr.Type)
+	tabi := b.abiType(typ.raw.Type)
+	if kind, _, _ := abi.DataKindOf(typ.raw.Type, 0, prog.is32Bits); kind != abi.Indirect {
+		return b.MakeInterface(tinter, b.Load(ptr))
+	}
+
+	b.recordUseIface(typ)
+	vptr := b.AllocU(typ)
+	dst := b.Convert(prog.VoidPtr(), vptr)
+	src := b.Convert(prog.VoidPtr(), ptr)
+	b.Call(b.Pkg.rtFunc("Typedmemmove"), tabi, dst, src)
+	return Expr{b.unsafeInterface(rawIntf, typ.raw.Type, tabi, vptr.impl), tinter}
+}
+
+func (b Builder) recordUseIface(typ Type) {
+	if mb := b.Pkg.metaBuilder; mb != nil {
+		if _, ok := types.Unalias(typ.raw.Type).Underlying().(*types.Interface); !ok {
+			typeName, _ := b.Prog.abi.TypeName(typ.raw.Type)
+			mb.AddIfaceUse(mb.Sym(b.Func.Name()), mb.Sym(typeName))
+		}
+	}
+}
+
+func (b Builder) recordUseIfaceMethod(rawIntf *types.Interface, methodIndex int) {
+	if mb := b.Pkg.metaBuilder; mb != nil {
+		intfSymName, _ := b.Prog.abi.TypeName(rawIntf)
+		intfSym := mb.Sym(intfSymName)
+		b.recordInterfaceInfo(rawIntf, intfSymName)
+		mb.AddIfaceMethodUse(mb.Sym(b.Func.Name()), intfSym, uint32(methodIndex))
+	}
+}
+
+func (b Builder) recordInterfaceInfo(t *types.Interface, typeName string) {
+	mb := b.Pkg.metaBuilder
+	if mb == nil {
+		return
+	}
+	prog := b.Prog
+	intfSym := mb.Sym(typeName)
+	for i := 0; i < t.NumMethods(); i++ {
+		f := t.Method(i)
+		ftypName, _ := prog.abi.TypeName(funcType(prog, f.Type()))
+		mb.AddIfaceMethod(intfSym, abiMethodName(f), mb.Sym(ftypName))
+	}
 }
 
 func (b Builder) valFromData(typ Type, data llvm.Value) Expr {
 	prog := b.Prog
+	if !directIfaceType(typ.raw.Type) {
+		impl := b.impl
+		tll := typ.ll
+		tptr := llvm.PointerType(tll, 0)
+		ptr := llvm.CreatePointerCast(impl, data, tptr)
+		return Expr{llvm.CreateLoad(impl, tll, ptr), typ}
+	}
 	kind, real, lvl := abi.DataKindOf(typ.raw.Type, 0, prog.is32Bits)
 	switch kind {
 	case abi.Indirect:
@@ -158,12 +345,12 @@ func (b Builder) valFromData(typ Type, data llvm.Value) Expr {
 	case abi.Pointer:
 		return b.buildVal(typ, data, lvl)
 	case abi.Integer:
-		x := castUintptr(b, data, prog.Uintptr())
-		return b.buildVal(typ, castInt(b, x, t), lvl)
+		x := castUintptr(b, data, prog.VoidPtr(), prog.Uintptr())
+		return b.buildVal(typ, castInt(b, x, prog.Uintptr(), t), lvl)
 	case abi.BitCast:
-		x := castUintptr(b, data, prog.Uintptr())
+		x := castUintptr(b, data, prog.VoidPtr(), prog.Uintptr())
 		if int(prog.SizeOf(t)) != prog.PointerSize() {
-			x = castInt(b, x, prog.Int32())
+			x = castInt(b, x, prog.Uintptr(), prog.Int32())
 		}
 		return b.buildVal(typ, llvm.CreateBitCast(b.impl, x, t.ll), lvl)
 	}
@@ -187,11 +374,11 @@ func (b Builder) buildVal(typ Type, val llvm.Value, lvl int) Expr {
 	case *types.Struct:
 		telem := b.Prog.rawType(t.Field(0).Type())
 		elem := b.buildVal(telem, val, lvl-1)
-		return Expr{aggregateValue(b.impl, typ.ll, elem.impl), typ}
+		return b.aggregateValue(typ, elem.impl)
 	case *types.Array:
 		telem := b.Prog.rawType(t.Elem())
 		elem := b.buildVal(telem, val, lvl-1)
-		return Expr{llvm.ConstArray(typ.ll, []llvm.Value{elem.impl}), typ}
+		return b.aggregateValue(typ, elem.impl)
 	}
 	panic("todo")
 }
@@ -236,20 +423,21 @@ func (b Builder) buildVal(typ Type, val llvm.Value, lvl int) Expr {
 //	t1 = typeassert t0.(int)
 //	t3 = typeassert,ok t2.(T)
 func (b Builder) TypeAssert(x Expr, assertedTyp Type, commaOk bool) Expr {
-	if debugInstr {
-		log.Printf("TypeAssert %v, %v, %v\n", x.impl, assertedTyp.raw.Type, commaOk)
-	}
+	dbgInstrf("TypeAssert %v, %v, %v\n", x.impl, assertedTyp.raw.Type, commaOk)
 	tx := b.faceAbiType(x)
 	tabi := b.abiType(assertedTyp.raw.Type)
 	var eq Expr
 	var val func() Expr
 	if x.RawType() == assertedTyp.RawType() {
-		eq = b.Const(constant.MakeBool(!b.faceData(x.impl).IsNull()), b.Prog.Bool())
+		eq = b.BinOp(token.NEQ, tx, b.Prog.Zero(b.Prog.AbiTypePtr()))
 		val = func() Expr { return x }
 	} else {
 		if rawIntf, ok := assertedTyp.raw.Type.Underlying().(*types.Interface); ok {
 			eq = b.InlineCall(b.Pkg.rtFunc("Implements"), tabi, tx)
-			val = func() Expr { return Expr{b.unsafeInterface(rawIntf, tx, b.faceData(x.impl)), assertedTyp} }
+			val = func() Expr { return Expr{b.unsafeInterface(rawIntf, nil, tx, b.faceData(x.impl)), assertedTyp} }
+		} else if assertedTyp.kind == vkClosure {
+			eq = b.InlineCall(b.Pkg.rtFunc("MatchesClosure"), tabi, tx)
+			val = func() Expr { return b.valFromData(assertedTyp, b.faceData(x.impl)) }
 		} else {
 			eq = b.BinOp(token.EQL, tx, tabi)
 			val = func() Expr { return b.valFromData(assertedTyp, b.faceData(x.impl)) }
@@ -267,14 +455,14 @@ func (b Builder) TypeAssert(x Expr, assertedTyp Type, commaOk bool) Expr {
 		phi.AddIncoming(b, blks[:2], func(i int, blk BasicBlock) Expr {
 			b.SetBlockEx(blk, AtEnd, false)
 			if i == 0 {
-				valTrue := aggregateValue(b.impl, t.ll, val().impl, prog.BoolVal(true).impl)
+				valTrue := b.aggregateValue(t, val().impl, prog.BoolVal(true).impl)
 				b.Jump(blks[2])
-				return Expr{valTrue, t}
+				return valTrue
 			}
 			zero := prog.Zero(assertedTyp)
-			valFalse := aggregateValue(b.impl, t.ll, zero.impl, prog.BoolVal(false).impl)
+			valFalse := b.aggregateValue(t, zero.impl, prog.BoolVal(false).impl)
 			b.Jump(blks[2])
-			return Expr{valFalse, t}
+			return valFalse
 		})
 		b.SetBlockEx(blks[2], AtEnd, false)
 		b.blk.last = blks[2].last
@@ -283,7 +471,14 @@ func (b Builder) TypeAssert(x Expr, assertedTyp Type, commaOk bool) Expr {
 	blks := b.Func.MakeBlocks(2)
 	b.If(eq, blks[0], blks[1])
 	b.SetBlockEx(blks[1], AtEnd, false)
-	b.Panic(b.MakeInterface(b.Prog.Any(), b.Str("type assertion "+x.RawType().String()+" -> "+assertedTyp.RawType().String()+" failed")))
+	var source Expr
+	if rawIntf, ok := x.RawType().Underlying().(*types.Interface); ok && rawIntf.NumMethods() > 0 {
+		source = b.abiType(x.RawType())
+	} else {
+		source = b.Prog.Nil(b.Prog.AbiTypePtr())
+	}
+	b.Call(b.Pkg.rtFunc("PanicTypeAssert"), source, tx, tabi)
+	b.Unreachable()
 	b.SetBlockEx(blks[0], AtEnd, false)
 	b.blk.last = blks[0].last
 	return val()
@@ -305,20 +500,16 @@ func (b Builder) ChangeInterface(typ Type, x Expr) (ret Expr) {
 	rawIntf := typ.raw.Type.Underlying().(*types.Interface)
 	tabi := b.faceAbiType(x)
 	data := b.faceData(x.impl)
-	return Expr{b.unsafeInterface(rawIntf, tabi, data), typ}
+	return Expr{b.unsafeInterface(rawIntf, nil, tabi, data), typ}
 }
 
 // -----------------------------------------------------------------------------
 
-/*
 // InterfaceData returns the data pointer of an interface.
 func (b Builder) InterfaceData(x Expr) Expr {
-	if debugInstr {
-		log.Printf("InterfaceData %v\n", x.impl)
-	}
+	dbgInstrf("InterfaceData %v\n", x.impl)
 	return Expr{b.faceData(x.impl), b.Prog.VoidPtr()}
 }
-*/
 
 func (b Builder) faceData(x llvm.Value) llvm.Value {
 	return llvm.CreateExtractValue(b.impl, x, 1)

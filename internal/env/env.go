@@ -11,25 +11,65 @@ import (
 )
 
 const (
-	LLGoCompilerPkg    = "github.com/goplus/llgo"
+	LLGoCompilerPkg    = "github.com/xgo-dev/llgo"
 	LLGoRuntimePkgName = "runtime"
 	LLGoRuntimePkg     = LLGoCompilerPkg + "/" + LLGoRuntimePkgName
 	envFileName        = "/internal/env/env.go"
 )
 
-func GOROOT() string {
-	root := os.Getenv("GOROOT")
-	if root != "" {
-		return root
+func GOROOT() (string, error) {
+	return GOROOTWithEnv(nil)
+}
+
+func GOROOTWithEnv(env []string) (string, error) {
+	vals, err := GoEnvWithEnv(env, "GOROOT")
+	if err != nil {
+		return "", err
 	}
-	cmd := exec.Command("go", "env", "GOROOT")
+	return vals[0], nil
+}
+
+func GOVERSIONWithEnv(env []string) (string, error) {
+	vals, err := GoEnvWithEnv(env, "GOVERSION")
+	if err != nil {
+		return "", err
+	}
+	return vals[0], nil
+}
+
+func GOROOTAndGOVERSIONWithEnv(env []string) (goroot, goversion string, err error) {
+	vals, err := GoEnvWithEnv(env, "GOROOT", "GOVERSION")
+	if err != nil {
+		return "", "", err
+	}
+	return vals[0], vals[1], nil
+}
+
+func GoEnvWithEnv(env []string, vars ...string) ([]string, error) {
+	if len(vars) == 0 {
+		return nil, fmt.Errorf("go env requires at least one variable")
+	}
+	args := append([]string{"env"}, vars...)
+	cmd := exec.Command("go", args...)
+	if len(env) != 0 {
+		cmd.Env = env
+	}
 	var out bytes.Buffer
+	var buf bytes.Buffer
 	cmd.Stdout = &out
+	cmd.Stderr = &buf
 	err := cmd.Run()
-	if err == nil {
-		return strings.TrimSpace(out.String())
+	if err != nil {
+		return nil, fmt.Errorf("%s, %w", buf.String(), err)
 	}
-	panic("cannot get GOROOT: " + err.Error())
+	got := strings.Split(strings.TrimSuffix(out.String(), "\n"), "\n")
+	if len(got) != len(vars) {
+		return nil, fmt.Errorf("go env returned %d values for %d variables", len(got), len(vars))
+	}
+	for i := range got {
+		got[i] = strings.TrimSpace(got[i])
+	}
+	return got, nil
 }
 
 func LLGoCacheDir() string {
@@ -101,8 +141,11 @@ func isLLGoRoot(root string) (string, bool) {
 	if err != nil {
 		return "", false
 	}
+	// Git's default Windows checkout may use CRLF. Normalize it before
+	// matching the module directive so a valid LLGO_ROOT remains portable.
+	data = bytes.ReplaceAll(data, []byte("\r\n"), []byte("\n"))
 	// Check module name
-	if !strings.Contains(string(data), "module "+LLGoRuntimePkg+"\n") {
+	if !bytes.Contains(data, []byte("module "+LLGoRuntimePkg+"\n")) {
 		return "", false
 	}
 	return root, true

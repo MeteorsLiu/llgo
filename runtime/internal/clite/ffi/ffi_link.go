@@ -3,12 +3,7 @@ package ffi
 import (
 	"unsafe"
 
-	c "github.com/goplus/llgo/runtime/internal/clite"
-)
-
-const (
-	LLGoPackage = "link: $(pkg-config --libs libffi); -lffi"
-	LLGoFiles   = "$(pkg-config --cflags libffi): _wrap/libffi.c"
+	c "github.com/xgo-dev/llgo/runtime/internal/clite"
 )
 
 /*
@@ -42,9 +37,15 @@ void ffi_call(ffi_cif *cif,
 //go:linkname Call C.ffi_call
 func Call(cif *Cif, fn unsafe.Pointer, rvalue unsafe.Pointer, avalue *unsafe.Pointer)
 
+// CallWithEnv calls a native hidden-env entry. cif and avalue contain only the
+// semantic arguments; env is installed by the architecture-specific final hop.
+//
+//go:linkname CallWithEnv C.llgo_ffi_call_with_env
+func CallWithEnv(cif *Cif, fn unsafe.Pointer, rvalue unsafe.Pointer, avalue *unsafe.Pointer, env unsafe.Pointer)
+
 // void *ffi_closure_alloc (size_t size, void **code);
 //
-//go:linkname ClosureAlloc C.llog_ffi_closure_alloc
+//go:linkname ClosureAlloc C.llgo_ffi_closure_alloc
 func ClosureAlloc(code *unsafe.Pointer) unsafe.Pointer
 
 // void ffi_closure_free (void *);

@@ -3,8 +3,8 @@ package ffi
 import (
 	"unsafe"
 
-	c "github.com/goplus/llgo/runtime/internal/clite"
-	"github.com/goplus/llgo/runtime/internal/clite/ffi"
+	c "github.com/xgo-dev/llgo/runtime/internal/clite"
+	"github.com/xgo-dev/llgo/runtime/internal/clite/ffi"
 )
 
 type BasicKind int
@@ -64,8 +64,8 @@ var (
 	TypeUint64     = &Type{8, 8, ffi.Uint64, nil}
 	TypeFloat32    = &Type{4, 4, ffi.Float, nil}
 	TypeFloat64    = &Type{8, 8, ffi.Double, nil}
-	TypeComplex64  = &Type{8, 4, ffi.Complex, &[]*Type{TypeFloat32, nil}[0]}
-	TypeComplex128 = &Type{16, 8, ffi.Complex, &[]*Type{TypeFloat64, nil}[0]}
+	TypeComplex64  = newComplexType(TypeFloat32, 8, 4)
+	TypeComplex128 = newComplexType(TypeFloat64, 16, 8)
 	TypeInt        = &Type{_sizei, _aligni, _Int, nil}
 	TypeUint       = &Type{_sizei, _aligni, _Uint, nil}
 	TypeUintptr    = &Type{_sizei, _aligni, _Uint, nil}
@@ -73,6 +73,8 @@ var (
 	TypeString     = StructOf(TypePointer, TypeInt)
 	TypeInterface  = StructOf(TypePointer, TypePointer)
 	TypeSlice      = StructOf(TypePointer, TypeInt, TypeInt)
+	empty          = [2]*Type{TypeInt8, nil}
+	typeEmpty      = &Type{0, 0, ffi.Struct, &empty[0]}
 )
 
 var Typ = []*Type{
@@ -100,6 +102,9 @@ var Typ = []*Type{
 }
 
 func ArrayOf(elem *Type, N int) *Type {
+	if N == 0 {
+		return typeEmpty
+	}
 	fs := make([]*Type, N+1)
 	for i := 0; i < N; i++ {
 		fs[i] = elem
@@ -113,6 +118,9 @@ func ArrayOf(elem *Type, N int) *Type {
 }
 
 func StructOf(fields ...*Type) *Type {
+	if len(fields) == 0 {
+		return typeEmpty
+	}
 	fs := make([]*Type, len(fields)+1)
 	copy(fs, fields)
 	return &Type{

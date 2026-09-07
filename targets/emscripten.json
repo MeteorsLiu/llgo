@@ -1,0 +1,9 @@
+{
+	"llvm-target": "wasm32-unknown-emscripten",
+	"cpu": "generic",
+	"build-tags": ["llgo.wasm.emscripten"],
+	"goos": "js",
+	"goarch": "wasm",
+	"wasm-abi": "emscripten",
+	"emulator": "node \"{root}/targets/emscripten-runner.mjs\" \"{}\""
+}

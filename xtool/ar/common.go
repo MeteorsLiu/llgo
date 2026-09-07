@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2024 The GoPlus Authors (goplus.org). All rights reserved.
+ * Copyright (c) 2024 The XGo Authors (xgo.dev). All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -13,6 +13,10 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+
+// Portions of this file are derived from github.com/blakesmith/ar.
+// Copyright (c) 2013 Blake Smith <blakesmith0@gmail.com>.
+// See ../../LICENSES/BlakeSmith-AR-MIT.txt for license terms.
 
 package ar
 

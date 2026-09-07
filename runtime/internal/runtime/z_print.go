@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2024 The GoPlus Authors (goplus.org). All rights reserved.
+ * Copyright (c) 2024 The XGo Authors (xgo.dev). All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -19,7 +19,7 @@ package runtime
 import (
 	"unsafe"
 
-	c "github.com/goplus/llgo/runtime/internal/clite"
+	c "github.com/xgo-dev/llgo/runtime/internal/clite"
 )
 
 func boolCStr(v bool) *c.Char {
@@ -33,48 +33,32 @@ func PrintBool(v bool) {
 	c.Fprintf(c.Stderr, boolCStr(v))
 }
 
-func PrintByte(v byte) {
-	c.Fputc(c.Int(v), c.Stderr)
-}
-
-func PrintFloat(v float64) {
-	switch {
-	case v != v:
-		c.Fprintf(c.Stderr, c.Str("NaN"))
-		return
-	case v+v == v && v != 0:
-		if v > 0 {
-			c.Fprintf(c.Stderr, c.Str("+Inf"))
-		} else {
-			c.Fprintf(c.Stderr, c.Str("-Inf"))
-		}
-		return
-	}
-	c.Fprintf(c.Stderr, c.Str("%+e"), v)
-}
-
-func PrintComplex(v complex128) {
-	print("(", real(v), imag(v), "i)")
-}
-
 func PrintUint(v uint64) {
-	c.Fprintf(c.Stderr, c.Str("%llu"), v)
+	c.Fprintf(c.Stderr, printFormatPrefixUInt, v)
 }
 
 func PrintInt(v int64) {
-	c.Fprintf(c.Stderr, c.Str("%lld"), v)
+	c.Fprintf(c.Stderr, printFormatPrefixInt, v)
+}
+
+func PrintFloat(v float64) {
+	c.Fputs(c.AllocaCStr(formatFloat(v)), c.Stderr)
+}
+
+func PrintComplex(v complex128) {
+	c.Fputs(c.AllocaCStr(formatComplex(v)), c.Stderr)
 }
 
 func PrintHex(v uint64) {
-	c.Fprintf(c.Stderr, c.Str("%llx"), v)
+	c.Fprintf(c.Stderr, printFormatPrefixHex, v)
 }
 
 func PrintPointer(p unsafe.Pointer) {
-	c.Fprintf(c.Stderr, c.Str("%p"), p)
-}
-
-func PrintString(s String) {
-	c.Fwrite(s.data, 1, uintptr(s.len), c.Stderr)
+	// Match Go's builtin print/println pointer formatting (0x... even for nil).
+	c.Fprintf(c.Stderr, c.Str("0x"))
+	// %llx consumes an unsigned long long. On 32-bit targets, passing uintptr
+	// directly leaves the upper half of the variadic argument unspecified.
+	c.Fprintf(c.Stderr, printFormatPrefixHex, uint64(uintptr(p)))
 }
 
 func PrintSlice(s Slice) {

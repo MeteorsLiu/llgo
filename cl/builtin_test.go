@@ -2,7 +2,7 @@
 // +build !llgo
 
 /*
- * Copyright (c) 2024 The GoPlus Authors (goplus.org). All rights reserved.
+ * Copyright (c) 2024 The XGo Authors (xgo.dev). All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -20,14 +20,16 @@
 package cl
 
 import (
+	"fmt"
 	"go/ast"
 	"go/constant"
+	"go/token"
 	"go/types"
 	"strings"
 	"testing"
-	"unsafe"
 
-	llssa "github.com/goplus/llgo/ssa"
+	llssa "github.com/xgo-dev/llgo/ssa"
+	"github.com/xgo-dev/llvm"
 	"golang.org/x/tools/go/ssa"
 )
 
@@ -37,9 +39,384 @@ func TestConstBool(t *testing.T) {
 	}
 }
 
+func TestCompileTailUnreachableOmitsSyntheticReturn(t *testing.T) {
+	_, m := mustCompileLLPkgFromSrc(t, `
+package foo
+
+import _ "unsafe"
+
+//go:linkname unreachable llgo.unreachable
+func unreachable()
+
+func stop() {
+	unreachable()
+}
+`)
+	ir := mustNamedFunction(t, m, "foo.stop").String()
+	if !strings.Contains(ir, "\n  unreachable\n") {
+		t.Fatalf("tail intrinsic did not lower to unreachable:\n%s", ir)
+	}
+	if strings.Contains(ir, "ret void") {
+		t.Fatalf("tail intrinsic retained the synthetic Go return:\n%s", ir)
+	}
+}
+
+func TestCompileTailUnreachableOmitsRunDefersAndReturn(t *testing.T) {
+	_, m := mustCompileLLPkgFromSrc(t, `
+package foo
+
+import _ "unsafe"
+
+//go:linkname unreachable llgo.unreachable
+func unreachable()
+
+func cleanup() {}
+
+func stop() {
+	defer cleanup()
+	unreachable()
+}
+`)
+	if err := llvm.VerifyModule(m, llvm.ReturnStatusAction); err != nil {
+		t.Fatalf("invalid module after tail unreachable with defer: %v\n%s", err, m.String())
+	}
+	ir := mustNamedFunction(t, m, "foo.stop").String()
+	if !strings.Contains(ir, "\n  unreachable\n\n_llgo_") {
+		t.Fatalf("tail intrinsic did not terminate its LLVM block:\n%s", ir)
+	}
+}
+
+func TestIsDirectTailUnreachableCallShapes(t *testing.T) {
+	ssaPkg, _, _ := buildGoSSAPkg(t, `
+package foo
+
+func unreachable()
+func ordinary()
+
+func stop() {
+	unreachable()
+}
+`)
+	call := findStaticCall(t, ssaPkg.Func("stop"), "unreachable")
+	ctx := &context{
+		prog:   llssa.NewProgram(nil),
+		goTyps: ssaPkg.Pkg,
+		loaded: make(map[*types.Package]*pkgInfo),
+	}
+	ctx.prog.SetLinkname("foo.unreachable", "llgo.unreachable")
+
+	if !ctx.isDirectTailUnreachableCall(call, []ssa.Instruction{new(ssa.DebugRef), new(ssa.RunDefers), new(ssa.Return)}) {
+		t.Fatal("debug references and one RunDefers should preserve the tail unreachable match")
+	}
+
+	tests := []struct {
+		name     string
+		instr    ssa.Instruction
+		tail     []ssa.Instruction
+		linkname string
+	}{
+		{name: "non-call", instr: new(ssa.Return)},
+		{name: "invoke", instr: &ssa.Call{Call: ssa.CallCommon{Method: types.NewFunc(token.NoPos, nil, "M", types.NewSignatureType(nil, nil, nil, nil, nil, false))}}},
+		{name: "dynamic call", instr: &ssa.Call{Call: ssa.CallCommon{Value: new(ssa.MakeClosure)}}},
+		{name: "ordinary function", instr: call, tail: []ssa.Instruction{new(ssa.Return)}, linkname: "foo.ordinary"},
+		{name: "different LLGo intrinsic", instr: call, tail: []ssa.Instruction{new(ssa.Return)}, linkname: "llgo.funcAddr"},
+		{name: "missing return", instr: call},
+		{name: "unexpected tail instruction", instr: call, tail: []ssa.Instruction{new(ssa.Jump)}},
+		{name: "duplicate RunDefers", instr: call, tail: []ssa.Instruction{new(ssa.RunDefers), new(ssa.RunDefers), new(ssa.Return)}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			linkname := tt.linkname
+			if linkname == "" {
+				linkname = "llgo.unreachable"
+			}
+			ctx.prog.SetLinkname("foo.unreachable", linkname)
+			if ctx.isDirectTailUnreachableCall(tt.instr, tt.tail) {
+				t.Fatal("unexpected tail unreachable match")
+			}
+		})
+	}
+}
+
+func TestIsLargeNonPointerValue(t *testing.T) {
+	prog := llssa.NewProgram(nil)
+	ctx := &context{prog: prog}
+
+	largeArray := prog.Type(types.NewArray(types.Typ[types.Byte], int64(maxDirectDerefSize)+1), llssa.InGo)
+	if !ctx.isLargeNonPointerValue(largeArray) {
+		t.Fatal("large array should require explicit nil-deref guard")
+	}
+
+	smallArray := prog.Type(types.NewArray(types.Typ[types.Byte], 16), llssa.InGo)
+	if ctx.isLargeNonPointerValue(smallArray) {
+		t.Fatal("small array should not require explicit nil-deref guard")
+	}
+
+	largePointer := prog.Type(types.NewPointer(types.NewArray(types.Typ[types.Byte], int64(maxDirectDerefSize)+1)), llssa.InGo)
+	if ctx.isLargeNonPointerValue(largePointer) {
+		t.Fatal("pointer values should not be classified as large direct values")
+	}
+}
+
+func TestCompileLargeNilDerefInterfaceGuards(t *testing.T) {
+	_, m := mustCompileLLPkgFromSrc(t, `
+package foo
+
+type large [1 << 21]byte
+type largeStruct struct {
+	data [1 << 21]byte
+}
+type holder struct {
+	pad [1 << 21]byte
+	value largeStruct
+}
+
+var sink any
+
+func arrayIface(p *large) {
+	sink = *p
+}
+
+func standalone(p *large) {
+	_ = *p
+}
+
+func fieldIface(p *holder) {
+	sink = p.value
+}
+`)
+	ir := m.String()
+	for _, want := range []string{"AssertNilDeref", "Typedmemmove"} {
+		if !strings.Contains(ir, want) {
+			t.Fatalf("compiled IR missing %s for large nil-deref guard path:\n%s", want, ir)
+		}
+	}
+}
+
+func TestCompileInterfaceCompareDerefNilGuard(t *testing.T) {
+	_, m := mustCompileLLPkgFromSrc(t, `
+package foo
+
+func compareInterfacePtr(p *interface{}, q interface{}) bool {
+	return *p == q
+}
+`)
+	if ir := m.String(); !strings.Contains(ir, "AssertNilDeref") {
+		t.Fatalf("compiled IR missing AssertNilDeref for interface compare deref:\n%s", ir)
+	}
+}
+
+func TestCompileNestedLargeNilDerefBaseGuard(t *testing.T) {
+	_, m := mustCompileLLPkgFromSrc(t, `
+package foo
+
+type large [1 << 21]byte
+
+func nested(pp **large) {
+	_ = **pp
+}
+`)
+	ir := m.String()
+	if strings.Count(ir, "AssertNilDerefPtr") == 0 {
+		t.Fatalf("compiled IR missing nested AssertNilDerefPtr guard:\n%s", ir)
+	}
+	if !strings.Contains(ir, "AssertNilDeref") {
+		t.Fatalf("compiled IR missing outer AssertNilDeref guard:\n%s", ir)
+	}
+}
+
+func TestCompileWrapNilCheckGuard(t *testing.T) {
+	_, m := mustCompileLLPkgFromSrc(t, `
+	package foo
+
+type value struct {
+	n int
+}
+
+func (v value) method() int {
+	return v.n
+}
+
+func methodExpr(p *value) int {
+	return (*value).method(p)
+}
+
+func methodValue(p *value) func() int {
+	return p.method
+}
+`)
+	if !strings.Contains(m.String(), "AssertNilDeref") {
+		t.Fatalf("compiled IR missing AssertNilDeref for ssa:wrapnilchk:\n%s", m.String())
+	}
+}
+
+func TestCompilePromotedValueMethodNilDerefGuard(t *testing.T) {
+	_, m := mustCompileLLPkgFromSrc(t, `
+	package foo
+
+	type embedded struct {
+		n int
+	}
+
+	func (v embedded) value() int {
+		return v.n
+	}
+
+	type outer struct {
+		*embedded
+	}
+
+	func call(o outer) int {
+		return o.value()
+	}
+	`)
+	if !strings.Contains(m.String(), "AssertNilDeref") {
+		t.Fatalf("compiled IR missing AssertNilDeref for promoted value method receiver:\n%s", m.String())
+	}
+}
+
+func TestCompileValueReceiverNilDerefKeepsDominance(t *testing.T) {
+	_, m := mustCompileLLPkgFromSrc(t, `
+	package foo
+
+	type stamp struct {
+		n int
+	}
+
+	func (s stamp) value() int {
+		return 1
+	}
+
+	type conn struct {
+		idle stamp
+	}
+
+	func pick(conns []*conn, cond bool) int {
+		if len(conns) == 0 {
+			return 0
+		}
+		pc := conns[0]
+		if cond {
+			_ = pc.idle.value()
+		}
+		return pc.idle.n
+	}
+	`)
+	if err := llvm.VerifyModule(m, llvm.ReturnStatusAction); err != nil {
+		t.Fatalf("compiled IR failed verifier: %v\n%s", err, m.String())
+	}
+}
+
+func TestMethodNilDerefHelperBranches(t *testing.T) {
+	ctx := &context{}
+	alloc := &ssa.Alloc{}
+	field := &ssa.FieldAddr{X: alloc}
+
+	ctx.emitNilDerefBaseCheck(nil, field)
+	ctx.assertNilDerefBase(nil, field)
+	ctx.assertNilDerefBase(nil, &ssa.UnOp{Op: token.ADD})
+
+	if arg, ok := valueReceiverNilDerefArg(nil, nil); ok || arg != nil {
+		t.Fatal("nil function should not request value receiver nil check")
+	}
+
+	recv := types.NewVar(token.NoPos, nil, "recv", types.Typ[types.Int])
+	valueMethod := &ssa.Function{
+		Signature: types.NewSignatureType(recv, nil, nil, nil, nil, false),
+	}
+	unop := &ssa.UnOp{Op: token.MUL, X: alloc}
+	if arg, ok := valueReceiverNilDerefArg(valueMethod, []ssa.Value{unop}); ok || arg != nil {
+		t.Fatal("known non-nil receiver address should not request nil check")
+	}
+
+	bound := &ssa.Function{
+		Synthetic: "bound method wrapper for value",
+		FreeVars:  []*ssa.FreeVar{nil},
+	}
+	if arg, ok := boundValueReceiverNilDerefArg(bound, nil); ok || arg != nil {
+		t.Fatal("missing bound method binding should not request nil check")
+	}
+
+	if arg, ok := boundValueReceiverNilDerefArg(
+		&ssa.Function{Synthetic: "plain closure", FreeVars: []*ssa.FreeVar{nil}},
+		[]ssa.Value{unop},
+	); ok || arg != nil {
+		t.Fatal("non-bound wrapper should not request nil check")
+	}
+
+	ssapkg := buildSSAPackage(t, `
+package foo
+
+type pointer struct{}
+
+func (*pointer) pointerMethod() int { return 1 }
+
+type value struct{}
+
+func (value) valueMethod() int { return 2 }
+
+func bindPointer(p *pointer) func() int {
+	return p.pointerMethod
+}
+
+func bindLocalValue() func() int {
+	var v value
+	return v.valueMethod
+}
+`)
+	if arg, ok := boundValueReceiverNilDerefArgFromFunc(t, ssapkg.Func("bindPointer")); ok || arg != nil {
+		t.Fatal("pointer receiver bound method should not request nil check")
+	}
+	if arg, ok := boundValueReceiverNilDerefArgFromFunc(t, ssapkg.Func("bindLocalValue")); ok || arg != nil {
+		t.Fatal("known non-nil local value binding should not request nil check")
+	}
+}
+
+func boundValueReceiverNilDerefArgFromFunc(t *testing.T, fn *ssa.Function) (*ssa.UnOp, bool) {
+	t.Helper()
+	if fn == nil {
+		t.Fatal("missing function")
+	}
+	for _, block := range fn.Blocks {
+		for _, instr := range block.Instrs {
+			closure, ok := instr.(*ssa.MakeClosure)
+			if !ok {
+				continue
+			}
+			bound, ok := closure.Fn.(*ssa.Function)
+			if !ok {
+				t.Fatalf("closure function has type %T, want *ssa.Function", closure.Fn)
+			}
+			return boundValueReceiverNilDerefArg(bound, closure.Bindings)
+		}
+	}
+	t.Fatalf("bound method closure not found in %s", fn.Name())
+	return nil, false
+}
+
+func TestCollectMethodNilDerefChecksSkipsDynamicDeferGo(t *testing.T) {
+	fn := &ssa.Function{
+		Blocks: []*ssa.BasicBlock{{
+			Instrs: []ssa.Instruction{
+				&ssa.Defer{},
+				&ssa.Go{},
+			},
+		}},
+	}
+	if got := collectMethodNilDerefChecks(fn); len(got) != 0 {
+		t.Fatalf("collectMethodNilDerefChecks() = %v, want no static checks", got)
+	}
+}
+
 func TestToBackground(t *testing.T) {
-	if v := toBackground(""); v != llssa.InGo {
-		t.Fatal("toBackground:", v)
+	for name, want := range map[string]llssa.Background{
+		"":        llssa.InGo,
+		"C":       llssa.InC,
+		"stdcall": llssa.InStdcall,
+	} {
+		if got := toBackground(name); got != want {
+			t.Fatalf("toBackground(%q) = %v, want %v", name, got, want)
+		}
 	}
 }
 
@@ -170,20 +547,18 @@ func TestIsAllocVargs(t *testing.T) {
 
 func ssaSlice(refs ...ssa.Instruction) *ssa.Slice {
 	a := &ssa.Slice{}
-	setRefs(unsafe.Pointer(a), refs...)
+	setRefs(a, refs...)
 	return a
 }
 
 func ssaAlloc(refs ...ssa.Instruction) *ssa.Alloc {
 	a := &ssa.Alloc{}
-	setRefs(unsafe.Pointer(a), refs...)
+	setRefs(a, refs...)
 	return a
 }
 
-func setRefs(v unsafe.Pointer, refs ...ssa.Instruction) {
-	off := unsafe.Offsetof(ssa.Alloc{}.Comment) - unsafe.Sizeof([]int(nil))
-	ptr := uintptr(v) + off
-	*(*[]ssa.Instruction)(unsafe.Pointer(ptr)) = refs
+func setRefs(v ssa.Value, refs ...ssa.Instruction) {
+	*v.Referrers() = refs
 }
 
 func TestRecvTypeName(t *testing.T) {
@@ -205,6 +580,25 @@ func TestRecvTypeName(t *testing.T) {
 		}
 	}()
 	recvTypeName(&ast.BadExpr{})
+}
+
+func TestRecvType(t *testing.T) {
+	pkg := types.NewPackage("", "main")
+	obj := types.NewTypeName(token.NoPos, pkg, "T", nil)
+	named := types.NewNamed(obj, types.Typ[types.Int], nil)
+	if ret := recvNamed(named); ret != named {
+		t.Fatal("error")
+	}
+	if ret := recvNamed(types.NewPointer(named)); ret != named {
+		t.Fatal("error")
+	}
+	defer func() {
+		err := recover()
+		if err == nil {
+			t.Fatal("must panic")
+		}
+	}()
+	recvNamed(types.NewPointer(types.Typ[types.Int]))
 }
 
 /*
@@ -230,8 +624,16 @@ func TestErrCompileValue(t *testing.T) {
 
 func TestErrCompileInstrOrValue(t *testing.T) {
 	defer func() {
-		if r := recover(); r == nil {
+		r := recover()
+		if r == nil {
 			t.Fatal("compileInstrOrValue: no error?")
+		}
+		got := fmt.Sprint(r)
+		if !strings.Contains(got, "unreachable: *ssa.Call") {
+			t.Fatalf("compileInstrOrValue error = %q", got)
+		}
+		if strings.Contains(got, "PANIC=String method") {
+			t.Fatalf("compileInstrOrValue formatted the malformed SSA value: %q", got)
 		}
 	}()
 	ctx := &context{
@@ -260,6 +662,8 @@ func TestErrBuiltin(t *testing.T) {
 	test("funcAddr", func(ctx *context) { ctx.funcAddr(nil, nil) })
 	test("sigsetjmp", func(ctx *context) { ctx.sigsetjmp(nil, nil) })
 	test("siglongjmp", func(ctx *context) { ctx.siglongjmp(nil, nil) })
+	test("setjmp", func(ctx *context) { ctx.setjmp(nil, nil) })
+	test("longjmp", func(ctx *context) { ctx.longjmp(nil, nil) })
 	test("cstr(NoArgs)", func(ctx *context) { cstr(nil, nil) })
 	test("cstr(Nonconst)", func(ctx *context) { cstr(nil, []ssa.Value{&ssa.Parameter{}}) })
 	test("pystr(NoArgs)", func(ctx *context) { pystr(nil, nil) })
@@ -289,7 +693,7 @@ func TestErrAsm(t *testing.T) {
 		nonConstKey := &ssa.Parameter{}
 		mapUpdate := &ssa.MapUpdate{Key: nonConstKey}
 		referrers := []ssa.Instruction{mapUpdate}
-		setRefs(unsafe.Pointer(makeMap), referrers...)
+		setRefs(makeMap, referrers...)
 		strConst := &ssa.Const{
 			Value: constant.MakeString("nop"),
 		}
@@ -298,7 +702,7 @@ func TestErrAsm(t *testing.T) {
 	test("asmFull(RegisterNotFound)", func(ctx *context) {
 		makeMap := &ssa.MakeMap{}
 		referrers := []ssa.Instruction{}
-		setRefs(unsafe.Pointer(makeMap), referrers...)
+		setRefs(makeMap, referrers...)
 		strConst := &ssa.Const{
 			Value: constant.MakeString("test {missing}"),
 		}
@@ -308,7 +712,7 @@ func TestErrAsm(t *testing.T) {
 		makeMap := &ssa.MakeMap{}
 		unknownRef := &ssa.Return{}
 		referrers := []ssa.Instruction{unknownRef}
-		setRefs(unsafe.Pointer(makeMap), referrers...)
+		setRefs(makeMap, referrers...)
 		strConst := &ssa.Const{
 			Value: constant.MakeString("test"),
 		}
@@ -361,6 +765,12 @@ func TestPkgKindOf(t *testing.T) {
 	if v, _ := PkgKindOf(pkg); v != PkgNoInit {
 		t.Fatal("PkgKindOf foo:", v)
 	}
+	if PkgSkipsInit(PkgNormal) {
+		t.Fatal("normal package skips initialization")
+	}
+	if !PkgSkipsInit(PkgNoInit) || !PkgSkipsInit(PkgDeclOnly) {
+		t.Fatal("noinit/decl-only package does not skip initialization")
+	}
 }
 
 func TestIsAny(t *testing.T) {
@@ -393,10 +803,10 @@ func TestErrImport(t *testing.T) {
 
 func TestErrInitLinkname(t *testing.T) {
 	var ctx context
-	ctx.initLinkname("//llgo:link abc", func(name string) (string, bool, bool) {
+	ctx.initLinkname("//llgo:link abc", true, func(name string, isExport bool) (string, bool, bool) {
 		return "", false, false
 	})
-	ctx.initLinkname("//go:linkname Printf printf", func(name string) (string, bool, bool) {
+	ctx.initLinkname("//go:linkname Printf printf", true, func(name string, isExport bool) (string, bool, bool) {
 		return "", false, false
 	})
 	defer func() {
@@ -404,7 +814,7 @@ func TestErrInitLinkname(t *testing.T) {
 			t.Fatal("initLinkname: no error?")
 		}
 	}()
-	ctx.initLinkname("//go:linkname Printf printf", func(name string) (string, bool, bool) {
+	ctx.initLinkname("//go:linkname Printf printf", true, func(name string, isExport bool) (string, bool, bool) {
 		return "foo.Printf", false, name == "Printf"
 	})
 }
@@ -504,5 +914,223 @@ func TestInstantiate(t *testing.T) {
 	}
 	if typ := instantiate(obj.Type(), inamed.(*types.Named)); typ == obj.Type() || typ.(*types.Named).TypeArgs() == nil {
 		t.Fatal("error")
+	}
+}
+
+func TestHandleExportDiffName(t *testing.T) {
+	tests := []struct {
+		name               string
+		enableExportRename bool
+		line               string
+		fullName           string
+		inPkgName          string
+		wantHasLinkname    bool
+		wantLinkname       string
+		wantExport         string
+	}{
+		{
+			name:               "ExportDiffNames_DifferentName",
+			enableExportRename: true,
+			line:               "//export IRQ_Handler",
+			fullName:           "pkg.HandleInterrupt",
+			inPkgName:          "HandleInterrupt",
+			wantHasLinkname:    true,
+			wantLinkname:       "IRQ_Handler",
+			wantExport:         "IRQ_Handler",
+		},
+		{
+			name:               "ExportDiffNames_SameName",
+			enableExportRename: true,
+			line:               "//export SameName",
+			fullName:           "pkg.SameName",
+			inPkgName:          "SameName",
+			wantHasLinkname:    true,
+			wantLinkname:       "SameName",
+			wantExport:         "SameName",
+		},
+		{
+			name:               "ExportDiffNames_WithSpaces",
+			enableExportRename: true,
+			line:               "//export   Timer_Callback  ",
+			fullName:           "pkg.OnTimerTick",
+			inPkgName:          "OnTimerTick",
+			wantHasLinkname:    true,
+			wantLinkname:       "Timer_Callback",
+			wantExport:         "Timer_Callback",
+		},
+		{
+			name:               "ExportDiffNames_Disabled_MatchingName",
+			enableExportRename: false,
+			line:               "//export Func",
+			fullName:           "pkg.Func",
+			inPkgName:          "Func",
+			wantHasLinkname:    true,
+			wantLinkname:       "Func",
+			wantExport:         "Func",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Setup context
+			prog := llssa.NewProgram(nil)
+			pkg := prog.NewPackage("test", "test")
+			ctx := &context{
+				prog:    prog,
+				pkg:     pkg,
+				options: Options{ExportRename: tt.enableExportRename},
+			}
+
+			// Call initLinkname with closure that mimics initLinknameByDoc behavior
+			ret := ctx.initLinkname(tt.line, true, func(name string, isExport bool) (string, bool, bool) {
+				return tt.fullName, false, name == tt.inPkgName || (isExport && ctx.options.ExportRename)
+			})
+
+			// Verify result
+			hasLinkname := (ret == hasLinkname)
+			if hasLinkname != tt.wantHasLinkname {
+				t.Errorf("hasLinkname = %v, want %v", hasLinkname, tt.wantHasLinkname)
+			}
+
+			if tt.wantHasLinkname {
+				// Check linkname was set
+				if link, ok := prog.Linkname(tt.fullName); !ok || link != tt.wantLinkname {
+					t.Errorf("linkname = %q (ok=%v), want %q", link, ok, tt.wantLinkname)
+				}
+
+				// Check export was set
+				exports := pkg.ExportFuncs()
+				if export, ok := exports[tt.fullName]; !ok || export != tt.wantExport {
+					t.Errorf("export = %q (ok=%v), want %q", export, ok, tt.wantExport)
+				}
+			}
+		})
+	}
+}
+
+func TestInitLinknameByDocExportDiffNames(t *testing.T) {
+	tests := []struct {
+		name               string
+		enableExportRename bool
+		doc                *ast.CommentGroup
+		fullName           string
+		inPkgName          string
+		wantExported       bool // Whether the symbol should be exported with different name
+		wantLinkname       string
+		wantExport         string
+	}{
+		{
+			name:               "WithExportDiffNames_DifferentNameExported",
+			enableExportRename: true,
+			doc: &ast.CommentGroup{
+				List: []*ast.Comment{
+					{Text: "//export IRQ_Handler"},
+				},
+			},
+			fullName:     "pkg.HandleInterrupt",
+			inPkgName:    "HandleInterrupt",
+			wantExported: true,
+			wantLinkname: "IRQ_Handler",
+			wantExport:   "IRQ_Handler",
+		},
+		{
+			name:               "WithoutExportDiffNames_NotExported",
+			enableExportRename: false,
+			doc: &ast.CommentGroup{
+				List: []*ast.Comment{
+					{Text: "//export DifferentName"},
+				},
+			},
+			fullName:     "pkg.HandleInterrupt",
+			inPkgName:    "HandleInterrupt",
+			wantExported: false,
+			// Without enableExportRename, it goes through normal flow which expects same name
+			// The symbol "DifferentName" won't be found, so no export happens
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Without ExportRename, export with different names will panic.
+			if !tt.wantExported && !tt.enableExportRename {
+				defer func() {
+					if r := recover(); r == nil {
+						t.Error("expected panic for export with different name when enableExportRename=false")
+					}
+				}()
+			}
+
+			// Setup context
+			prog := llssa.NewProgram(nil)
+			pkg := prog.NewPackage("test", "test")
+			ctx := &context{
+				prog:    prog,
+				pkg:     pkg,
+				options: Options{ExportRename: tt.enableExportRename},
+			}
+
+			// Call initLinknameByDoc
+			ctx.processLinknameByDoc(tt.doc, tt.fullName, tt.inPkgName, false, true)
+
+			// Verify export behavior
+			exports := pkg.ExportFuncs()
+			if tt.wantExported {
+				// Should have exported the symbol with different name
+				if export, ok := exports[tt.fullName]; !ok || export != tt.wantExport {
+					t.Errorf("export = %q (ok=%v), want %q", export, ok, tt.wantExport)
+				}
+				// Check linkname was also set
+				if link, ok := prog.Linkname(tt.fullName); !ok || link != tt.wantLinkname {
+					t.Errorf("linkname = %q (ok=%v), want %q", link, ok, tt.wantLinkname)
+				}
+			}
+		})
+	}
+}
+
+func TestInitLinkExportDiffNames(t *testing.T) {
+	tests := []struct {
+		name               string
+		enableExportRename bool
+		line               string
+		wantPanic          bool
+	}{
+		{
+			name:               "ExportDiffNames_Enabled_NoError",
+			enableExportRename: true,
+			line:               "//export IRQ_Handler",
+			wantPanic:          false,
+		},
+		{
+			name:               "ExportDiffNames_Disabled_Panic",
+			enableExportRename: false,
+			line:               "//export IRQ_Handler",
+			wantPanic:          true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if tt.wantPanic {
+				defer func() {
+					if r := recover(); r == nil {
+						t.Error("expected panic but didn't panic")
+					}
+				}()
+			}
+
+			prog := llssa.NewProgram(nil)
+			pkg := prog.NewPackage("test", "test")
+			ctx := &context{
+				prog:    prog,
+				pkg:     pkg,
+				options: Options{ExportRename: tt.enableExportRename},
+			}
+
+			ctx.initLinkname(tt.line, true, func(inPkgName string, isExport bool) (fullName string, isVar, ok bool) {
+				// Simulate initLinknames scenario: symbol not found (like in decl packages)
+				return "", false, false
+			})
+		})
 	}
 }

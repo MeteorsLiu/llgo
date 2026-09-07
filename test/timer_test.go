@@ -1,0 +1,150 @@
+package test
+
+import (
+	"sync/atomic"
+	"testing"
+	"time"
+)
+
+// Ensure AfterFunc runs within a reasonable time.
+func TestAfterFuncFires(t *testing.T) {
+	done := make(chan struct{})
+	time.AfterFunc(30*time.Millisecond, func() { close(done) })
+
+	select {
+	case <-done:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatalf("AfterFunc timeout")
+	}
+}
+
+// Verify Stop/Reset on Timer still fire after reset.
+func TestTimerResetFires(t *testing.T) {
+	timer := time.NewTimer(100 * time.Millisecond)
+	active := timer.Stop()
+	if !active {
+		// Drain if it already fired
+		select {
+		case <-timer.C:
+		default:
+		}
+	}
+	// Reset returns whether timer was active before reset; both true/false are acceptable.
+	timer.Reset(40 * time.Millisecond)
+
+	select {
+	case <-timer.C:
+	case <-time.After(400 * time.Millisecond):
+		t.Fatalf("timer did not fire after Reset")
+	}
+}
+
+// Stop should prevent a timer from firing.
+func TestTimerStopPreventsFire(t *testing.T) {
+	timer := time.NewTimer(50 * time.Millisecond)
+	if !timer.Stop() {
+		// It already fired; drain to avoid leakage.
+		select {
+		case <-timer.C:
+		default:
+		}
+		t.Skip("timer fired earlier than expected")
+	}
+
+	select {
+	case <-timer.C:
+		t.Fatalf("timer fired after Stop")
+	case <-time.After(120 * time.Millisecond):
+	}
+}
+
+// After delivers exactly one event and channel does not block forever.
+func TestAfterSingleFire(t *testing.T) {
+	ch := time.After(20 * time.Millisecond)
+	select {
+	case <-ch:
+	case <-time.After(200 * time.Millisecond):
+		t.Fatalf("after timeout")
+	}
+	// Ensure channel doesn't deliver twice.
+	select {
+	case <-ch:
+		t.Fatalf("after channel delivered more than once")
+	default:
+	}
+}
+
+// AfterFunc Stop returns correct boolean and prevents callback.
+func TestAfterFuncStop(t *testing.T) {
+	triggered := make(chan struct{}, 1)
+	tmr := time.AfterFunc(50*time.Millisecond, func() { triggered <- struct{}{} })
+	if !tmr.Stop() {
+		// It might already be running; drain best-effort.
+		select {
+		case <-triggered:
+		default:
+		}
+	}
+	// Wait longer than the timer to check it doesn't fire.
+	select {
+	case <-triggered:
+		t.Fatalf("AfterFunc fired after Stop")
+	case <-time.After(150 * time.Millisecond):
+	}
+}
+
+// Reset reschedules an AfterFunc and reports whether it was active or expired.
+func TestAfterFuncReset(t *testing.T) {
+	const callbackTimeout = 5 * time.Second
+	var count atomic.Int32
+	fired := make(chan int32, 2) // Buffered for both expected callbacks.
+	tmr := time.AfterFunc(time.Hour, func() {
+		fired <- count.Add(1)
+	})
+	defer tmr.Stop()
+
+	if !tmr.Reset(30 * time.Millisecond) {
+		t.Fatal("Reset reported an active AfterFunc as stopped")
+	}
+
+	select {
+	case got := <-fired:
+		if got != 1 {
+			t.Fatalf("first callback count = %d, want 1", got)
+		}
+	case <-time.After(callbackTimeout):
+		t.Fatal("AfterFunc did not fire after active Reset")
+	}
+
+	// The timer becomes inactive before its callback starts. Receiving fired
+	// therefore establishes that this Reset observes an expired timer.
+	if tmr.Reset(30 * time.Millisecond) {
+		t.Fatal("Reset reported an expired AfterFunc as active")
+	}
+	select {
+	case got := <-fired:
+		if got != 2 {
+			t.Fatalf("second callback count = %d, want 2", got)
+		}
+	case <-time.After(callbackTimeout):
+		t.Fatal("AfterFunc did not fire after expired Reset")
+	}
+}
+
+// Concurrent stops should be safe.
+func TestTimerConcurrentStop(t *testing.T) {
+	tmr := time.NewTimer(40 * time.Millisecond)
+	done := make(chan struct{})
+
+	go func() {
+		tmr.Stop()
+		close(done)
+	}()
+
+	select {
+	case <-tmr.C:
+	case <-done:
+	case <-time.After(300 * time.Millisecond):
+		t.Fatalf("timer or stop did not complete")
+	}
+}

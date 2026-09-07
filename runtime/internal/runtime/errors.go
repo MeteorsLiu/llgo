@@ -1,13 +1,13 @@
 // Copyright 2014 The Go Authors. All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Use of this source code is governed by a BSD-style license.
+// See LICENSES/Go-BSD-3-Clause.txt at this module root for license terms.
 
 package runtime
 
 import (
 	"unsafe"
 
-	"github.com/goplus/llgo/runtime/abi"
+	"github.com/xgo-dev/llgo/runtime/abi"
 )
 
 // A boundsError represents an indexing or slicing operation gone wrong.
@@ -68,6 +68,33 @@ var boundsNegErrorFmts = [...]string{
 }
 
 func (e boundsError) RuntimeError() {}
+
+func panicBounds(x int64, signed bool, y int, code boundsErrorCode) {
+	panic(boundsError{x: x, signed: signed, y: y, code: code})
+}
+
+func boundsOutOfRange(x int64, signed bool, y int, inclusive bool) bool {
+	if signed {
+		if x < 0 {
+			return true
+		}
+		if inclusive {
+			return x > int64(y)
+		}
+		return x >= int64(y)
+	}
+	if inclusive {
+		return uint64(x) > uint64(y)
+	}
+	return uint64(x) >= uint64(y)
+}
+
+func boundsAbove(x int64, signed bool, y int64) bool {
+	if signed {
+		return x < 0 || x > y
+	}
+	return uint64(x) > uint64(y)
+}
 
 func appendIntStr(b []byte, v int64, signed bool) []byte {
 	if signed && v < 0 {
@@ -131,6 +158,21 @@ type TypeAssertionError struct {
 
 func (*TypeAssertionError) RuntimeError() {}
 
+func PanicTypeAssert(source, concrete, asserted *_type) {
+	missingMethod := ""
+	if concrete != nil {
+		if missing, _ := interfaceImplementation(asserted, concrete); missing != nil {
+			missingMethod = missing.Name()
+		}
+	}
+	panic(&TypeAssertionError{
+		_interface:    source,
+		concrete:      concrete,
+		asserted:      asserted,
+		missingMethod: missingMethod,
+	})
+}
+
 func (e *TypeAssertionError) Error() string {
 	inter := "interface"
 	if e._interface != nil {
@@ -171,3 +213,21 @@ func pkgpath(t *_type) string {
 	}
 	return ""
 }
+
+// A PanicNilError happens when code calls panic(nil).
+//
+// Before Go 1.21, programs that called panic(nil) observed recover returning nil.
+// Starting in Go 1.21, programs that call panic(nil) observe recover returning a *PanicNilError.
+// Programs can change back to the old behavior by setting GODEBUG=panicnil=1.
+type PanicNilError struct {
+	// This field makes PanicNilError structurally different from
+	// any other struct in this package, and the _ makes it different
+	// from any struct in other packages too.
+	// This avoids any accidental conversions being possible
+	// between this struct and some other struct sharing the same fields,
+	// like happened in go.dev/issue/56603.
+	_ [0]*PanicNilError
+}
+
+func (*PanicNilError) Error() string { return panicNilErrorMessage() }
+func (*PanicNilError) RuntimeError() {}

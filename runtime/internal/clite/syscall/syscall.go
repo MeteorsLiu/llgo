@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2024 The GoPlus Authors (goplus.org). All rights reserved.
+ * Copyright (c) 2024 The XGo Authors (xgo.dev). All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,23 +17,13 @@
 package syscall
 
 import (
-	errorsPkg "errors"
 	_ "unsafe"
 
-	c "github.com/goplus/llgo/runtime/internal/clite"
+	c "github.com/xgo-dev/llgo/runtime/internal/clite"
 )
 
 const (
 	LLGoPackage = true
-)
-
-var (
-	ErrInvalid     = errorsPkg.New("invalid argument")
-	ErrPermission  = errorsPkg.New("permission denied")
-	ErrExist       = errorsPkg.New("file already exists")
-	ErrNotExist    = errorsPkg.New("file does not exist")
-	ErrClosed      = errorsPkg.New("file already closed")
-	ErrUnsupported = errorsPkg.New("operation not supported")
 )
 
 // Nano returns the time stored in ts as nanoseconds.
@@ -59,7 +49,7 @@ func (tv *Timeval) Unix() (sec int64, nsec int64) {
 //go:linkname c_getpid C.getpid
 func c_getpid() c.Int
 
-func Kill(pid int, signum Signal) error {
+func Kill(pid int, signum Signal) Errno {
 	// WASI does not have the notion of processes nor signal handlers.
 	//
 	// Any signal that the application raises to the process itself will
@@ -68,7 +58,7 @@ func Kill(pid int, signum Signal) error {
 		return ESRCH
 	}
 	ProcExit(128 + int32(signum))
-	return nil
+	return 0
 }
 
 func ProcExit(code int32) {

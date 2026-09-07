@@ -1,0 +1,67 @@
+name: "Setup Embedded Dependencies"
+description: "Install embedded QEMU dependencies after the common LLGo dependencies"
+
+runs:
+  using: "composite"
+  steps:
+    - name: Install macOS embedded dependencies
+      if: runner.os == 'macOS'
+      shell: bash
+      env:
+        HOMEBREW_NO_AUTO_UPDATE: 1
+        HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK: 1
+      run: |
+        # setup-deps runs before this action and refreshes Homebrew metadata on
+        # Apple Silicon. Do not repeat that network operation here.
+        brew list --versions sdl2 >/dev/null || brew install sdl2
+
+    - name: Install Ubuntu embedded dependencies
+      if: runner.os == 'Linux'
+      shell: bash
+      run: |
+        # setup-deps has already refreshed apt metadata in every caller.
+        sudo apt-get install -y libsdl2-2.0-0 libslirp0
+
+    - name: Cache ESP QEMU toolchains
+      id: esp_qemu_cache
+      uses: actions/cache@v6
+      with:
+        path: .cache/qemu
+        key: esp-qemu-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('.github/workflows/install-esp-qemu.sh') }}
+
+    - name: Install ESP QEMU toolchains
+      if: steps.esp_qemu_cache.outputs.cache-hit != 'true'
+      shell: bash
+      run: |
+        chmod +x .github/workflows/install-esp-qemu.sh
+        .github/workflows/install-esp-qemu.sh .cache/qemu
+
+    - name: Add ESP QEMU to PATH
+      shell: bash
+      run: |
+        qemu_bin="${PWD}/.cache/qemu/bin"
+        if [[ "$RUNNER_OS" == Windows ]]; then
+          # Git Bash understands /d/... paths, but LLGo launches QEMU through
+          # Windows CreateProcess and therefore needs a native path.
+          qemu_bin="$(cygpath -w "$qemu_bin")"
+        fi
+        echo "$qemu_bin" >> "$GITHUB_PATH"
+
+    - name: Verify ESP QEMU installation on Unix
+      if: runner.os != 'Windows'
+      shell: bash
+      run: |
+        command -v qemu-system-riscv32
+        command -v qemu-system-xtensa
+        qemu-system-riscv32 --version
+        qemu-system-xtensa --version
+
+    - name: Verify ESP QEMU installation on Windows
+      if: runner.os == 'Windows'
+      shell: pwsh
+      run: |
+        $ErrorActionPreference = "Stop"
+        Get-Command qemu-system-riscv32 | Select-Object -ExpandProperty Source
+        Get-Command qemu-system-xtensa | Select-Object -ExpandProperty Source
+        qemu-system-riscv32 --version
+        qemu-system-xtensa --version

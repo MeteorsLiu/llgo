@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2024 The GoPlus Authors (goplus.org). All rights reserved.
+ * Copyright (c) 2024 The XGo Authors (xgo.dev). All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -28,8 +28,11 @@ import (
 
 	"golang.org/x/tools/go/ssa"
 
-	"github.com/goplus/llgo/internal/env"
-	llssa "github.com/goplus/llgo/ssa"
+	"github.com/xgo-dev/llgo/internal/directive"
+	"github.com/xgo-dev/llgo/internal/env"
+	"github.com/xgo-dev/llgo/internal/genmethod"
+	"github.com/xgo-dev/llgo/internal/locality"
+	llssa "github.com/xgo-dev/llgo/ssa"
 )
 
 // -----------------------------------------------------------------------------
@@ -73,7 +76,7 @@ func (p *pkgSymInfo) initLinknames(ctx *context) {
 		lines := bytes.Split(b, sep)
 		for _, line := range lines {
 			if bytes.HasPrefix(line, commentPrefix) {
-				ctx.initLinkname(string(line), func(inPkgName string) (fullName string, isVar, ok bool) {
+				ctx.initLinkname(string(line), true, func(inPkgName string, isExport bool) (fullName string, isVar, ok bool) {
 					if sym, ok := p.syms[inPkgName]; ok && file == sym.file {
 						return sym.fullName, sym.isVar, true
 					}
@@ -92,6 +95,12 @@ func PkgKindOf(pkg *types.Package) (int, string) {
 		kind = pkgKindByPath(pkg.Path())
 	}
 	return kind, param
+}
+
+// PkgSkipsInit reports whether packages of kind are excluded from Go package
+// initialization.
+func PkgSkipsInit(kind int) bool {
+	return kind >= PkgNoInit
 }
 
 // decl: a package that only contains declarations
@@ -144,6 +153,9 @@ func (p *context) importPkg(pkg *types.Package, i *pkgInfo) {
 	}
 start:
 	i.kind = kind
+	if p.options.PreloadedSyntax {
+		return
+	}
 	fset := p.fset
 	names := scope.Names()
 	syms := newPkgSymInfo()
@@ -175,15 +187,25 @@ start:
 }
 
 func (p *context) initFiles(pkgPath string, files []*ast.File, cPkg bool) {
+	preloaded := p.options.PreloadedSyntax
 	for _, file := range files {
 		for _, decl := range file.Decls {
 			switch decl := decl.(type) {
 			case *ast.FuncDecl:
 				fullName, inPkgName := astFuncName(pkgPath, decl)
-				if !p.initLinknameByDoc(decl.Doc, fullName, inPkgName, false) && cPkg {
-					// package C (https://github.com/goplus/llgo/issues/1165)
+				if preloaded {
+					if exportName, ok := p.prog.PackageExport(fullName); ok {
+						p.pkg.SetExport(fullName, exportName)
+					}
+					continue
+				}
+				p.processNoInterfaceByDoc(decl.Doc, fullName)
+				if !p.processLinknameByDoc(decl.Doc, fullName, inPkgName, false, true) && cPkg {
+					// package C (https://github.com/xgo-dev/llgo/issues/1165)
 					if decl.Recv == nil && token.IsExported(inPkgName) {
-						p.prog.SetLinkname(fullName, strings.TrimPrefix(inPkgName, "X"))
+						exportName := strings.TrimPrefix(inPkgName, "X")
+						p.prog.SetLinkname(fullName, exportName)
+						p.pkg.SetExport(fullName, exportName)
 					}
 				}
 			case *ast.GenDecl:
@@ -192,7 +214,14 @@ func (p *context) initFiles(pkgPath string, files []*ast.File, cPkg bool) {
 					if len(decl.Specs) == 1 {
 						if names := decl.Specs[0].(*ast.ValueSpec).Names; len(names) == 1 {
 							inPkgName := names[0].Name
-							p.initLinknameByDoc(decl.Doc, pkgPath+"."+inPkgName, inPkgName, true)
+							fullName := pkgPath + "." + inPkgName
+							if preloaded {
+								if exportName, ok := p.prog.PackageExport(fullName); ok {
+									p.pkg.SetExport(fullName, exportName)
+								}
+							} else {
+								p.processLinknameByDoc(decl.Doc, fullName, inPkgName, true, true)
+							}
 						}
 					}
 				case token.CONST:
@@ -271,12 +300,85 @@ func (p *context) collectSkip(line string, prefix int) {
 	}
 }
 
-func (p *context) initLinknameByDoc(doc *ast.CommentGroup, fullName, inPkgName string, isVar bool) bool {
+// collectDeclarationDirectives caches source metadata needed after the syntax
+// pass. funcPos is token.NoPos for non-function declarations.
+func collectDeclarationDirectives(prog llssa.Program, fset *token.FileSet, doc *ast.CommentGroup, fullName, inPkgName string, funcPos token.Pos) {
+	_, _ = collectDeclarationDirectivesWithOptions(prog, fset, doc, fullName, inPkgName, funcPos, Options{})
+}
+
+func collectDeclarationDirectivesWithOptions(prog llssa.Program, fset *token.FileSet, doc *ast.CommentGroup, fullName, inPkgName string, funcPos token.Pos, options Options) (bool, error) {
+	directives := directive.ParseGroup(doc)
+	linkCollected := false
+	hasClosureEnv := false
+	wasmImportSeen := false
+	for n := len(directives) - 1; n >= 0; n-- {
+		item := directives[n]
+		switch item.Name {
+		case "go:linkname", "llgo:link":
+			if linkCollected {
+				continue
+			}
+			fields := strings.Fields(item.Args)
+			if len(fields) >= 2 && fields[0] == inPkgName {
+				prog.SetLinkname(fullName, strings.Join(fields[1:], " "))
+				linkCollected = true
+			}
+		case "export":
+			if linkCollected || item.Args == "" {
+				continue
+			}
+			if item.Args != inPkgName && !options.ExportRename {
+				return false, fmt.Errorf("export comment has wrong name %q", item.Args)
+			}
+			prog.SetLinkname(fullName, item.Args)
+			prog.SetPackageExport(fullName, item.Args)
+			linkCollected = true
+		case "llgo:env":
+			if funcPos.IsValid() {
+				hasClosureEnv = true
+			}
+		case "go:wasmimport":
+			if !funcPos.IsValid() || wasmImportSeen {
+				continue
+			}
+			wasmImportSeen = true
+			fields := strings.Fields(item.Args)
+			if len(fields) == 2 {
+				prog.SetWasmImport(fullName, fields[0], fields[1])
+			}
+		}
+	}
+	if hasClosureEnv {
+		prog.SetClosureEnvDirective(fset, fullName, funcPos)
+	}
+	return linkCollected, nil
+}
+
+// collectGoLinknames follows cmd/compile's package-scoped go:linkname behavior.
+func collectGoLinknames(prog llssa.Program, comments []*ast.CommentGroup, syms map[string]string) {
+	const prefix = "//go:linkname "
+	for _, group := range comments {
+		for _, comment := range group.List {
+			if !strings.HasPrefix(comment.Text, prefix) {
+				continue
+			}
+			fields := strings.Fields(comment.Text[len(prefix):])
+			if len(fields) < 2 {
+				continue
+			}
+			if fullName, ok := syms[fields[0]]; ok {
+				prog.SetLinkname(fullName, strings.Join(fields[1:], " "))
+			}
+		}
+	}
+}
+
+func (p *context) processLinknameByDoc(doc *ast.CommentGroup, fullName, inPkgName string, isVar, allowExport bool) bool {
 	if doc != nil {
 		for n := len(doc.List) - 1; n >= 0; n-- {
 			line := doc.List[n].Text
-			ret := p.initLinkname(line, func(name string) (_ string, _, ok bool) {
-				return fullName, isVar, name == inPkgName
+			ret := p.initLinkname(line, allowExport, func(name string, isExport bool) (_ string, _, ok bool) {
+				return fullName, isVar, name == inPkgName || (isExport && p.options.ExportRename)
 			})
 			if ret != unknownDirective {
 				return ret == hasLinkname
@@ -286,13 +388,29 @@ func (p *context) initLinknameByDoc(doc *ast.CommentGroup, fullName, inPkgName s
 	return false
 }
 
+func (p *context) processNoInterfaceByDoc(doc *ast.CommentGroup, fullName string) {
+	if doc == nil {
+		return
+	}
+	for n := len(doc.List) - 1; n >= 0; n-- {
+		line := doc.List[n].Text
+		if line == "//go:nointerface" {
+			p.prog.SetNoInterfaceMethod(fullName)
+			return
+		}
+		if !strings.HasPrefix(line, "//go:") {
+			return
+		}
+	}
+}
+
 const (
 	noDirective = iota
 	hasLinkname
 	unknownDirective = -1
 )
 
-func (p *context) initLinkname(line string, f func(inPkgName string) (fullName string, isVar, ok bool)) int {
+func (p *context) initLinkname(line string, allowExport bool, f func(inPkgName string, isExport bool) (fullName string, isVar, ok bool)) int {
 	const (
 		linkname  = "//go:linkname "
 		llgolink  = "//llgo:link "
@@ -301,16 +419,19 @@ func (p *context) initLinkname(line string, f func(inPkgName string) (fullName s
 		directive = "//go:"
 	)
 	if strings.HasPrefix(line, linkname) {
-		p.initLink(line, len(linkname), f)
+		p.initLink(line, len(linkname), false, f)
 		return hasLinkname
 	} else if strings.HasPrefix(line, llgolink2) {
-		p.initLink(line, len(llgolink2), f)
+		p.initLink(line, len(llgolink2), false, f)
 		return hasLinkname
 	} else if strings.HasPrefix(line, llgolink) {
-		p.initLink(line, len(llgolink), f)
+		p.initLink(line, len(llgolink), false, f)
 		return hasLinkname
-	} else if strings.HasPrefix(line, export) {
-		p.initCgoExport(line, len(export), f)
+	} else if allowExport && strings.HasPrefix(line, export) {
+		// rewrite //export FuncName to //export FuncName FuncName
+		funcName := strings.TrimSpace(line[len(export):])
+		line = line + " " + funcName
+		p.initLink(line, len(export), true, f)
 		return hasLinkname
 	} else if strings.HasPrefix(line, directive) {
 		// skip unknown annotation but continue to parse the next annotation
@@ -319,25 +440,24 @@ func (p *context) initLinkname(line string, f func(inPkgName string) (fullName s
 	return noDirective
 }
 
-func (p *context) initCgoExport(line string, prefix int, f func(inPkgName string) (fullName string, isVar, ok bool)) {
-	name := strings.TrimSpace(line[prefix:])
-	if fullName, _, ok := f(name); ok {
-		p.cgoExports[fullName] = name // TODO(xsw): why not use prog.SetLinkname?
-	}
-}
-
-func (p *context) initLink(line string, prefix int, f func(inPkgName string) (fullName string, isVar, ok bool)) {
+func (p *context) initLink(line string, prefix int, export bool, f func(inPkgName string, isExport bool) (fullName string, isVar, ok bool)) {
 	text := strings.TrimSpace(line[prefix:])
 	if idx := strings.IndexByte(text, ' '); idx > 0 {
 		inPkgName := text[:idx]
-		if fullName, isVar, ok := f(inPkgName); ok {
+		if fullName, _, ok := f(inPkgName, export); ok {
 			link := strings.TrimLeft(text[idx+1:], " ")
-			if isVar || strings.Contains(link, ".") { // eg. C.printf, C.strlen, llgo.cstr
-				p.prog.SetLinkname(fullName, link)
-			} else {
-				p.prog.SetLinkname(fullName, "C."+link)
+			p.prog.SetLinkname(fullName, link)
+			if export {
+				p.pkg.SetExport(fullName, link)
 			}
 		} else {
+			// Export with different names already processed by initLinknameByDoc
+			if export && p.options.ExportRename {
+				return
+			}
+			if export {
+				panic(fmt.Sprintf("export comment has wrong name %q", inPkgName))
+			}
 			fmt.Fprintln(os.Stderr, "==>", line)
 			fmt.Fprintf(os.Stderr, "llgo: linkname %s not found and ignored\n", inPkgName)
 		}
@@ -408,16 +528,27 @@ func typesFuncName(pkgPath string, fn *types.Func) (fullName, inPkgName string) 
 // - func: pkg.name
 // - method: pkg.(T).name, pkg.(*T).name
 func funcName(pkg *types.Package, fn *ssa.Function, org bool) string {
+	// Closures in methods can be nested (closure inside closure inside method).
+	// Walking only one Parent() loses the receiver for deeper nests, producing
+	// names like "pkg.marshal$1$1" that can collide across receiver types.
+	// Walk parents until we find a receiver.
 	var recv *types.Var
-	parent := fn.Parent()
-	if parent != nil { // closure in method
-		recv = parent.Signature.Recv()
-	} else {
-		recv = fn.Signature.Recv()
-		// check $bound
-		if recv == nil && strings.HasSuffix(fn.Name(), "$bound") && len(fn.FreeVars) == 1 {
-			recv = types.NewVar(token.NoPos, nil, "", fn.FreeVars[0].Type())
+	for f := fn; f != nil; f = f.Parent() {
+		recv = f.Signature.Recv()
+		if recv != nil {
+			break
 		}
+	}
+	// For wrappers, fall back to metadata available on fn itself.
+	name := fn.Name()
+	if recv == nil && strings.HasSuffix(name, "$thunk") {
+		// For thunks, extract receiver from first parameter.
+		if params := fn.Signature.Params(); params.Len() > 0 {
+			recv = params.At(0)
+		}
+	} else if recv == nil && strings.HasSuffix(name, "$bound") && len(fn.FreeVars) == 1 {
+		// For bound method wrappers, synthesize receiver var from free var type.
+		recv = types.NewVar(token.NoPos, nil, "", fn.FreeVars[0].Type())
 	}
 	var fnName string
 	if org := fn.Origin(); org != nil {
@@ -427,6 +558,23 @@ func funcName(pkg *types.Package, fn *ssa.Function, org bool) string {
 		}
 	} else {
 		fnName = fn.Name()
+	}
+	if recv != nil {
+		// funcName's pkg is the receiver named type's package for wrappers.
+		// Keep it identical to the receiver package passed by abiUncommonMethods
+		// when it declares the itab target, or definition and reference symbols
+		// will diverge for promoted unexported methods.
+		if method, ok := fn.Object().(*types.Func); ok {
+			fnName = llssa.MethodSymbolName(pkg, method, fnName)
+			if genmethod.SupportsGenericMethods && genmethod.IsGenericMethod(method.Type()) {
+				if targs := fn.TypeArgs(); len(targs) > 0 {
+					fnName += llssa.TypeArgs(targs)
+				}
+			}
+		}
+		// Synthesized $thunk/$bound functions have no Object. Their references
+		// are produced through this same funcName path, so the wrapper name is
+		// already internally consistent and needs no declaring-package suffix.
 	}
 	return llssa.FuncName(pkg, fnName, recv, org)
 }
@@ -454,6 +602,7 @@ const (
 	goFunc      = int(llssa.InGo)
 	cFunc       = int(llssa.InC)
 	pyFunc      = int(llssa.InPython)
+	stdcallFunc = int(llssa.InStdcall)
 	llgoInstr   = -1
 
 	llgoInstrBase   = 0x80
@@ -472,8 +621,9 @@ const (
 	llgoSigjmpbuf  = llgoInstrBase + 0xb
 	llgoSigsetjmp  = llgoInstrBase + 0xc
 	llgoSiglongjmp = llgoInstrBase + 0xd
-
-	llgoFuncAddr = llgoInstrBase + 0xe
+	llgoFuncAddr   = llgoInstrBase + 0xe
+	llgoSetjmp     = llgoInstrBase + 0x13
+	llgoLongjmp    = llgoInstrBase + 0x14
 
 	llgoPyList  = llgoInstrBase + 0x10
 	llgoPyStr   = llgoInstrBase + 0x11
@@ -484,17 +634,17 @@ const (
 	llgoAtomicCmpXchg = llgoInstrBase + 0x1f
 	llgoAtomicOpBase  = llgoInstrBase + 0x20
 
-	llgoAtomicXchg = llgoAtomicOpBase + llssa.OpXchg
-	llgoAtomicAdd  = llgoAtomicOpBase + llssa.OpAdd
-	llgoAtomicSub  = llgoAtomicOpBase + llssa.OpSub
-	llgoAtomicAnd  = llgoAtomicOpBase + llssa.OpAnd
-	llgoAtomicNand = llgoAtomicOpBase + llssa.OpNand
-	llgoAtomicOr   = llgoAtomicOpBase + llssa.OpOr
-	llgoAtomicXor  = llgoAtomicOpBase + llssa.OpXor
-	llgoAtomicMax  = llgoAtomicOpBase + llssa.OpMax
-	llgoAtomicMin  = llgoAtomicOpBase + llssa.OpMin
-	llgoAtomicUMax = llgoAtomicOpBase + llssa.OpUMax
-	llgoAtomicUMin = llgoAtomicOpBase + llssa.OpUMin
+	llgoAtomicXchg = int(llgoAtomicOpBase + llssa.OpXchg)
+	llgoAtomicAdd  = int(llgoAtomicOpBase + llssa.OpAdd)
+	llgoAtomicSub  = int(llgoAtomicOpBase + llssa.OpSub)
+	llgoAtomicAnd  = int(llgoAtomicOpBase + llssa.OpAnd)
+	llgoAtomicNand = int(llgoAtomicOpBase + llssa.OpNand)
+	llgoAtomicOr   = int(llgoAtomicOpBase + llssa.OpOr)
+	llgoAtomicXor  = int(llgoAtomicOpBase + llssa.OpXor)
+	llgoAtomicMax  = int(llgoAtomicOpBase + llssa.OpMax)
+	llgoAtomicMin  = int(llgoAtomicOpBase + llssa.OpMin)
+	llgoAtomicUMax = int(llgoAtomicOpBase + llssa.OpUMax)
+	llgoAtomicUMin = int(llgoAtomicOpBase + llssa.OpUMin)
 
 	llgoCgoBase         = llgoInstrBase + 0x30
 	llgoCgoCString      = llgoCgoBase + 0x0
@@ -506,10 +656,61 @@ const (
 	llgoCgoCheckPointer = llgoCgoBase + 0x6
 	llgoCgoCgocall      = llgoCgoBase + 0x7
 
-	llgoAsm = llgoInstrBase + 0x40
+	llgoAsm                = llgoInstrBase + 0x40
+	llgoStackSave          = llgoInstrBase + 0x41
+	llgoFuncPCABI0         = llgoInstrBase + 0x42
+	llgoSkip               = llgoInstrBase + 0x43
+	llgoSyscall            = llgoInstrBase + 0x44
+	llgoAtomicCmpXchgOK    = llgoInstrBase + 0x45
+	llgoAtomicAddReturnNew = llgoInstrBase + 0x46
+	llgoBoolToUint8        = llgoInstrBase + 0x47
+	llgoClosureEnv         = llgoInstrBase + 0x48
+	llgoFloat32FromBits    = llgoInstrBase + 0x49
+	llgoFloat32Bits        = llgoInstrBase + 0x4a
+	llgoFloat64FromBits    = llgoInstrBase + 0x4b
+	llgoFloat64Bits        = llgoInstrBase + 0x4c
 
 	llgoAtomicOpLast = llgoAtomicOpBase + int(llssa.OpUMin)
 )
+
+func recvNamed(typ types.Type) *types.Named {
+	if named := recvNamedOk(typ); named != nil {
+		return named
+	}
+	panic(fmt.Errorf("invalid recv type: %v", typ))
+}
+
+func recvNamedOk(typ types.Type) *types.Named {
+retry:
+	switch t := types.Unalias(typ).(type) {
+	case *types.Named:
+		return t
+	case *types.Pointer:
+		typ = t.Elem()
+		goto retry
+	}
+	return nil
+}
+
+func hasTypeArgs(named *types.Named) bool {
+	targs := named.TypeArgs()
+	return targs != nil && targs.Len() > 0
+}
+
+// extractTrampolineCName extracts the C function name from a trampoline function name.
+// Handles patterns:
+//   - "libc_XXX_trampoline" -> "XXX"
+//   - "XXX_trampoline" -> "XXX"
+//
+// Returns empty string if name does not match the trampoline pattern.
+func extractTrampolineCName(name string) string {
+	if !strings.HasSuffix(name, "_trampoline") {
+		return ""
+	}
+	base := strings.TrimSuffix(name, "_trampoline")
+	base = strings.TrimPrefix(base, "libc_")
+	return base
+}
 
 func (p *context) funcName(fn *ssa.Function) (*types.Package, string, int) {
 	var pkg *types.Package
@@ -523,6 +724,9 @@ func (p *context) funcName(fn *ssa.Function) (*types.Package, string, int) {
 		if checkCgo(fname) && !cgoIgnored(fname) {
 			return nil, fname, llgoInstr
 		}
+		if strings.HasPrefix(fname, "_cgoexp_") {
+			return nil, fname, ignoredFunc
+		}
 		if isCgoExternSymbol(fn) {
 			if _, ok := llgoInstrs[fname]; ok {
 				return nil, fname, llgoInstr
@@ -530,6 +734,12 @@ func (p *context) funcName(fn *ssa.Function) (*types.Package, string, int) {
 		}
 		if fnPkg := fn.Pkg; fnPkg != nil {
 			pkg = fnPkg.Pkg
+		} else if recv := fn.Type().(*types.Signature).Recv(); recv != nil {
+			if named := recvNamedOk(recv.Type()); named != nil && named.Obj().Pkg() != nil && (hasTypeArgs(named) || p.needsLinkOnce(fn)) {
+				pkg = named.Obj().Pkg()
+			} else {
+				pkg = p.goTyps
+			}
 		} else {
 			pkg = p.goTyps
 		}
@@ -537,8 +747,16 @@ func (p *context) funcName(fn *ssa.Function) (*types.Package, string, int) {
 		orgName = funcName(pkg, fn, false)
 	}
 	if v, ok := p.prog.Linkname(orgName); ok {
+		if p.options.CExportWrappers {
+			if export, ok := p.pkg.ExportFuncs()[orgName]; ok && export == v {
+				return pkg, funcName(pkg, fn, false), goFunc
+			}
+		}
 		if strings.HasPrefix(v, "C.") {
 			return nil, v[2:], cFunc
+		}
+		if strings.HasPrefix(v, "stdcall.") {
+			return nil, v[len("stdcall."):], stdcallFunc
 		}
 		if strings.HasPrefix(v, "py.") {
 			return pkg, v[3:], pyFunc
@@ -547,6 +765,31 @@ func (p *context) funcName(fn *ssa.Function) (*types.Package, string, int) {
 			return nil, v[5:], llgoInstr
 		}
 		return pkg, v, goFunc
+	}
+	// Stdlib compiler intrinsics that are defined as `panic("intrinsic")` in
+	// source form. LLGo doesn't run Go escape analysis, so we can lower these to
+	// a no-op.
+	//
+	// See: $(GOROOT)/src/hash/maphash/maphash.go: escapeForHash.
+	if orgName == "hash/maphash.escapeForHash" {
+		return nil, "skip", llgoInstr
+	}
+	// The 386 C ABI returns floating-point values through x87. Loading a
+	// signaling NaN into x87 quiets it, so a normal call to the standard
+	// library's pointer-based frombits helpers would not preserve the bit
+	// pattern promised by package math. Lower all four bit conversions at the
+	// caller on 386, matching the Go compiler's intrinsic treatment.
+	if target := p.prog.Target(); target != nil && target.GOARCH == "386" {
+		switch orgName {
+		case "math.Float32frombits":
+			return nil, "float32FromBits", llgoInstr
+		case "math.Float32bits":
+			return nil, "float32Bits", llgoInstr
+		case "math.Float64frombits":
+			return nil, "float64FromBits", llgoInstr
+		case "math.Float64bits":
+			return nil, "float64Bits", llgoInstr
+		}
 	}
 	return pkg, funcName(pkg, fn, false), goFunc
 }
@@ -563,6 +806,15 @@ func (p *context) varName(pkg *types.Package, v *ssa.Global) (vName string, vtyp
 	// TODO(lijie): need a bettery way to process linkname (maybe alias)
 	if !isCgoCfpvar(v.Name()) && !isCgoVar(v.Name()) {
 		if v, ok := p.prog.Linkname(name); ok {
+			if strings.HasPrefix(v, "stdcall.") {
+				panic(fmt.Errorf("stdcall linkname namespace applies only to functions: %s", name))
+			}
+			if strings.HasPrefix(v, "go:") {
+				if llssa.PathOf(pkg) == "runtime" {
+					return v, goVar, true
+				}
+				return v, goVar, false
+			}
 			if pos := strings.IndexByte(v, '.'); pos >= 0 {
 				if pos == 2 && v[0] == 'p' && v[1] == 'y' {
 					return v[3:], pyVar, false
@@ -584,6 +836,9 @@ func (p *context) varOf(b llssa.Builder, v *ssa.Global) llssa.Expr {
 			return b.PyNewVar(pysymPrefix+mod, name).Expr
 		}
 		panic("unreachable")
+	}
+	if local, ok := p.localVariableAddress(b, v, name); ok {
+		return local
 	}
 	ret := pkg.VarOf(name)
 	if ret == nil {
@@ -617,19 +872,89 @@ func (p *context) initPyModule() {
 	}
 }
 
-// ParsePkgSyntax parses AST of a package to check llgo:type in type declaration.
-func ParsePkgSyntax(prog llssa.Program, pkg *types.Package, files []*ast.File) {
+// ParsePkgSyntax collects declaration directives in one syntax pass before SSA
+// creation using default frontend options.
+func ParsePkgSyntax(prog llssa.Program, fset *token.FileSet, pkg *types.Package, files []*ast.File) error {
+	return ParsePkgSyntaxWithOptions(prog, fset, pkg, files, Options{})
+}
+
+// ParsePkgSyntaxWithOptions collects all Program-side declaration metadata.
+// LLVM Package effects such as preserving //export symbols are applied later.
+func ParsePkgSyntaxWithOptions(prog llssa.Program, fset *token.FileSet, pkg *types.Package, files []*ast.File, options Options) error {
+	if pkg == nil {
+		return nil
+	}
+	if prog.PackageSyntaxParsed(pkg) {
+		return nil
+	}
+	ctx := &context{prog: prog, options: options}
+	pkgPath := llssa.PathOf(pkg)
+	syms := make(map[string]string)
+	var fileComments []*ast.CommentGroup
 	for _, file := range files {
+		for _, imp := range file.Imports {
+			if imp.Path.Value == `"unsafe"` {
+				fileComments = append(fileComments, file.Comments...)
+				break
+			}
+		}
 		for _, decl := range file.Decls {
 			switch decl := decl.(type) {
+			case *ast.FuncDecl:
+				if err := locality.ValidateDoc(fset, decl.Doc); err != nil {
+					return err
+				}
+				if err := locality.ValidateFuncBody(fset, decl.Body); err != nil {
+					return err
+				}
+				fullName, inPkgName := astFuncName(pkgPath, decl)
+				syms[inPkgName] = fullName
+				hasLinkname, err := collectDeclarationDirectivesWithOptions(prog, fset, decl.Doc, fullName, inPkgName, decl.Pos(), options)
+				if err != nil {
+					return err
+				}
+				if !hasLinkname && pkg.Name() == "C" && decl.Recv == nil && token.IsExported(inPkgName) {
+					exportName := strings.TrimPrefix(inPkgName, "X")
+					prog.SetLinkname(fullName, exportName)
+					prog.SetPackageExport(fullName, exportName)
+				}
+				ctx.processNoInterfaceByDoc(decl.Doc, fullName)
 			case *ast.GenDecl:
-				switch decl.Tok {
-				case token.TYPE:
+				if decl.Tok == token.VAR {
+					for _, spec := range decl.Specs {
+						for _, name := range spec.(*ast.ValueSpec).Names {
+							syms[name.Name] = pkgPath + "." + name.Name
+						}
+					}
+					if len(decl.Specs) == 1 {
+						if names := decl.Specs[0].(*ast.ValueSpec).Names; len(names) == 1 {
+							inPkgName := names[0].Name
+							if _, err := collectDeclarationDirectivesWithOptions(prog, fset, decl.Doc, pkgPath+"."+inPkgName, inPkgName, token.NoPos, options); err != nil {
+								return err
+							}
+						}
+					}
+					vars, err := locality.ScanPackageVar(fset, decl)
+					if err != nil {
+						return err
+					}
+					for _, variable := range vars {
+						prog.DeclareLocality(pkg, variable.Name, variable.Info)
+					}
+					continue
+				}
+				if err := locality.ValidateNonPackageVar(fset, decl); err != nil {
+					return err
+				}
+				if decl.Tok == token.TYPE {
 					handleTypeDecl(prog, pkg, decl)
 				}
 			}
 		}
 	}
+	collectGoLinknames(prog, fileComments, syms)
+	prog.MarkPackageSyntaxParsed(pkg)
+	return nil
 }
 
 func handleTypeDecl(prog llssa.Program, pkg *types.Package, decl *ast.GenDecl) {
@@ -665,6 +990,8 @@ func toBackground(bg string) llssa.Background {
 	switch bg {
 	case "C":
 		return llssa.InC
+	case "stdcall":
+		return llssa.InStdcall
 	}
 	return llssa.InGo
 }

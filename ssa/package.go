@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2024 The GoPlus Authors (goplus.org). All rights reserved.
+ * Copyright (c) 2024 The XGo Authors (xgo.dev). All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -20,13 +20,16 @@ import (
 	"fmt"
 	"go/token"
 	"go/types"
+	"log"
 	"runtime"
 	"strconv"
 	"unsafe"
 
-	"github.com/goplus/llgo/internal/env"
-	"github.com/goplus/llgo/ssa/abi"
-	"github.com/goplus/llvm"
+	"github.com/xgo-dev/llgo/internal/env"
+	"github.com/xgo-dev/llgo/internal/meta"
+	"github.com/xgo-dev/llgo/internal/optlevel"
+	"github.com/xgo-dev/llgo/ssa/abi"
+	"github.com/xgo-dev/llvm"
 	"golang.org/x/tools/go/types/typeutil"
 )
 
@@ -52,6 +55,18 @@ var (
 // SetDebug sets debug flags.
 func SetDebug(dbgFlags dbgFlags) {
 	debugInstr = (dbgFlags & DbgFlagInstruction) != 0
+}
+
+func dbgInstrf(format string, args ...any) {
+	if debugInstr {
+		log.Printf(format, args...)
+	}
+}
+
+func dbgInstrln(args ...any) {
+	if debugInstr {
+		log.Println(args...)
+	}
 }
 
 // -----------------------------------------------------------------------------
@@ -109,7 +124,7 @@ type aProgram struct {
 
 	patchType func(types.Type) types.Type
 
-	fnsCompiled map[string]bool
+	compileMethods func(Package, types.Type)
 
 	rt    *types.Package
 	rtget func() *types.Package
@@ -117,11 +132,16 @@ type aProgram struct {
 	py    *types.Package
 	pyget func() *types.Package
 
-	target *Target
-	td     llvm.TargetData
-	// tm  llvm.TargetMachine
-	named   map[string]llvm.Type
+	target  *Target
+	td      llvm.TargetData
+	tm      llvm.TargetMachine
+	named   map[string]Type
 	fnnamed map[string]int
+	// structLayouts holds target-specific LLVM representation metadata by Go
+	// semantic type. LLVM structurally uniques anonymous struct types, so an
+	// LLVM type is not a safe identity for this metadata.
+	structLayouts    typeutil.Map
+	hasStructLayouts bool
 
 	intType   llvm.Type
 	int1Type  llvm.Type
@@ -163,14 +183,15 @@ type aProgram struct {
 	u32Ty     Type
 	i64Ty     Type
 	u64Ty     Type
+	u16Ty     Type
 
 	pyObjPtr  Type
 	pyObjPPtr Type
 
-	abiTyPtr  Type
-	abiTyPPtr Type
-	deferTy   Type
-	deferPtr  Type
+	abiTy    Type
+	abiTyPtr Type
+	deferTy  Type
+	deferPtr Type
 
 	pyImpTy      *types.Signature
 	pyNewList    *types.Signature
@@ -195,25 +216,54 @@ type aProgram struct {
 	mallocTy       *types.Signature
 	freeTy         *types.Signature
 	memsetInlineTy *types.Signature
+	stackSaveTy    *types.Signature
+	stackRestoreTy *types.Signature
 
-	createKeyTy *types.Signature
-	getSpecTy   *types.Signature
-	setSpecTy   *types.Signature
-	routineTy   *types.Signature
-	destructTy  *types.Signature
-	setjmpTy    *types.Signature
-	longjmpTy   *types.Signature
-	sigsetjmpTy *types.Signature
-	sigljmpTy   *types.Signature
+	routineTy *types.Signature
+	setjmpTy  *types.Signature
+	longjmpTy *types.Signature
 
 	printfTy *types.Signature
 
-	paramObjPtr_ *types.Var
-	linkname     map[string]string // pkgPath.nameInPkg => linkname
+	paramObjPtr_  *types.Var
+	packageSyntax *packageSyntaxData
+	localities    *localityInfos
+	abiSymbol     map[string]*AbiSymbol // abi symbol name => AbiSymbol
 
 	ptrSize int
 
+	abi abi.Builder
+
 	is32Bits bool
+	disposed bool
+
+	enableGoGlobalDCE     bool
+	enableDeadcodeDrop    bool
+	enableGCRoots         bool
+	enableSafepoints      bool
+	disableBoundsChecks   bool
+	pthreadStackSize      uint64
+	enableLTOPluginMarker bool
+
+	enableFuncInfoMetadata bool
+	enableFuncInfoSites    bool
+	debugInfoOptimized     bool
+	emitCodeViewDebugInfo  bool
+}
+
+type AbiSymbol struct {
+	Name    string
+	PkgPath string
+	Raw     types.Type
+	Typ     Type
+	MSet    *types.MethodSet
+}
+
+// AbiTypeInfo is the LLVM-free identity needed to declare one runtime type
+// descriptor in another Program.
+type AbiTypeInfo struct {
+	Name string
+	Raw  types.Type
 }
 
 // A Program presents a program.
@@ -235,6 +285,23 @@ func is32Bits(arch string) bool {
 	return false
 }
 
+// Dispose releases the LLVM resources owned by the program: the context
+// (and with it every module built in it), the target machine and the
+// target data. The Program and everything created from it must not be
+// used afterwards. In-process drivers that compile many packages
+// sequentially (llgen goldens, the cltest run harness) call this between
+// compiles; without it each compile's C++-side memory lives until the
+// process exits.
+func (p Program) Dispose() {
+	if p == nil || p.disposed {
+		return
+	}
+	p.disposed = true
+	p.tm.Dispose()
+	p.td.Dispose()
+	p.ctx.Dispose()
+}
+
 // NewProgram creates a new program.
 func NewProgram(target *Target) Program {
 	if target == nil {
@@ -244,8 +311,7 @@ func NewProgram(target *Target) Program {
 		}
 	}
 	ctx := llvm.NewContext()
-	td := target.targetData() // TODO(xsw): target config
-	fnsCompiled := make(map[string]bool)
+	td, tm := target.targetInfo()
 	/*
 		arch := target.GOARCH
 		if arch == "" {
@@ -257,12 +323,48 @@ func NewProgram(target *Target) Program {
 		ctx.Finalize()
 	*/
 	is32Bits := (td.PointerSize() == 4 || is32Bits(target.GOARCH))
-	return &aProgram{
-		ctx: ctx, gocvt: newGoTypes(), fnsCompiled: fnsCompiled,
-		target: target, td: td, is32Bits: is32Bits,
-		ptrSize: td.PointerSize(), named: make(map[string]llvm.Type), fnnamed: make(map[string]int),
-		linkname: make(map[string]string),
+	packageSyntax := newPackageSyntaxData()
+	prog := &aProgram{
+		ctx: ctx, gocvt: newGoTypes(packageSyntax),
+		target: target, td: td, tm: tm, is32Bits: is32Bits,
+		ptrSize: td.PointerSize(), named: make(map[string]Type), fnnamed: make(map[string]int),
+		packageSyntax: packageSyntax, localities: newLocalityInfos(),
+		abiSymbol:          make(map[string]*AbiSymbol),
+		debugInfoOptimized: target.effectiveOptLevel() != optlevel.O0,
 	}
+	prog.abi.Init(uintptr(prog.ptrSize), (*goProgram)(unsafe.Pointer(prog)))
+	return prog
+}
+
+// NewBackendProgram creates a Program with fresh LLVM-owned state and the same
+// build configuration as p. Go-side package syntax and locality metadata are
+// shared directly; callers must finish preparing them before backend Programs
+// are created and use them read-only afterwards.
+func (p Program) NewBackendProgram() Program {
+	var target *Target
+	if p.target != nil {
+		targetCopy := *p.target
+		target = &targetCopy
+	}
+	backend := NewProgram(target)
+	backend.sizes = p.sizes
+	backend.rt, backend.rtget = p.rt, p.rtget
+	backend.py, backend.pyget = p.py, p.pyget
+	backend.packageSyntax = p.packageSyntax
+	backend.gocvt.packageSyntax = p.packageSyntax
+	backend.localities = p.localities
+	backend.enableGoGlobalDCE = p.enableGoGlobalDCE
+	backend.enableDeadcodeDrop = p.enableDeadcodeDrop
+	backend.enableGCRoots = p.enableGCRoots
+	backend.enableSafepoints = p.enableSafepoints
+	backend.disableBoundsChecks = p.disableBoundsChecks
+	backend.pthreadStackSize = p.pthreadStackSize
+	backend.enableLTOPluginMarker = p.enableLTOPluginMarker
+	backend.enableFuncInfoMetadata = p.enableFuncInfoMetadata
+	backend.enableFuncInfoSites = p.enableFuncInfoSites
+	backend.debugInfoOptimized = p.debugInfoOptimized
+	backend.emitCodeViewDebugInfo = p.emitCodeViewDebugInfo
+	return backend
 }
 
 func (p Program) Target() *Target {
@@ -271,6 +373,14 @@ func (p Program) Target() *Target {
 
 func (p Program) TargetData() llvm.TargetData {
 	return p.td
+}
+
+func (p Program) TargetMachine() llvm.TargetMachine {
+	return p.tm
+}
+
+func (p Program) DataLayout() string {
+	return p.td.String()
 }
 
 func (p Program) SetPatch(patchType func(types.Type) types.Type) {
@@ -282,6 +392,70 @@ func (p Program) patch(typ types.Type) types.Type {
 		return p.patchType(typ)
 	}
 	return typ
+}
+
+func (p Program) SetCompileMethods(check func(Package, types.Type)) {
+	p.compileMethods = check
+}
+
+func (p Program) EnableGoGlobalDCE(enable bool) {
+	p.enableGoGlobalDCE = enable
+}
+
+func (p Program) EnableDeadcodeDrop(enable bool) {
+	p.enableDeadcodeDrop = enable
+}
+
+func (p Program) DeadcodeDropEnabled() bool {
+	return p.enableDeadcodeDrop
+}
+
+// DisableBoundsChecks controls index, slice, and slice-to-array conversion
+// bounds checks. Other dynamic validity checks, including nil pointer and
+// unsafe builtin checks, are not affected.
+func (p Program) DisableBoundsChecks(disable bool) {
+	p.disableBoundsChecks = disable
+}
+
+func (p Program) SetPthreadStackSize(size uint64) {
+	p.pthreadStackSize = size
+}
+
+func (p Program) EnableLTOPluginMarkers(enable bool) {
+	p.enableLTOPluginMarker = enable
+}
+
+// SetDebugInfoOptimized records whether DWARF should mark generated code as
+// optimized. It never selects compiler passes.
+func (p Program) SetDebugInfoOptimized(enable bool) {
+	p.debugInfoOptimized = enable
+}
+
+// EnableCodeViewDebugInfo asks LLVM to lower the existing source metadata to
+// CodeView in addition to DWARF. The final COFF link may then merge CodeView
+// records into a PDB without removing the DWARF used by LLDB and tracebacks.
+func (p Program) EnableCodeViewDebugInfo(enable bool) {
+	p.emitCodeViewDebugInfo = enable
+}
+
+func (p Program) SetNoInterfaceMethod(fullName string) {
+	p.packageSyntax.mu.Lock()
+	p.packageSyntax.noInterface[fullName] = none{}
+	p.packageSyntax.mu.Unlock()
+}
+
+func (p Program) isNoInterfaceMethod(fn *types.Func) bool {
+	if fn == nil {
+		return false
+	}
+	sig, ok := fn.Type().(*types.Signature)
+	if !ok || sig.Recv() == nil {
+		return false
+	}
+	p.packageSyntax.mu.RLock()
+	_, ok = p.packageSyntax.noInterface[FuncName(fn.Pkg(), fn.Name(), sig.Recv(), true)]
+	p.packageSyntax.mu.RUnlock()
+	return ok
 }
 
 // SetRuntime sets the runtime.
@@ -296,16 +470,81 @@ func (p Program) SetRuntime(runtime any) {
 }
 
 func (p Program) SetTypeBackground(fullName string, bg Background) {
-	p.gocvt.typbg.Store(fullName, bg)
+	p.packageSyntax.mu.Lock()
+	p.packageSyntax.typeBackgrounds[fullName] = bg
+	p.packageSyntax.mu.Unlock()
 }
 
 func (p Program) SetLinkname(name, link string) {
-	p.linkname[name] = link
+	p.packageSyntax.mu.Lock()
+	p.packageSyntax.linknames[name] = link
+	p.packageSyntax.mu.Unlock()
 }
 
 func (p Program) Linkname(name string) (link string, ok bool) {
-	link, ok = p.linkname[name]
+	p.packageSyntax.mu.RLock()
+	link, ok = p.packageSyntax.linknames[name]
+	p.packageSyntax.mu.RUnlock()
 	return
+}
+
+// SetWasmImport records a //go:wasmimport directive before its declaration is
+// lowered into the package's LLVM module.
+func (p Program) SetWasmImport(name, module, importName string) {
+	p.packageSyntax.mu.Lock()
+	p.packageSyntax.wasmImports[name] = wasmImport{module: module, name: importName}
+	p.packageSyntax.mu.Unlock()
+}
+
+// WasmImport returns the WebAssembly host import attached to name.
+func (p Program) WasmImport(name string) (module, importName string, ok bool) {
+	p.packageSyntax.mu.RLock()
+	entry, ok := p.packageSyntax.wasmImports[name]
+	p.packageSyntax.mu.RUnlock()
+	if ok {
+		module, importName = entry.module, entry.name
+	}
+	return
+}
+
+// HasLinknameTarget reports whether a declaration aliases target. It lets
+// build-time dead-code decisions preserve symbols that another package can
+// reference only through //go:linkname.
+func (p Program) HasLinknameTarget(target string) bool {
+	p.packageSyntax.mu.RLock()
+	defer p.packageSyntax.mu.RUnlock()
+	for _, link := range p.packageSyntax.linknames {
+		if link == target {
+			return true
+		}
+	}
+	return false
+}
+
+type closureEnvDirectiveKey struct {
+	fset *token.FileSet
+	name string
+	pos  token.Pos
+}
+
+// SetClosureEnvDirective records that a source function declaration has the
+// llgo:env directive. name and pos identify the source declaration rather
+// than its resolved linker symbol, so aliases retain independent ABI metadata.
+func (p Program) SetClosureEnvDirective(fset *token.FileSet, name string, pos token.Pos) {
+	key := closureEnvDirectiveKey{fset: fset, name: name, pos: pos}
+	p.packageSyntax.mu.Lock()
+	p.packageSyntax.closureEnvDirectives[key] = none{}
+	p.packageSyntax.mu.Unlock()
+}
+
+// HasClosureEnvDirective reports whether a source function declaration has the
+// cached llgo:env directive.
+func (p Program) HasClosureEnvDirective(fset *token.FileSet, name string, pos token.Pos) bool {
+	key := closureEnvDirectiveKey{fset: fset, name: name, pos: pos}
+	p.packageSyntax.mu.RLock()
+	_, ok := p.packageSyntax.closureEnvDirectives[key]
+	p.packageSyntax.mu.RUnlock()
+	return ok
 }
 
 func (p Program) runtime() *types.Package {
@@ -313,16 +552,6 @@ func (p Program) runtime() *types.Package {
 		p.rt = p.rtget()
 	}
 	return p.rt
-}
-
-// check generic function instantiation
-func (p Program) FuncCompiled(name string) bool {
-	_, ok := p.fnsCompiled[name]
-	return ok
-}
-
-func (p Program) SetFuncCompiled(name string) {
-	p.fnsCompiled[name] = true
 }
 
 func (p Program) rtNamed(name string) *types.Named {
@@ -411,7 +640,13 @@ func (p Program) tyComplex128() llvm.Type {
 
 // NewPackage creates a new package.
 func (p Program) NewPackage(name, pkgPath string) Package {
+	return p.NewPackageEx(name, pkgPath, false)
+}
+
+func (p Program) NewPackageEx(name, pkgPath string, metaCollect bool) Package {
 	mod := p.ctx.NewModule(pkgPath)
+	mod.SetDataLayout(p.DataLayout())
+	mod.SetTarget(p.Target().Spec().Triple)
 	// TODO(lijie): enable target output will check module override, but can't
 	// pass the snapshot test, so disable it for now
 	// if p.target.GOARCH != runtime.GOARCH && p.target.GOOS != runtime.GOOS {
@@ -422,21 +657,33 @@ func (p Program) NewPackage(name, pkgPath string) Package {
 	// mod.Finalize()
 	gbls := make(map[string]Global)
 	fns := make(map[string]Function)
-	stubs := make(map[string]Function)
 	pyobjs := make(map[string]PyObjRef)
 	pymods := make(map[string]Global)
 	strs := make(map[string]llvm.Value)
-	chkabi := make(map[types.Type]bool)
 	glbDbgVars := make(map[Expr]bool)
+	nullPointerIsValidAttr := mod.Context().CreateEnumAttribute(llvm.AttributeKindID("null_pointer_is_valid"), 0)
+	framePointerAttr := mod.Context().CreateStringAttribute("frame-pointer", "non-leaf")
 	// Don't need reset p.needPyInit here
 	// p.needPyInit = false
 	ret := &aPackage{
-		mod: mod, vars: gbls, fns: fns, stubs: stubs,
-		pyobjs: pyobjs, pymods: pymods, strs: strs,
-		chkabi: chkabi, Prog: p,
+		mod: mod, path: pkgPath, Prog: p, vars: gbls, fns: fns,
+		nullPointerIsValidAttr: nullPointerIsValidAttr,
+		framePointerAttr:       framePointerAttr,
+		pyobjs:                 pyobjs, pymods: pymods, strs: strs,
 		di: nil, cu: nil, glbDbgVars: glbDbgVars,
+		export:         make(map[string]string),
+		preserveSyms:   make(map[string]struct{}),
+		llvmUsedValues: make([]llvm.Value, 0, 4),
+
+		abiTypeFakeUseCache: make(map[llvm.Value][]llvm.Value),
 	}
-	ret.abi.Init(pkgPath)
+	if metaCollect {
+		ret.metaBuilder = meta.NewBuilder()
+		ret.abiTypeWithUncommon = make(map[llvm.Value]struct{})
+	}
+	if p.enableGoGlobalDCE {
+		p.addVirtualFunctionElimModuleFlag(mod)
+	}
 	return ret
 }
 
@@ -465,20 +712,20 @@ func (p Program) DeferPtr() Type {
 	return p.deferPtr
 }
 
+// AbiType returns abi.Type type.
+func (p Program) AbiType() Type {
+	if p.abiTy == nil {
+		p.abiTy = p.rawType(p.rtNamed("Type"))
+	}
+	return p.abiTy
+}
+
 // AbiTypePtr returns *abi.Type type.
 func (p Program) AbiTypePtr() Type {
 	if p.abiTyPtr == nil {
-		p.abiTyPtr = p.rawType(types.NewPointer(p.rtNamed("Type")))
+		p.abiTyPtr = p.Pointer(p.AbiType())
 	}
 	return p.abiTyPtr
-}
-
-// AbiTypePtrPtr returns **abi.Type type.
-func (p Program) AbiTypePtrPtr() Type {
-	if p.abiTyPPtr == nil {
-		p.abiTyPPtr = p.Pointer(p.AbiTypePtr())
-	}
-	return p.abiTyPPtr
 }
 
 // Void returns void type.
@@ -641,6 +888,14 @@ func (p Program) Uint32() Type {
 	return p.u32Ty
 }
 
+// Uint16 returns uint16 type.
+func (p Program) Uint16() Type {
+	if p.u16Ty == nil {
+		p.u16Ty = p.rawType(types.Typ[types.Uint16])
+	}
+	return p.u16Ty
+}
+
 // Int64 returns int64 type.
 func (p Program) Int64() Type {
 	if p.i64Ty == nil {
@@ -668,10 +923,13 @@ func (p Program) Uint64() Type {
 // initializer) and "init#%d", the nth declared init function,
 // and unspecified other things too.
 type aPackage struct {
-	mod llvm.Module
-	abi abi.Builder
+	mod  llvm.Module
+	path string
 
 	Prog Program
+
+	nullPointerIsValidAttr llvm.Attribute
+	framePointerAttr       llvm.Attribute
 
 	di         diBuilder
 	cu         CompilationUnit
@@ -679,21 +937,31 @@ type aPackage struct {
 
 	vars   map[string]Global
 	fns    map[string]Function
-	stubs  map[string]Function
 	pyobjs map[string]PyObjRef
 	pymods map[string]Global
 	strs   map[string]llvm.Value
 	goStrs map[string]llvm.Value
-	chkabi map[types.Type]bool
-	afterb unsafe.Pointer
-	patch  func(types.Type) types.Type
 	fnlink func(string) string
 
 	iRoutine int
 
-	NeedRuntime bool
-	NeedPyInit  bool
+	NeedRuntime         bool
+	NeedPyInit          bool
+	NeedAbiInit         int // bitmask of Reflect* flags indicating which reflect type-construction operations are used
+	MethodByIndex       map[int]none
+	MethodByName        map[string]none
+	Meta                *meta.PackageMeta
+	metaBuilder         *meta.Builder
+	abiTypeWithUncommon map[llvm.Value]struct{}
+
+	export         map[string]string   // pkgPath.nameInPkg => exportname
+	preserveSyms   map[string]struct{} // set of exported symbol names
+	llvmUsedValues []llvm.Value
+
+	abiTypeFakeUseCache map[llvm.Value][]llvm.Value
 }
+
+type none struct{}
 
 type Package = *aPackage
 
@@ -701,71 +969,93 @@ func (p Package) Module() llvm.Module {
 	return p.mod
 }
 
+func (p Package) FinishMetaCollection() error {
+	extractOrdinaryEdges(p.metaBuilder, p.mod, p.abiTypeWithUncommon)
+	pm, err := p.metaBuilder.Build()
+	if err != nil {
+		return err
+	}
+	p.Meta = pm
+	p.metaBuilder = nil
+	return nil
+}
+
+func (p Package) SetExport(name, export string) {
+	p.export[name] = export
+	p.preserveSyms[export] = struct{}{}
+}
+
+func (p Package) ExportFuncs() map[string]string {
+	return p.export
+}
+
+func (p Package) isPreservedName(name string) bool {
+	_, ok := p.preserveSyms[name]
+	return ok
+}
+
+func (p Package) markLLVMUsed(v llvm.Value) {
+	elemTyp := p.Prog.VoidPtr().ll
+	p.llvmUsedValues = append(p.llvmUsedValues, llvm.ConstBitCast(v, elemTyp))
+}
+
+func (p Package) MaterializePreserveSyms() {
+	if len(p.llvmUsedValues) == 0 {
+		return
+	}
+	elemTyp := p.Prog.VoidPtr().ll
+	init := llvm.ConstArray(elemTyp, p.llvmUsedValues)
+	global := llvm.AddGlobal(p.mod, init.Type(), "llvm.compiler.used")
+	global.SetInitializer(init)
+	global.SetLinkage(llvm.AppendingLinkage)
+	global.SetSection("llvm.metadata")
+}
+
 func (p Package) rtFunc(fnName string) Expr {
 	p.NeedRuntime = true
 	fn := p.Prog.runtime().Scope().Lookup(fnName).(*types.Func)
 	name := FullName(fn.Pkg(), fnName)
+	if p.fnlink != nil {
+		name = p.fnlink(name)
+	}
 	sig := fn.Type().(*types.Signature)
 	return p.NewFunc(name, sig, InGo).Expr
+}
+
+// rtEnvFunc returns a runtime entry whose source-level signature excludes its
+// compiler-owned environment. Runtime type algorithms use this form when a
+// type descriptor supplies the hidden type context.
+func (p Package) rtEnvFunc(fnName string) Expr {
+	p.NeedRuntime = true
+	fn := p.Prog.runtime().Scope().Lookup(fnName).(*types.Func)
+	name := FullName(fn.Pkg(), fnName)
+	if p.fnlink != nil {
+		name = p.fnlink(name)
+	}
+	sig := fn.Type().(*types.Signature)
+	env := types.NewVar(token.NoPos, nil, "$env", types.Typ[types.UnsafePointer])
+	return p.NewEnvFunc(name, sig, InGo, env, false).Expr
+}
+
+// RuntimeFunc returns a declaration for a function in LLGo's internal runtime.
+func (p Package) RuntimeFunc(fnName string) Expr {
+	return p.rtFunc(fnName)
 }
 
 func (p Package) cFunc(fullName string, sig *types.Signature) Expr {
 	return p.NewFunc(fullName, sig, InC).Expr
 }
 
-const (
-	closureCtx  = "__llgo_ctx"
-	closureStub = "__llgo_stub."
-)
-
-func (p Package) closureStub(b Builder, t types.Type, v Expr) Expr {
-	name := v.impl.Name()
-	prog := b.Prog
-	nilVal := prog.Nil(prog.VoidPtr()).impl
-	if fn, ok := p.stubs[name]; ok {
-		v = fn.Expr
-	} else {
-		sig := v.raw.Type.(*types.Signature)
-		n := sig.Params().Len()
-		nret := sig.Results().Len()
-		ctx := types.NewParam(token.NoPos, nil, closureCtx, types.Typ[types.UnsafePointer])
-		sig = FuncAddCtx(ctx, sig)
-		fn := p.NewFunc(closureStub+name, sig, InC)
-		fn.impl.SetLinkage(llvm.LinkOnceAnyLinkage)
-		args := make([]Expr, n)
-		for i := 0; i < n; i++ {
-			args[i] = fn.Param(i + 1)
-		}
-		b := fn.MakeBody(1)
-		call := b.Call(v, args...)
-		call.impl.SetTailCall(true)
-		switch nret {
-		case 0:
-			b.impl.CreateRetVoid()
-		default: // TODO(xsw): support multiple return values
-			b.impl.CreateRet(call.impl)
-		}
-		p.stubs[name] = fn
-		v = fn.Expr
-	}
-	return b.aggregateValue(prog.rawType(t), v.impl, nilVal)
-}
-
 // -----------------------------------------------------------------------------
 
 // Path returns the package path.
 func (p Package) Path() string {
-	return p.abi.Pkg
+	return p.path
 }
 
 // String returns a string representation of the package.
 func (p Package) String() string {
 	return p.mod.String()
-}
-
-// SetPatch sets a patch function.
-func (p Package) SetPatch(fn func(types.Type) types.Type) {
-	p.patch = fn
 }
 
 // SetResolveLinkname sets a function to resolve linkname.
@@ -775,36 +1065,26 @@ func (p Package) SetResolveLinkname(fn func(string) string) {
 
 // -----------------------------------------------------------------------------
 
-func (p Package) afterBuilder() Builder {
-	if p.afterb == nil {
-		fn := p.NewFunc(p.Path()+".init$after", NoArgsNoRet, InC)
-		fnb := fn.MakeBody(1)
-		p.afterb = unsafe.Pointer(fnb)
-	}
-	return Builder(p.afterb)
-}
-
 // AfterInit is called after the package is initialized (init all packages that depends on).
 func (p Package) AfterInit(b Builder, ret BasicBlock) {
-	p.keyInit(deferKey)
-	doAfterb := p.afterb != nil
 	doPyLoadModSyms := p.pyHasModSyms()
-	if doAfterb || doPyLoadModSyms {
+	if doPyLoadModSyms {
 		b.SetBlockEx(ret, afterInit, false)
-		if doAfterb {
-			afterb := Builder(p.afterb)
-			afterb.Return()
-			b.Call(afterb.Func.Expr)
-		}
-		if doPyLoadModSyms {
-			p.pyLoadModSyms(b)
-		}
+		p.pyLoadModSyms(b)
 	}
 }
 
 func (p Package) InitDebug(name, pkgPath string, positioner Positioner) {
 	p.di = newDIBuilder(p.Prog, p, positioner)
 	p.cu = p.di.createCompileUnit(name, pkgPath)
+}
+
+// FinalizeDebug resolves temporary debug metadata and releases the package's
+// DI builder. No debug records may be added after this call.
+func (p Package) FinalizeDebug() {
+	if p.di != nil {
+		p.di.finalize()
+	}
 }
 
 func (p Package) createGlobalStr(v string) (ret llvm.Value) {
@@ -826,6 +1106,19 @@ func (p Package) createGlobalStr(v string) (ret llvm.Value) {
 	}
 	p.strs[v] = ret
 	return
+}
+
+func (p Package) createGlobalBytes(v []byte) (ret llvm.Value) {
+	prog := p.Prog
+	if len(v) == 0 {
+		return llvm.ConstNull(prog.CStr().ll)
+	}
+	typ := llvm.ArrayType(prog.tyInt8(), len(v))
+	global := llvm.AddGlobal(p.mod, typ, "")
+	global.SetInitializer(prog.ctx.ConstString(string(v), false))
+	global.SetLinkage(llvm.PrivateLinkage)
+	global.SetAlignment(1)
+	return llvm.ConstInBoundsGEP(typ, global, []llvm.Value{prog.Val(0).impl})
 }
 
 // -----------------------------------------------------------------------------

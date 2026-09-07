@@ -1,14 +1,18 @@
 // Copyright 2014 The Go Authors. All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Use of this source code is governed by a BSD-style license.
+// See LICENSES/Go-BSD-3-Clause.txt at this module root for license terms.
 
 package runtime
 
 import (
 	"unsafe"
 
-	c "github.com/goplus/llgo/runtime/internal/clite"
-	"github.com/goplus/llgo/runtime/internal/clite/debug"
+	latomic "sync/atomic"
+
+	c "github.com/xgo-dev/llgo/runtime/internal/clite"
+	clitedebug "github.com/xgo-dev/llgo/runtime/internal/clite/debug"
+	cliteos "github.com/xgo-dev/llgo/runtime/internal/clite/os"
+	rtdebug "github.com/xgo-dev/llgo/runtime/internal/runtime"
 )
 
 // Frames may be used to get function/file/line information for a
@@ -78,7 +82,2083 @@ func safeGoString(s *c.Char, defaultStr string) string {
 	return c.GoString(s)
 }
 
+func uintptrHex(v uintptr) string {
+	const hexdigits = "0123456789abcdef"
+	var digits [16]byte
+	i := len(digits)
+	for v > 0 {
+		i--
+		digits[i] = hexdigits[v&0xf]
+		v >>= 4
+	}
+	if i == len(digits) {
+		i--
+		digits[i] = '0'
+	}
+	out := make([]byte, 2+len(digits)-i)
+	out[0] = '0'
+	out[1] = 'x'
+	copy(out[2:], digits[i:])
+	return string(out)
+}
+
+func unknownFunctionName(pc uintptr) string {
+	// Use a stable PC-based placeholder instead of a constant string.
+	// Some stdlib code (e.g. testing cleanup stack mapping) compares function
+	// names and can loop if too many frames share the same placeholder.
+	return "pc=" + uintptrHex(pc)
+}
+
+type pcSymbol struct {
+	pc        uintptr
+	entry     uintptr
+	function  string
+	file      string
+	line      int
+	startLine int
+	ok        bool
+}
+
+type frameSymbolCacheEntry struct {
+	pc     uintptr
+	offset uintptr
+	name   string
+}
+
+// Sized for whole-stack re-walks: CallersFrames over a deep stack touches
+// one entry per distinct return pc, and a 128-entry table thrashed on
+// 32-frame stacks (adjacent return pcs share high bits, and repeated walks
+// paid a pcline search per frame per walk).
+const frameSymbolCacheSize = 4096
+
+var frameSymbolCache [frameSymbolCacheSize]frameSymbolCacheEntry
+
+func recordFrameSymbol(pc, offset uintptr, name string) {
+	if pc == 0 || name == "" || isPCSiteSymbol(name) {
+		return
+	}
+	i := (pc >> 4) & (frameSymbolCacheSize - 1)
+	frameSymbolCache[i] = frameSymbolCacheEntry{pc: pc, offset: offset, name: name}
+}
+
+type runtimeFuncInfoRecord struct {
+	symbolPkg  uint32
+	symbolName uint32
+	namePkg    uint32
+	nameName   uint32
+	fileRoot   uint32
+	fileName   uint32
+	line       uint32
+}
+
+const (
+	runtimeFuncInfoLineWrapper = uint32(1 << 31)
+	runtimeFuncInfoLineMask    = runtimeFuncInfoLineWrapper - 1
+)
+
+//go:linkname runtimeFuncInfoTable __llgo_funcinfo_table
+var runtimeFuncInfoTable *runtimeFuncInfoRecord
+
+//go:linkname runtimeFuncInfoStrings __llgo_funcinfo_strings
+var runtimeFuncInfoStrings *c.Char
+
+//go:linkname runtimeFuncInfoStringOffsets __llgo_funcinfo_string_offsets
+var runtimeFuncInfoStringOffsets *uint32
+
+//go:linkname runtimeFuncInfoStringCount __llgo_funcinfo_string_count
+var runtimeFuncInfoStringCount uintptr
+
+//go:linkname runtimeFuncInfoHash __llgo_funcinfo_hash
+var runtimeFuncInfoHash *uint16
+
+//go:linkname runtimeFuncInfoCount __llgo_funcinfo_count
+var runtimeFuncInfoCount uintptr
+
+//go:linkname runtimeFuncInfoHashMask __llgo_funcinfo_hash_mask
+var runtimeFuncInfoHashMask uintptr
+
+//go:linkname runtimeFuncInfoSymbolIndex __llgo_funcinfo_symbol_index
+var runtimeFuncInfoSymbolIndex *runtimeFuncInfoSymbolIndexRecord
+
+//go:linkname runtimeFuncInfoSymbolIndexCount __llgo_funcinfo_symbol_index_count
+var runtimeFuncInfoSymbolIndexCount uintptr
+
+//go:linkname runtimeFuncInfoEntryStart __llgo_funcinfo_entry_start
+var runtimeFuncInfoEntryStart *runtimeFuncInfoEntryRecord
+
+//go:linkname runtimeFuncInfoEntryEnd __llgo_funcinfo_entry_end
+var runtimeFuncInfoEntryEnd *runtimeFuncInfoEntryRecord
+
+type runtimePCLineRecord struct {
+	id        uint64
+	funcIndex uint32
+	fileRoot  uint32
+	fileName  uint32
+	line      uint32
+}
+
+//go:linkname runtimePCLineTable __llgo_pcline_table
+var runtimePCLineTable *runtimePCLineRecord
+
+//go:linkname runtimePCLineCount __llgo_pcline_count
+var runtimePCLineCount uintptr
+
+//go:linkname runtimePCSiteStart __llgo_pcsite_start
+var runtimePCSiteStart *runtimePCSiteRecord
+
+//go:linkname runtimePCSiteEnd __llgo_pcsite_end
+var runtimePCSiteEnd *runtimePCSiteRecord
+
+type runtimePCLineFrame struct {
+	pc        uintptr
+	sequence  uintptr
+	entry     uintptr
+	function  string
+	file      string
+	line      int
+	startLine int
+}
+
+var runtimePCLineInitState uint32
+var runtimePCLineFrames []runtimePCLineFrame
+var runtimePCLineIndex runtimePCFindIndex
+
+type runtimeFuncPCFrame struct {
+	entry     uintptr
+	funcIndex uint32
+}
+
+type runtimePCFindBucket struct {
+	idx        uint32
+	subbuckets [runtimePCFindSubbucket]uint16
+}
+
+type runtimePCFindIndex struct {
+	base    uintptr
+	buckets []runtimePCFindBucket
+}
+
+const (
+	// Keep the lookup geometry aligned with Go's pclntab findfunc table:
+	// 4096-byte buckets and 16 subbuckets. Go stores one-byte subbucket
+	// deltas because its linker guarantees a 16-byte minimum function size;
+	// LLGo has no minimum size for function entries and indexes call-site
+	// records that can sit a few bytes apart, so it stores two-byte deltas.
+	// A delta counts distinct PCs inside one 4096-byte bucket and therefore
+	// can never exceed 4096, which makes uint16 overflow impossible and the
+	// index unconditional. LLGo builds the index at first use after reading
+	// DCE-safe entry PC sections, because the LLVM IR stage does not yet own
+	// final text addresses the way cmd/link does for Go.
+	runtimePCMinFuncSize    = uintptr(16)
+	runtimePCFindBucketSize = uintptr(256) * runtimePCMinFuncSize
+	runtimePCFindSubbucket  = 16
+)
+
+var runtimeFuncPCInitState uint32
+var runtimeFuncPCFrames []runtimeFuncPCFrame
+var runtimeFuncPCEntries []uintptr
+var runtimeFuncPCIndex runtimePCFindIndex
+
+const (
+	runtimeFuncInfoInitUninit uint32 = iota
+	runtimeFuncInfoInitDone
+	runtimeFuncInfoInitBusy
+)
+
+func hasStringPrefix(s, prefix string) bool {
+	if len(s) < len(prefix) {
+		return false
+	}
+	for i := 0; i < len(prefix); i++ {
+		if s[i] != prefix[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func isPCSiteSymbol(name string) bool {
+	for i := 0; i < len(name) && name[i] == '_'; i++ {
+		if hasStringPrefix(name[i:], "__llgo_pcsite_") {
+			return true
+		}
+	}
+	return false
+}
+
+func publicFunctionName(name string) string {
+	const commandLineArguments = "command-line-arguments."
+	if hasStringPrefix(name, commandLineArguments) {
+		return "main." + name[len(commandLineArguments):]
+	}
+	if len(name) > 0 && name[0] == '_' {
+		name = name[1:]
+	}
+	return name
+}
+
+func cStringCompare(cstr *c.Char, s string) int {
+	if cstr == nil {
+		if s == "" {
+			return 0
+		}
+		return -1
+	}
+	ptr := unsafe.Pointer(cstr)
+	for i := 0; ; i++ {
+		c := *(*byte)(unsafe.Add(ptr, i))
+		if i == len(s) {
+			if c == 0 {
+				return 0
+			}
+			return 1
+		}
+		if c == 0 {
+			return -1
+		}
+		if c < s[i] {
+			return -1
+		}
+		if c > s[i] {
+			return 1
+		}
+	}
+}
+
+func cStringLen(cstr *c.Char) int {
+	if cstr == nil {
+		return 0
+	}
+	ptr := unsafe.Pointer(cstr)
+	for i := 0; ; i++ {
+		if *(*byte)(unsafe.Add(ptr, i)) == 0 {
+			return i
+		}
+	}
+}
+
+func cStringAppend(dst []byte, cstr *c.Char) []byte {
+	if cstr == nil {
+		return dst
+	}
+	ptr := unsafe.Pointer(cstr)
+	for i := 0; ; i++ {
+		c := *(*byte)(unsafe.Add(ptr, i))
+		if c == 0 {
+			return dst
+		}
+		dst = append(dst, c)
+	}
+}
+
+func funcInfoCString(id uint32) *c.Char {
+	if runtimeFuncInfoStrings == nil || runtimeFuncInfoStringOffsets == nil ||
+		uintptr(id) >= runtimeFuncInfoStringCount {
+		return nil
+	}
+	off := *(*uint32)(unsafe.Add(unsafe.Pointer(runtimeFuncInfoStringOffsets), uintptr(id)*unsafe.Sizeof(*runtimeFuncInfoStringOffsets)))
+	return (*c.Char)(unsafe.Add(unsafe.Pointer(runtimeFuncInfoStrings), uintptr(off)))
+}
+
+func funcInfoAt(i uintptr) *runtimeFuncInfoRecord {
+	size := unsafe.Sizeof(*runtimeFuncInfoTable)
+	return (*runtimeFuncInfoRecord)(unsafe.Add(unsafe.Pointer(runtimeFuncInfoTable), i*size))
+}
+
+func pcLineAt(i uintptr) *runtimePCLineRecord {
+	size := unsafe.Sizeof(*runtimePCLineTable)
+	return (*runtimePCLineRecord)(unsafe.Add(unsafe.Pointer(runtimePCLineTable), i*size))
+}
+
+func funcInfoHashString(s string) uintptr {
+	const (
+		offset = uint32(2166136261)
+		prime  = uint32(16777619)
+	)
+	h := offset
+	for i := 0; i < len(s); i++ {
+		h ^= uint32(s[i])
+		h *= prime
+	}
+	return uintptr(h)
+}
+
+func funcInfoSymbolEqual(rec *runtimeFuncInfoRecord, symbol string) bool {
+	pkg := funcInfoCString(rec.symbolPkg)
+	name := funcInfoCString(rec.symbolName)
+	pkgLen := cStringLen(pkg)
+	nameLen := cStringLen(name)
+	if pkgLen == 0 {
+		return cStringCompare(name, symbol) == 0
+	}
+	if len(symbol) != pkgLen+1+nameLen {
+		return false
+	}
+	if cStringCompare(pkg, symbol[:pkgLen]) != 0 || symbol[pkgLen] != '.' {
+		return false
+	}
+	return cStringCompare(name, symbol[pkgLen+1:]) == 0
+}
+
+func funcInfoJoinName(pkgID, nameID uint32) string {
+	pkg := funcInfoCString(pkgID)
+	name := funcInfoCString(nameID)
+	pkgLen := cStringLen(pkg)
+	nameLen := cStringLen(name)
+	if pkgLen == 0 {
+		return safeGoString(name, "")
+	}
+	if nameLen == 0 {
+		return safeGoString(pkg, "")
+	}
+	buf := make([]byte, 0, pkgLen+1+nameLen)
+	buf = cStringAppend(buf, pkg)
+	buf = append(buf, '.')
+	buf = cStringAppend(buf, name)
+	return string(buf)
+}
+
+func funcInfoNameLen(pkgID, nameID uint32) int {
+	pkgLen := cStringLen(funcInfoCString(pkgID))
+	nameLen := cStringLen(funcInfoCString(nameID))
+	if pkgLen == 0 {
+		return nameLen
+	}
+	if nameLen == 0 {
+		return pkgLen
+	}
+	return pkgLen + 1 + nameLen
+}
+
+func appendFuncInfoName(dst []byte, pkgID, nameID uint32) []byte {
+	pkg := funcInfoCString(pkgID)
+	name := funcInfoCString(nameID)
+	pkgLen := cStringLen(pkg)
+	nameLen := cStringLen(name)
+	if pkgLen == 0 {
+		return cStringAppend(dst, name)
+	}
+	if nameLen == 0 {
+		return cStringAppend(dst, pkg)
+	}
+	dst = cStringAppend(dst, pkg)
+	dst = append(dst, '.')
+	return cStringAppend(dst, name)
+}
+
+func funcInfoJoinFile(rootID, nameID uint32) string {
+	root := funcInfoCString(rootID)
+	name := funcInfoCString(nameID)
+	rootLen := cStringLen(root)
+	nameLen := cStringLen(name)
+	if rootLen == 0 {
+		return safeGoString(name, "")
+	}
+	if nameLen == 0 {
+		return safeGoString(root, "")
+	}
+	buf := make([]byte, 0, rootLen+nameLen)
+	buf = cStringAppend(buf, root)
+	buf = cStringAppend(buf, name)
+	return string(buf)
+}
+
+func maxFuncInfoSymbolLen() int {
+	maxLen := 0
+	for i := uintptr(0); i < runtimeFuncInfoCount; i++ {
+		fn := funcInfoAt(i)
+		if n := funcInfoNameLen(fn.symbolPkg, fn.symbolName); n > maxLen {
+			maxLen = n
+		}
+	}
+	return maxLen
+}
+
+func symbolPCBytes(name []byte) uintptr {
+	if len(name) == 0 {
+		return 0
+	}
+	name = append(name, 0)
+	return uintptr(clitedebug.Symbol((*c.Char)(unsafe.Pointer(&name[0]))))
+}
+
+func symbolPCFuncInfoName(buf []byte, pkgID, nameID uint32) uintptr {
+	name := appendFuncInfoName(buf[:0], pkgID, nameID)
+	return symbolPCBytes(name)
+}
+
+func funcInfoFunctionName(fn *runtimeFuncInfoRecord) string {
+	if fn == nil {
+		return ""
+	}
+	if function := publicFunctionName(funcInfoJoinName(fn.namePkg, fn.nameName)); function != "" {
+		return function
+	}
+	return publicFunctionName(funcInfoJoinName(fn.symbolPkg, fn.symbolName))
+}
+
+func funcInfoFileName(fn *runtimeFuncInfoRecord) string {
+	if fn == nil {
+		return ""
+	}
+	return funcInfoJoinFile(fn.fileRoot, fn.fileName)
+}
+
+func funcInfoForSymbol(symbol string) *runtimeFuncInfoRecord {
+	if symbol == "" || runtimeFuncInfoTable == nil || runtimeFuncInfoCount == 0 {
+		return nil
+	}
+	if runtimeFuncInfoStrings == nil || runtimeFuncInfoStringOffsets == nil || runtimeFuncInfoCount > 1<<20 || runtimeFuncInfoHashMask > 1<<22 {
+		return nil
+	}
+	if runtimeFuncInfoHash != nil && runtimeFuncInfoHashMask != 0 {
+		slot := funcInfoHashString(symbol) & runtimeFuncInfoHashMask
+		for probes := uintptr(0); probes <= runtimeFuncInfoHashMask; probes++ {
+			idx := *(*uint16)(unsafe.Add(unsafe.Pointer(runtimeFuncInfoHash), slot*unsafe.Sizeof(*runtimeFuncInfoHash)))
+			if idx == 0 {
+				return nil
+			}
+			if uintptr(idx) <= runtimeFuncInfoCount {
+				rec := funcInfoAt(uintptr(idx) - 1)
+				if funcInfoSymbolEqual(rec, symbol) {
+					return rec
+				}
+			}
+			slot = (slot + 1) & runtimeFuncInfoHashMask
+		}
+		return nil
+	}
+	for i := uintptr(0); i < runtimeFuncInfoCount; i++ {
+		rec := funcInfoAt(i)
+		if funcInfoSymbolEqual(rec, symbol) {
+			return rec
+		}
+	}
+	return nil
+}
+
+func funcInfoForRuntimeSymbol(symbol string) *runtimeFuncInfoRecord {
+	return funcInfoForSymbol(symbol)
+}
+
+func applyFuncInfo(sym *pcSymbol, rawFunction string) {
+	rec := funcInfoForRuntimeSymbol(rawFunction)
+	if rec == nil {
+		public := publicFunctionName(rawFunction)
+		if public != rawFunction {
+			rec = funcInfoForRuntimeSymbol(public)
+		}
+	}
+	if rec == nil {
+		return
+	}
+	if name := funcInfoJoinName(rec.namePkg, rec.nameName); name != "" {
+		sym.function = publicFunctionName(name)
+	}
+	if file := funcInfoJoinFile(rec.fileRoot, rec.fileName); file != "" {
+		if sym.file == "" {
+			sym.file = file
+		}
+	}
+	line := int(rec.line)
+	if GOOS == "windows" {
+		line = int(rec.line & runtimeFuncInfoLineMask)
+	}
+	if rec.line != 0 {
+		sym.startLine = int(rec.line)
+		if sym.line == 0 {
+			sym.line = line
+		}
+	}
+	sym.ok = sym.ok || sym.function != "" || sym.file != ""
+}
+
+func cachedFrameSymbol(pc uintptr) pcSymbol {
+	i := (pc >> 4) & (frameSymbolCacheSize - 1)
+	entry := frameSymbolCache[i]
+	if entry.pc != pc || entry.name == "" {
+		return pcSymbol{pc: pc}
+	}
+	rawFn := entry.name
+	if isPCSiteSymbol(rawFn) {
+		return pcSymbol{pc: pc}
+	}
+	fn := publicFunctionName(rawFn)
+	sym := pcSymbol{
+		pc:       pc,
+		entry:    pc - entry.offset,
+		function: fn,
+		ok:       fn != "" || entry.offset != 0,
+	}
+	applyFuncInfo(&sym, rawFn)
+	return sym
+}
+
+func addrInfoSymbol(pc uintptr) pcSymbol {
+	var info clitedebug.Info
+	if clitedebug.Addrinfo(unsafe.Pointer(pc), &info) == 0 {
+		return cachedFrameSymbol(pc)
+	}
+	rawFn := safeGoString(info.Sname, "")
+	if isPCSiteSymbol(rawFn) {
+		return pcSymbol{pc: pc}
+	}
+	if rawFn == "" {
+		if sym := cachedFrameSymbol(pc); sym.ok {
+			return sym
+		}
+	}
+	fn := publicFunctionName(rawFn)
+	sym := pcSymbol{
+		pc:       pc,
+		entry:    uintptr(info.Saddr),
+		function: fn,
+		ok:       fn != "" || info.Saddr != nil,
+	}
+	applyFuncInfo(&sym, rawFn)
+	return sym
+}
+
+func initRuntimeFuncPCFrames() {
+	if latomic.LoadUint32(&runtimeFuncPCInitState) == runtimeFuncInfoInitDone {
+		return
+	}
+	initRuntimeFuncPCFramesSlow()
+}
+
+// runtimeFuncPCFramesBuilt reports whether the entry frame table has already
+// been constructed, without triggering its construction.
+func runtimeFuncPCFramesBuilt() bool {
+	return latomic.LoadUint32(&runtimeFuncPCInitState) == runtimeFuncInfoInitDone
+}
+
+// Set LLGO_FUNCINFO_DEBUG=1 to print one line per lazily built runtime
+// metadata table. This is how benchmarks and bug reports can tell whether a
+// lookup used the compact find index or a degraded full-table fallback.
+var runtimeFuncInfoDebugState uint32
+
+var runtimeFuncPCFramesFromSites bool
+
+func runtimeFuncInfoDebugEnabled() bool {
+	state := latomic.LoadUint32(&runtimeFuncInfoDebugState)
+	if state == 0 {
+		state = 1
+		if p := cliteos.Getenv(c.AllocaCStr("LLGO_FUNCINFO_DEBUG")); p != nil {
+			if v := c.GoString(p); v != "" && v != "0" {
+				state = 2
+			}
+		}
+		latomic.StoreUint32(&runtimeFuncInfoDebugState, state)
+	}
+	return state == 2
+}
+
+func runtimeFuncInfoDebugSource(fromSites bool) string {
+	if fromSites {
+		return "sites"
+	}
+	return "dlsym"
+}
+
+func runtimeFuncInfoDebugIndex(index runtimePCFindIndex) string {
+	if len(index.buckets) != 0 {
+		return "built"
+	}
+	return "fallback"
+}
+
+func reportRuntimeFuncPCDebug() {
+	if !runtimeFuncInfoDebugEnabled() {
+		return
+	}
+	entrySrc := runtimeFuncInfoDebugSource(runtimeFuncPCFramesFromSites)
+	if runtimeFuncPCFramesPrebuilt {
+		entrySrc = "prebuilt"
+	}
+	frameCount := len(runtimeFuncPCFrames)
+	if runtimeFuncPCFramesPrebuilt {
+		frameCount = prebuiltFrameCount()
+	}
+	println("llgo funcinfo: func table frames=", frameCount,
+		" buckets=", len(runtimeFuncPCIndex.buckets),
+		" index=", runtimeFuncInfoDebugIndex(runtimeFuncPCIndex),
+		" entries=", entrySrc)
+}
+
+func reportRuntimePCLineDebug() {
+	if !runtimeFuncInfoDebugEnabled() {
+		return
+	}
+	println("llgo funcinfo: pcline table frames=", len(runtimePCLineFrames),
+		" buckets=", len(runtimePCLineIndex.buckets),
+		" index=", runtimeFuncInfoDebugIndex(runtimePCLineIndex))
+}
+
+func initRuntimeFuncPCFramesSlow() {
+	for {
+		state := latomic.LoadUint32(&runtimeFuncPCInitState)
+		switch state {
+		case runtimeFuncInfoInitDone:
+			return
+		case runtimeFuncInfoInitUninit:
+			if latomic.CompareAndSwapUint32(&runtimeFuncPCInitState, runtimeFuncInfoInitUninit, runtimeFuncInfoInitBusy) {
+				initRuntimeFuncPCFramesOnce()
+				latomic.StoreUint32(&runtimeFuncPCInitState, runtimeFuncInfoInitDone)
+				reportRuntimeFuncPCDebug()
+				return
+			}
+		}
+		c.Usleep(1)
+	}
+}
+
+// Prebuilt table format written into the entry-site section by the
+// link-phase tool (chore/pclnpost -write). Layout, all little-endian,
+// 8-byte aligned at the section start:
+//
+//	u64 magic          "LLGOFTB1"
+//	u64 linkSectAddr   link-time vmaddr of this section (informational)
+//	u64 base           runtime PC of the first table entry
+//	u32 count          ftab entries incl. trailing sentinel
+//	u32 bucketCount    findfunctab buckets (runtime uint16 layout)
+//	count × {u32 entryOff /* relative to base */, u32 funcIndex}
+//	bucketCount × {u32 idx; 16 × u16 subbuckets}
+//
+// The base slot is a live relocation: on Mach-O the rewriter splices it back
+// into the dyld chained-fixup page chain (so dyld both pre-touches the
+// table's pages at load and writes the slid address), and on non-PIE ELF the
+// link-time value already equals the runtime address. Either way the slot
+// holds a runtime PC — no slide arithmetic here.
+//
+// The tool sorts, deduplicates LTO inline copies against the symbol table,
+// and normalizes entries to true symbol starts, so adopting the table also
+// retires first-use sorting and the dlsym fallback.
+const runtimePrebuiltMagic = uint64(0x314254464F474C4C) // "LLGOFTB1" little-endian
+const runtimePrebuiltHeaderSize = 8 + 8 + 8 + 4 + 4
+
+type runtimePrebuiltFtabEntry struct {
+	entryOff  uint32
+	funcIndex uint32
+}
+
+var runtimeFuncPCFramesPrebuilt bool
+
+// Zero-copy view of the prebuilt table: lookups binary-search the on-disk
+// ftab directly; nothing is materialized at adoption time.
+var runtimePrebuiltBase uintptr
+var runtimePrebuiltFtab []runtimePrebuiltFtabEntry
+var runtimePrebuiltEntriesOnce uint32
+
+// runtimePrebuiltFuncs caches one *Func per ftab row for exact-entry
+// lookups. The set-associative pc cache in FuncForPC thrashes once the live
+// pc population outgrows it (thousands of distinct functions queried in a
+// loop); this cache is keyed by table row, so batch workloads stay O(search)
+// after the first pass regardless of scale. Atomic pointer publication keeps
+// concurrently created Func values fully initialized before readers use them.
+var runtimePrebuiltFuncs []unsafe.Pointer
+
+func prebuiltFuncCacheLoad(idx int) unsafe.Pointer {
+	if idx < 0 || idx >= len(runtimePrebuiltFuncs) {
+		return nil
+	}
+	return latomic.LoadPointer(&runtimePrebuiltFuncs[idx])
+}
+
+func prebuiltFuncCacheStore(idx int, fn unsafe.Pointer) {
+	if idx < 0 || idx >= len(runtimePrebuiltFuncs) {
+		return
+	}
+	latomic.StorePointer(&runtimePrebuiltFuncs[idx], fn)
+}
+
+// prebuiltFrameIndexForEntry returns the ftab row whose entry is exactly pc,
+// or -1.
+func prebuiltFrameIndexForEntry(pc uintptr) int {
+	idx := prebuiltFrameIndex(pc)
+	if idx < 0 || prebuiltFrame(idx).entry != pc {
+		return -1
+	}
+	return idx
+}
+
+// adoptPrebuiltFuncPCTable installs a zero-copy view over the prebuilt table
+// if the entry section carries the magic header. Returns false to fall back
+// to first-use construction.
+func adoptPrebuiltFuncPCTable() bool {
+	if runtimeFuncInfoEntryStart == nil || runtimeFuncInfoEntryEnd == nil {
+		return false
+	}
+	start := uintptr(unsafe.Pointer(runtimeFuncInfoEntryStart))
+	end := uintptr(unsafe.Pointer(runtimeFuncInfoEntryEnd))
+	if end < start+runtimePrebuiltHeaderSize {
+		return false
+	}
+	if *(*uint64)(unsafe.Pointer(start)) != runtimePrebuiltMagic {
+		return false
+	}
+	base := uintptr(*(*uint64)(unsafe.Pointer(start + 16)))
+	count := *(*uint32)(unsafe.Pointer(start + 24))
+	bucketCount := *(*uint32)(unsafe.Pointer(start + 28))
+	need := uintptr(runtimePrebuiltHeaderSize) + uintptr(count)*8 +
+		uintptr(bucketCount)*unsafe.Sizeof(runtimePCFindBucket{})
+	if count < 2 || end < start+need || uintptr(count) > runtimeFuncInfoCount*16+1 {
+		return false
+	}
+	runtimePrebuiltBase = base
+	runtimePrebuiltFtab = unsafe.Slice((*runtimePrebuiltFtabEntry)(unsafe.Pointer(start+runtimePrebuiltHeaderSize)), count)
+	runtimeFuncPCIndex = runtimePCFindIndex{
+		base:    base &^ (runtimePCFindBucketSize - 1),
+		buckets: unsafe.Slice((*runtimePCFindBucket)(unsafe.Pointer(start+runtimePrebuiltHeaderSize+uintptr(count)*8)), bucketCount),
+	}
+	runtimeFuncPCFramesPrebuilt = true
+	runtimeFuncPCFramesFromSites = true
+	runtimePrebuiltFuncs = make([]unsafe.Pointer, count)
+	return true
+}
+
+// prebuiltFrame returns the ftab row as a runtimeFuncPCFrame view.
+func prebuiltFrame(i int) runtimeFuncPCFrame {
+	e := runtimePrebuiltFtab[i]
+	return runtimeFuncPCFrame{entry: runtimePrebuiltBase + uintptr(e.entryOff), funcIndex: e.funcIndex}
+}
+
+// prebuiltFrameCount excludes the trailing sentinel.
+func prebuiltFrameCount() int {
+	return len(runtimePrebuiltFtab) - 1
+}
+
+// materializePrebuiltEntries lazily builds the funcIndex -> entry map that
+// only the pcline initializer consumes; FuncForPC lookups never pay for it.
+// Two-phase (busy/done) so concurrent losers wait for the winner's store.
+func materializePrebuiltEntries() {
+	for {
+		switch latomic.LoadUint32(&runtimePrebuiltEntriesOnce) {
+		case 2:
+			return
+		case 0:
+			if !latomic.CompareAndSwapUint32(&runtimePrebuiltEntriesOnce, 0, 1) {
+				continue
+			}
+			entries := make([]uintptr, runtimeFuncInfoCount+1)
+			for _, e := range runtimePrebuiltFtab[:prebuiltFrameCount()] {
+				if e.funcIndex == 0 || uintptr(e.funcIndex) > runtimeFuncInfoCount {
+					continue
+				}
+				pc := runtimePrebuiltBase + uintptr(e.entryOff)
+				if entries[e.funcIndex] == 0 || pc < entries[e.funcIndex] {
+					entries[e.funcIndex] = pc
+				}
+			}
+			runtimeFuncPCEntries = entries
+			latomic.StoreUint32(&runtimePrebuiltEntriesOnce, 2)
+			return
+		default:
+			c.Usleep(1)
+		}
+	}
+}
+
+func initRuntimeFuncPCFramesOnce() {
+	if runtimeFuncInfoTable == nil ||
+		runtimeFuncInfoCount == 0 ||
+		runtimeFuncInfoStrings == nil ||
+		runtimeFuncInfoStringOffsets == nil {
+		return
+	}
+	if runtimeFuncInfoCount > 1<<20 {
+		return
+	}
+	if adoptPrebuiltFuncPCTable() {
+		return
+	}
+	// Keep potentially large materialization loops free of append and checked
+	// slice indexing. LLGo currently keeps their stack temporaries alive until
+	// function return, which can exhaust a worker thread's fixed-size stack.
+	var frames []runtimeFuncPCFrame
+	entries := make([]uintptr, runtimeFuncInfoCount+1)
+	frames, usedEntrySites := appendRuntimeFuncInfoEntryFrames(frames, entries)
+	symbolBuf := []byte(nil)
+	if !usedEntrySites {
+		frames = make([]runtimeFuncPCFrame, runtimeFuncInfoCount)
+		frameBase := unsafe.Pointer(&frames[0])
+		frameSize := unsafe.Sizeof(frames[0])
+		entryBase := unsafe.Pointer(&entries[0])
+		nframes := 0
+		symbolBuf = make([]byte, 0, maxFuncInfoSymbolLen()+1)
+		for i := uintptr(0); i < runtimeFuncInfoCount; i++ {
+			fn := funcInfoAt(i)
+			pc := symbolPCFuncInfoName(symbolBuf, fn.symbolPkg, fn.symbolName)
+			if pc == 0 {
+				continue
+			}
+			index := uint32(i + 1)
+			*(*runtimeFuncPCFrame)(unsafe.Add(frameBase, uintptr(nframes)*frameSize)) = runtimeFuncPCFrame{
+				entry:     pc,
+				funcIndex: index,
+			}
+			nframes++
+			entry := (*uintptr)(unsafe.Add(entryBase, uintptr(index)*unsafe.Sizeof(uintptr(0))))
+			if *entry == 0 || pc < *entry {
+				*entry = pc
+			}
+		}
+		frames = frames[:nframes]
+	}
+	sortRuntimeFuncPCFrames(frames)
+	frames = uniqueRuntimeFuncPCFrames(frames)
+	runtimeFuncPCFrames = frames
+	runtimeFuncPCEntries = entries
+	runtimeFuncPCIndex = buildRuntimeFuncPCIndex(frames)
+	runtimeFuncPCFramesFromSites = usedEntrySites
+}
+
+func appendRuntimeFuncInfoEntryFrames(frames []runtimeFuncPCFrame, entries []uintptr) ([]runtimeFuncPCFrame, bool) {
+	if runtimeFuncInfoEntryStart == nil || runtimeFuncInfoEntryEnd == nil {
+		return frames, false
+	}
+	start := uintptr(unsafe.Pointer(runtimeFuncInfoEntryStart))
+	end := uintptr(unsafe.Pointer(runtimeFuncInfoEntryEnd))
+	size := unsafe.Sizeof(*runtimeFuncInfoEntryStart)
+	if end <= start || size == 0 || (end-start)%size != 0 {
+		return frames, false
+	}
+	nsite := (end - start) / size
+	if nsite > runtimeFuncInfoCount*16 || nsite > 1<<20 {
+		return frames, false
+	}
+	if nsite == 0 {
+		return frames, false
+	}
+	base := len(frames)
+	grown := make([]runtimeFuncPCFrame, base+int(nsite))
+	copy(grown, frames)
+	frames = grown
+	frameBase := unsafe.Pointer(&frames[0])
+	frameSize := unsafe.Sizeof(frames[0])
+	entryBase := unsafe.Pointer(&entries[0])
+	nframes := base
+	used := false
+	for i := uintptr(0); i < nsite; i++ {
+		site := (*runtimeFuncInfoEntryRecord)(unsafe.Pointer(start + i*size))
+		if site == nil || site.pc == 0 || site.symbolID == 0 {
+			continue
+		}
+		funcIndex := funcInfoIndexForSymbolID(site.symbolID)
+		if funcIndex == 0 || uintptr(funcIndex) > runtimeFuncInfoCount {
+			continue
+		}
+		*(*runtimeFuncPCFrame)(unsafe.Add(frameBase, uintptr(nframes)*frameSize)) = runtimeFuncPCFrame{
+			entry:     site.pc,
+			funcIndex: funcIndex,
+		}
+		nframes++
+		entry := (*uintptr)(unsafe.Add(entryBase, uintptr(funcIndex)*unsafe.Sizeof(uintptr(0))))
+		if *entry == 0 || site.pc < *entry {
+			*entry = site.pc
+		}
+		used = true
+	}
+	return frames[:nframes], used
+}
+
+func funcInfoIndexForSymbolID(symbolID uint64) uint32 {
+	if symbolID == 0 || runtimeFuncInfoSymbolIndex == nil || runtimeFuncInfoSymbolIndexCount == 0 {
+		return 0
+	}
+	if runtimeFuncInfoSymbolIndexCount > runtimeFuncInfoCount || runtimeFuncInfoSymbolIndexCount > 1<<20 {
+		return 0
+	}
+	lo, hi := uintptr(0), runtimeFuncInfoSymbolIndexCount
+	size := unsafe.Sizeof(*runtimeFuncInfoSymbolIndex)
+	for lo < hi {
+		mid := (lo + hi) >> 1
+		rec := (*runtimeFuncInfoSymbolIndexRecord)(unsafe.Add(unsafe.Pointer(runtimeFuncInfoSymbolIndex), mid*size))
+		if rec.symbolID >= symbolID {
+			hi = mid
+		} else {
+			lo = mid + 1
+		}
+	}
+	if lo >= runtimeFuncInfoSymbolIndexCount {
+		return 0
+	}
+	rec := (*runtimeFuncInfoSymbolIndexRecord)(unsafe.Add(unsafe.Pointer(runtimeFuncInfoSymbolIndex), lo*size))
+	if rec.symbolID != symbolID || rec.funcIndex == 0 || uintptr(rec.funcIndex) > runtimeFuncInfoCount {
+		return 0
+	}
+	return rec.funcIndex
+}
+
+func sortRuntimeFuncPCFrames(frames []runtimeFuncPCFrame) {
+	count := len(frames)
+	if count < 2 {
+		return
+	}
+	// Pass only the backing-store pointer through the sorting loop. LLGo
+	// currently lowers each checked slice access to a dynamic stack
+	// temporary whose lifetime extends until function return; quicksort's
+	// partition loops can otherwise exhaust the fixed pthread stack.
+	quickSortRuntimeFuncPCFrames(unsafe.Pointer(&frames[0]), 0, count-1)
+}
+
+func runtimeFuncPCFrameAt(base unsafe.Pointer, index int) *runtimeFuncPCFrame {
+	return (*runtimeFuncPCFrame)(unsafe.Add(base, uintptr(index)*unsafe.Sizeof(runtimeFuncPCFrame{})))
+}
+
+func swapRuntimeFuncPCFrames(base unsafe.Pointer, i, j int) {
+	left := runtimeFuncPCFrameAt(base, i)
+	right := runtimeFuncPCFrameAt(base, j)
+	tmp := *left
+	*left = *right
+	*right = tmp
+}
+
+func quickSortRuntimeFuncPCFrames(base unsafe.Pointer, lo, hi int) {
+	for hi-lo > 16 {
+		mid := int(uint(lo+hi) >> 1)
+		if runtimeFuncPCFrameAt(base, mid).entry < runtimeFuncPCFrameAt(base, lo).entry {
+			swapRuntimeFuncPCFrames(base, mid, lo)
+		}
+		if runtimeFuncPCFrameAt(base, hi).entry < runtimeFuncPCFrameAt(base, mid).entry {
+			swapRuntimeFuncPCFrames(base, hi, mid)
+		}
+		if runtimeFuncPCFrameAt(base, mid).entry < runtimeFuncPCFrameAt(base, lo).entry {
+			swapRuntimeFuncPCFrames(base, mid, lo)
+		}
+		pivot := runtimeFuncPCFrameAt(base, mid).entry
+		i, j := lo, hi
+		for {
+			for runtimeFuncPCFrameAt(base, i).entry < pivot {
+				i++
+			}
+			for runtimeFuncPCFrameAt(base, j).entry > pivot {
+				j--
+			}
+			if i >= j {
+				break
+			}
+			swapRuntimeFuncPCFrames(base, i, j)
+			i++
+			j--
+		}
+		if j-lo < hi-i {
+			quickSortRuntimeFuncPCFrames(base, lo, j)
+			lo = i
+		} else {
+			quickSortRuntimeFuncPCFrames(base, i, hi)
+			hi = j
+		}
+	}
+	for i := lo + 1; i <= hi; i++ {
+		x := *runtimeFuncPCFrameAt(base, i)
+		j := i - 1
+		for j >= lo && runtimeFuncPCFrameAt(base, j).entry > x.entry {
+			*runtimeFuncPCFrameAt(base, j+1) = *runtimeFuncPCFrameAt(base, j)
+			j--
+		}
+		*runtimeFuncPCFrameAt(base, j+1) = x
+	}
+}
+
+func uniqueRuntimeFuncPCFrames(frames []runtimeFuncPCFrame) []runtimeFuncPCFrame {
+	if len(frames) < 2 {
+		return frames
+	}
+	base := unsafe.Pointer(&frames[0])
+	size := unsafe.Sizeof(frames[0])
+	count := len(frames)
+	n := 1
+	for i := 1; i < count; i++ {
+		current := (*runtimeFuncPCFrame)(unsafe.Add(base, uintptr(i)*size))
+		previous := (*runtimeFuncPCFrame)(unsafe.Add(base, uintptr(n-1)*size))
+		if current.entry == previous.entry {
+			*previous = *current
+			continue
+		}
+		*(*runtimeFuncPCFrame)(unsafe.Add(base, uintptr(n)*size)) = *current
+		n++
+	}
+	return frames[:n]
+}
+
+// buildRuntimeFuncPCIndex is the runtime counterpart of Go's linker-built
+// findfunctab. The table shape and lookup behavior are Go-style; the build time
+// differs because LLGo's final function PCs are discovered from associated
+// sections after link/load instead of being sorted directly by cmd/link.
+func buildRuntimeFuncPCIndex(frames []runtimeFuncPCFrame) runtimePCFindIndex {
+	if len(frames) == 0 {
+		return runtimePCFindIndex{}
+	}
+	if uintptr(len(frames)) > ^uintptr(0)>>1 {
+		return runtimePCFindIndex{}
+	}
+	frameCount := len(frames)
+	frameBase := &frames[0]
+	frameSize := unsafe.Sizeof(*frameBase)
+	base := frameBase.entry &^ (runtimePCFindBucketSize - 1)
+	last := (*runtimeFuncPCFrame)(unsafe.Add(unsafe.Pointer(frameBase), uintptr(frameCount-1)*frameSize)).entry
+	if last < base {
+		return runtimePCFindIndex{}
+	}
+	nbuckets := (last-base)/runtimePCFindBucketSize + 1
+	if nbuckets > 1<<20 && nbuckets > uintptr(frameCount)*64 {
+		return runtimePCFindIndex{}
+	}
+	buckets := make([]runtimePCFindBucket, nbuckets)
+	bucketCount := len(buckets)
+	bucketBase := unsafe.Pointer(&buckets[0])
+	bucketSize := unsafe.Sizeof(buckets[0])
+	subSize := runtimePCFindBucketSize / runtimePCFindSubbucket
+	for b := 0; b < bucketCount; b++ {
+		bucket := (*runtimePCFindBucket)(unsafe.Add(bucketBase, uintptr(b)*bucketSize))
+		bucketStart := base + uintptr(b)*runtimePCFindBucketSize
+		baseIdx := runtimeFuncPCFrameIndexUnsafe(frameBase, frameCount, bucketStart)
+		if baseIdx < 0 {
+			baseIdx = 0
+		}
+		if baseIdx > frameCount-1 {
+			baseIdx = frameCount - 1
+		}
+		bucket.idx = uint32(baseIdx)
+		subbucketBase := unsafe.Pointer(&bucket.subbuckets[0])
+		for s := 0; s < runtimePCFindSubbucket; s++ {
+			pc := bucketStart + uintptr(s)*subSize
+			subIdx := runtimeFuncPCFrameIndexUnsafe(frameBase, frameCount, pc)
+			if subIdx < 0 {
+				subIdx = 0
+			}
+			if subIdx > frameCount-1 {
+				subIdx = frameCount - 1
+			}
+			// delta counts deduplicated PCs inside one bucket, so it is
+			// bounded by the bucket size and always fits in uint16.
+			delta := subIdx - baseIdx
+			if delta < 0 || delta > 0xffff {
+				return runtimePCFindIndex{}
+			}
+			*(*uint16)(unsafe.Add(subbucketBase, uintptr(s)*unsafe.Sizeof(uint16(0)))) = uint16(delta)
+		}
+	}
+	return runtimePCFindIndex{base: base, buckets: buckets}
+}
+
+func runtimePCFindRange(index runtimePCFindIndex, n int, pc uintptr) (int, int, bool) {
+	if n == 0 || len(index.buckets) == 0 || pc < index.base {
+		return 0, 0, false
+	}
+	off := pc - index.base
+	bucket := off / runtimePCFindBucketSize
+	if bucket >= uintptr(len(index.buckets)) {
+		return 0, 0, false
+	}
+	subSize := runtimePCFindBucketSize / runtimePCFindSubbucket
+	sub := (off % runtimePCFindBucketSize) / subSize
+	b := index.buckets[bucket]
+	lo := int(b.idx) + int(b.subbuckets[sub])
+	hi := n
+	if sub+1 < runtimePCFindSubbucket {
+		hi = int(b.idx) + int(b.subbuckets[sub+1])
+	} else if bucket+1 < uintptr(len(index.buckets)) {
+		hi = int(index.buckets[bucket+1].idx)
+	}
+	if lo > 0 {
+		lo--
+	}
+	if hi < lo {
+		hi = lo
+	}
+	hi += 2
+	if hi > n {
+		hi = n
+	}
+	if lo > n {
+		lo = n
+	}
+	return lo, hi, true
+}
+
+// runtimeFuncPCFrameIndex mirrors runtime.findfunc: use the compact bucket
+// table to jump near the containing function, then scan the sorted frame table
+// inside that narrow range.
+func runtimeFuncPCFrameIndex(pc uintptr) int {
+	if runtimeFuncPCFramesPrebuilt {
+		return prebuiltFrameIndex(pc)
+	}
+	frames := runtimeFuncPCFrames
+	if len(frames) == 0 {
+		return -1
+	}
+	if lo, hi, ok := runtimePCFindRange(runtimeFuncPCIndex, len(frames), pc); ok {
+		for lo < hi {
+			mid := int(uint(lo+hi) >> 1)
+			if frames[mid].entry > pc {
+				hi = mid
+			} else {
+				lo = mid + 1
+			}
+		}
+		idx := lo - 1
+		if idx < 0 || frames[idx].entry > pc {
+			return -1
+		}
+		return idx
+	}
+	return runtimeFuncPCFrameIndexBinary(frames, pc)
+}
+
+func runtimeFuncPCFrameIndexBinary(frames []runtimeFuncPCFrame, pc uintptr) int {
+	lo, hi := 0, len(frames)
+	for lo < hi {
+		mid := int(uint(lo+hi) >> 1)
+		if frames[mid].entry > pc {
+			hi = mid
+		} else {
+			lo = mid + 1
+		}
+	}
+	idx := lo - 1
+	if idx < 0 {
+		return -1
+	}
+	return idx
+}
+
+// runtimeFuncPCFrameIndexUnsafe is used while building an index. The caller
+// validates base and n once so LLGo does not emit a bounds-check stack
+// temporary for every bucket lookup.
+func runtimeFuncPCFrameIndexUnsafe(base *runtimeFuncPCFrame, n int, pc uintptr) int {
+	lo, hi := 0, n
+	size := unsafe.Sizeof(*base)
+	for lo < hi {
+		mid := int(uint(lo+hi) >> 1)
+		frame := (*runtimeFuncPCFrame)(unsafe.Add(unsafe.Pointer(base), uintptr(mid)*size))
+		if frame.entry > pc {
+			hi = mid
+		} else {
+			lo = mid + 1
+		}
+	}
+	return lo - 1
+}
+
+// prebuiltFrameIndex is runtimeFuncPCFrameIndex over the zero-copy ftab:
+// bucket narrowing via the shared find index, then binary search on
+// entryOff. Returns the index of the last entry with PC <= pc, or -1.
+func prebuiltFrameIndex(pc uintptr) int {
+	n := prebuiltFrameCount()
+	if n <= 0 || pc < runtimePrebuiltBase {
+		return -1
+	}
+	off := uint32(pc - runtimePrebuiltBase)
+	lo, hi := 0, n
+	if l, h, ok := runtimePCFindRange(runtimeFuncPCIndex, n, pc); ok {
+		lo, hi = l, h
+	}
+	for lo < hi {
+		mid := int(uint(lo+hi) >> 1)
+		if runtimePrebuiltFtab[mid].entryOff > off {
+			hi = mid
+		} else {
+			lo = mid + 1
+		}
+	}
+	idx := lo - 1
+	if idx < 0 || runtimePrebuiltFtab[idx].entryOff > off {
+		return -1
+	}
+	return idx
+}
+
+func funcEntryForIndex(index uint32) uintptr {
+	if index == 0 {
+		return 0
+	}
+	initRuntimeFuncPCFrames()
+	if runtimeFuncPCFramesPrebuilt {
+		materializePrebuiltEntries()
+	}
+	if uintptr(index) >= uintptr(len(runtimeFuncPCEntries)) {
+		return 0
+	}
+	return runtimeFuncPCEntries[index]
+}
+
+// coldFuncInfoEntryLookup resolves an exact function-entry PC by scanning the
+// raw entry-site section, without building the sorted frame table and without
+// any dynamic-loader query. The scan is linear, so it is capped: for larger
+// binaries the dladdr cold path is cheaper than streaming the whole section.
+const coldFuncInfoEntryScanLimit = 4096
+
+// coldFuncInfoScanRange scans one {pc, symbolID} record section for the
+// anchor nearest at-or-after pc within the warm path's entry slack (anchors
+// are emitted from LLVM IR and land after the backend prologue). It returns
+// the matched funcinfo index and delta, or (0, maxDelta) on miss.
+func coldFuncInfoScanRange(start, end, size, pc uintptr, bestDelta uintptr) (uint32, uintptr) {
+	if start == 0 || end <= start || size == 0 || (end-start)%size != 0 {
+		return 0, bestDelta
+	}
+	nsite := (end - start) / size
+	if nsite > coldFuncInfoEntryScanLimit || nsite > runtimeFuncInfoCount*16 {
+		return 0, bestDelta
+	}
+	bestIndex := uint32(0)
+	for i := uintptr(0); i < nsite; i++ {
+		site := (*runtimeFuncInfoEntryRecord)(unsafe.Pointer(start + i*size))
+		if site.symbolID == 0 || site.pc < pc {
+			continue
+		}
+		delta := site.pc - pc
+		if delta >= bestDelta {
+			continue
+		}
+		funcIndex := funcInfoIndexForSymbolID(site.symbolID)
+		if funcIndex == 0 || uintptr(funcIndex) > runtimeFuncInfoCount {
+			continue
+		}
+		bestDelta = delta
+		bestIndex = funcIndex
+		if delta == 0 {
+			break
+		}
+	}
+	return bestIndex, bestDelta
+}
+
+// coldFuncPCLookupBudget grants a small number of table-free cold lookups per
+// process; past that, building the sorted table amortizes better than more
+// linear scans or dladdr calls.
+var coldFuncPCLookupCount uint32
+
+func coldFuncPCLookupBudget() bool {
+	if prebuiltFuncPCTablePresent() {
+		// The prebuilt table makes first-use initialization cheap; skip the
+		// scan/dladdr path entirely and let the caller fall through to it.
+		return false
+	}
+	return latomic.AddUint32(&coldFuncPCLookupCount, 1) <= 8
+}
+
+// prebuiltFuncPCTablePresent reports whether the entry section carries the
+// link-phase prebuilt table, in which case the cold scan must not interpret
+// its bytes as site records — and does not need to: adopting the prebuilt
+// table is itself cheap.
+func prebuiltFuncPCTablePresent() bool {
+	if runtimeFuncInfoEntryStart == nil || runtimeFuncInfoEntryEnd == nil {
+		return false
+	}
+	start := uintptr(unsafe.Pointer(runtimeFuncInfoEntryStart))
+	end := uintptr(unsafe.Pointer(runtimeFuncInfoEntryEnd))
+	if end < start+8 {
+		return false
+	}
+	m := *(*uint64)(unsafe.Pointer(start))
+	return m == runtimePrebuiltMagic
+}
+
+// runtimeFuncInfoWarmSink keeps the warm-up loads observable.
+var runtimeFuncInfoWarmSink byte
+
+// init pre-warms the prebuilt function table, mirroring Go: Go's pclntab
+// pages are touched by the runtime itself (traceback, GC) long before user
+// code queries it, so its "first" FuncForPC never pays page-in. Touching the
+// pages the lookup path reads — adopted blob, funcinfo records, string
+// offsets, strings — moves first-touch page-in (plus, on darwin,
+// code-signature validation) from the first user lookup to process startup
+// (tens of µs once, on binaries that carry funcinfo tables). Without a
+// prebuilt table everything stays lazy: first-use construction allocates,
+// which has no place in init, and programs that never introspect pay
+// nothing.
+func init() {
+	if !prebuiltFuncPCTablePresent() {
+		return
+	}
+	initRuntimeFuncPCFrames() // zero-copy adoption, sub-µs
+	if !runtimeFuncPCFramesPrebuilt {
+		return
+	}
+	touch := func(base unsafe.Pointer, n uintptr) {
+		if base == nil || n == 0 {
+			return
+		}
+		const pageStep = 4096
+		sink := runtimeFuncInfoWarmSink
+		p := uintptr(base)
+		for off := uintptr(0); off < n; off += pageStep {
+			sink += *(*byte)(unsafe.Pointer(p + off))
+		}
+		sink += *(*byte)(unsafe.Pointer(p + n - 1))
+		runtimeFuncInfoWarmSink = sink
+	}
+	// Derive the adopted blob's range from its zero-copy views.
+	if n := len(runtimePrebuiltFtab); n > 0 {
+		touch(unsafe.Pointer(&runtimePrebuiltFtab[0]), uintptr(n)*8)
+	}
+	if n := len(runtimeFuncPCIndex.buckets); n > 0 {
+		touch(unsafe.Pointer(&runtimeFuncPCIndex.buckets[0]),
+			uintptr(n)*unsafe.Sizeof(runtimePCFindBucket{}))
+	}
+	touch(unsafe.Pointer(runtimeFuncInfoTable),
+		runtimeFuncInfoCount*unsafe.Sizeof(runtimeFuncInfoRecord{}))
+	touch(unsafe.Pointer(runtimeFuncInfoStringOffsets),
+		runtimeFuncInfoStringCount*unsafe.Sizeof(uint32(0)))
+	if runtimeFuncInfoStrings != nil && runtimeFuncInfoStringCount > 0 {
+		last := uintptr(*(*uint32)(unsafe.Add(unsafe.Pointer(runtimeFuncInfoStringOffsets),
+			(runtimeFuncInfoStringCount-1)*unsafe.Sizeof(uint32(0)))))
+		lastStr := funcInfoCString(uint32(runtimeFuncInfoStringCount - 1))
+		touch(unsafe.Pointer(runtimeFuncInfoStrings), last+uintptr(cStringLen(lastStr))+1)
+	}
+	// The pcline table is on the Caller/CallersFrames path; building it
+	// here keeps the first user lookup at steady-state cost (the build cost
+	// scales with call-site count and showed up as a 200µs first Caller).
+	initRuntimePCLineFrames()
+	// One synthetic lookup warms the code paths themselves (allocator size
+	// classes, lookup caches), not just the data pages.
+	if prebuiltFrameCount() > 0 {
+		frame := prebuiltFrame(0)
+		if sym, ok := pcSymbolForFuncInfoIndex(frame.entry, frame.entry, frame.funcIndex); ok {
+			runtimeFuncInfoWarmSink += byte(len(sym.function))
+		}
+	}
+	// Write-warm the FuncForPC cache: its first stores otherwise take
+	// zero-fill write faults, one per page, on the first few lookups.
+	for i := 0; i < funcForPCCacheSets; i += 4096 / int(unsafe.Sizeof(funcForPCCache[0])) {
+		latomic.StorePointer(&funcForPCCache[i][0], nil)
+	}
+	latomic.StorePointer(&funcForPCCache[funcForPCCacheSets-1][0], nil)
+}
+
+func coldFuncInfoEntryLookup(pc uintptr) (pcSymbol, bool) {
+	if pc == 0 || prebuiltFuncPCTablePresent() {
+		return pcSymbol{}, false
+	}
+	bestDelta := uintptr(runtimeFuncPCEntrySlack) + 1
+	bestIndex := uint32(0)
+	if runtimeFuncInfoEntryStart != nil && runtimeFuncInfoEntryEnd != nil {
+		bestIndex, bestDelta = coldFuncInfoScanRange(
+			uintptr(unsafe.Pointer(runtimeFuncInfoEntryStart)),
+			uintptr(unsafe.Pointer(runtimeFuncInfoEntryEnd)),
+			unsafe.Sizeof(*runtimeFuncInfoEntryStart), pc, bestDelta)
+	}
+	if bestIndex == 0 {
+		return pcSymbol{}, false
+	}
+	if bestDelta != 0 && !runtimeFuncPCMayUseEntrySlack(pc) {
+		return pcSymbol{}, false
+	}
+	return pcSymbolForFuncInfoIndex(pc, pc, bestIndex)
+}
+
+func funcPCFrameForPC(pc uintptr) (pcSymbol, bool) {
+	if pc == 0 {
+		return pcSymbol{}, false
+	}
+	initRuntimeFuncPCFrames()
+	idx := runtimeFuncPCFrameIndex(pc)
+	if idx < 0 {
+		return pcSymbol{}, false
+	}
+	var frame runtimeFuncPCFrame
+	if runtimeFuncPCFramesPrebuilt {
+		frame = prebuiltFrame(idx)
+	} else {
+		frame = runtimeFuncPCFrames[idx]
+	}
+	return pcSymbolForFuncInfoIndex(pc, frame.entry, frame.funcIndex)
+}
+
+func funcPCFrameForEntryPC(pc uintptr) (pcSymbol, bool) {
+	if pc == 0 {
+		return pcSymbol{}, false
+	}
+	initRuntimeFuncPCFrames()
+	if runtimeFuncPCFramesPrebuilt {
+		// Prebuilt entries are true symbol starts (normalized against the
+		// symbol table by the link-phase tool), so no slack is needed.
+		idx := prebuiltFrameIndex(pc)
+		if idx < 0 {
+			return pcSymbol{}, false
+		}
+		frame := prebuiltFrame(idx)
+		if frame.entry != pc {
+			return pcSymbol{}, false
+		}
+		return pcSymbolForFuncInfoIndex(pc, pc, frame.funcIndex)
+	}
+	frames := runtimeFuncPCFrames
+	if len(frames) == 0 {
+		return pcSymbol{}, false
+	}
+	lo, hi := 0, len(frames)
+	for lo < hi {
+		mid := int(uint(lo+hi) >> 1)
+		if frames[mid].entry >= pc {
+			hi = mid
+		} else {
+			lo = mid + 1
+		}
+	}
+	if lo >= len(frames) {
+		return pcSymbol{}, false
+	}
+	frame := frames[lo]
+	if frame.entry != pc {
+		if frame.entry-pc > runtimeFuncPCEntrySlack || !runtimeFuncPCMayUseEntrySlack(pc) {
+			return pcSymbol{}, false
+		}
+	}
+	return pcSymbolForFuncInfoIndex(pc, pc, frame.funcIndex)
+}
+
+func pcSymbolForFuncInfoIndex(pc, entry uintptr, funcIndex uint32) (pcSymbol, bool) {
+	if funcIndex == 0 || uintptr(funcIndex) > runtimeFuncInfoCount {
+		return pcSymbol{}, false
+	}
+	fn := funcInfoAt(uintptr(funcIndex) - 1)
+	line := int(fn.line)
+	startLine := line
+	if GOOS == "windows" {
+		line = int(fn.line & runtimeFuncInfoLineMask)
+		startLine = int(fn.line)
+	}
+	return pcSymbol{
+		pc:        pc,
+		entry:     entry,
+		function:  funcInfoFunctionName(fn),
+		file:      funcInfoFileName(fn),
+		line:      line,
+		startLine: startLine,
+		ok:        true,
+	}, true
+}
+
+// refinePCSymbolLine upgrades a function-record symbol to statement
+// granularity when a same-function pcline record covers pc, or the call
+// instruction at pc-1 for return addresses (statement labels can sit
+// exactly on a return address). Cross-function records are rejected by
+// pcLineFrameForPC's entry check, so exact-entry queries keep their
+// declaration line. This is the single place the pc/pc-1 statement rule
+// lives; FuncForPC and CallersFrames must agree on it.
+func refinePCSymbolLine(sym pcSymbol, pc uintptr) pcSymbol {
+	if lineSym, ok := pcLineFrameForPC(pc, sym.entry); ok {
+		return mergePCLineSymbol(sym, lineSym)
+	}
+	if lineSym, ok := pcLineFrameForPC(pc-1, sym.entry); ok {
+		lineSym.pc = pc
+		return mergePCLineSymbol(sym, lineSym)
+	}
+	// No same-function statement anchor covers pc. Mid-function pcs of a
+	// record with no evidence can actually belong to a foreign (C)
+	// function linked between Go functions — nearest-below cannot see the
+	// hole and would misattribute the frame to the preceding Go function.
+	// One dladdr cross-check on this cold, cache-backed path: a closer
+	// symbol wins. Exact entries and anchored functions never get here.
+	if pc != sym.entry {
+		if ai := addrInfoSymbol(pc); ai.ok && ai.entry > sym.entry {
+			return ai
+		}
+	}
+	return sym
+}
+
+func initRuntimePCLineFrames() {
+	if latomic.LoadUint32(&runtimePCLineInitState) == runtimeFuncInfoInitDone {
+		return
+	}
+	initRuntimePCLineFramesSlow()
+}
+
+func initRuntimePCLineFramesSlow() {
+	for {
+		state := latomic.LoadUint32(&runtimePCLineInitState)
+		switch state {
+		case runtimeFuncInfoInitDone:
+			return
+		case runtimeFuncInfoInitUninit:
+			if latomic.CompareAndSwapUint32(&runtimePCLineInitState, runtimeFuncInfoInitUninit, runtimeFuncInfoInitBusy) {
+				initRuntimePCLineFramesOnce()
+				latomic.StoreUint32(&runtimePCLineInitState, runtimeFuncInfoInitDone)
+				reportRuntimePCLineDebug()
+				return
+			}
+		}
+		c.Usleep(1)
+	}
+}
+
+func initRuntimePCLineFramesOnce() {
+	if runtimePCLineTable == nil ||
+		runtimePCLineCount == 0 ||
+		runtimePCSiteStart == nil ||
+		runtimePCSiteEnd == nil ||
+		runtimeFuncInfoTable == nil ||
+		runtimeFuncInfoCount == 0 ||
+		runtimeFuncInfoStrings == nil ||
+		runtimeFuncInfoStringOffsets == nil {
+		return
+	}
+	if runtimePCLineCount > 1<<20 || runtimePCLineCount > runtimeFuncInfoCount*1024 {
+		return
+	}
+	start := uintptr(unsafe.Pointer(runtimePCSiteStart))
+	end := uintptr(unsafe.Pointer(runtimePCSiteEnd))
+	size := unsafe.Sizeof(*runtimePCSiteStart)
+	if end <= start || size == 0 || (end-start)%size != 0 {
+		return
+	}
+	nsite := (end - start) / size
+	if nsite > runtimePCLineCount*1024 || nsite > 1<<22 {
+		return
+	}
+	frames := make([]runtimePCLineFrame, nsite)
+	frameBase := unsafe.Pointer(&frames[0])
+	frameSize := unsafe.Sizeof(frames[0])
+	nframes := 0
+	symbolBuf := make([]byte, 0, maxFuncInfoSymbolLen()+1)
+	// Sites vastly outnumber distinct functions and files, so materialize the
+	// per-function strings and entry PCs once and the file strings once
+	// per file ID. Building them per site used to dominate first-use latency.
+	type pcLineFuncInfo struct {
+		entry    uintptr
+		function string
+		file     string
+		line     int
+		resolved bool
+	}
+	funcCache := make([]pcLineFuncInfo, runtimeFuncInfoCount+1)
+	funcCacheBase := unsafe.Pointer(&funcCache[0])
+	funcCacheSize := unsafe.Sizeof(funcCache[0])
+	fileCache := make(map[uint64]string)
+	for i := uintptr(0); i < nsite; i++ {
+		site := (*runtimePCSiteRecord)(unsafe.Pointer(start + i*size))
+		if site == nil || site.id == 0 || site.pc == 0 {
+			continue
+		}
+		rec := pcLineInfoForID(site.id)
+		if rec == nil || rec.funcIndex == 0 || uintptr(rec.funcIndex) > runtimeFuncInfoCount {
+			continue
+		}
+		pc := site.pc
+		fn := funcInfoAt(uintptr(rec.funcIndex) - 1)
+		fc := (*pcLineFuncInfo)(unsafe.Add(funcCacheBase, uintptr(rec.funcIndex)*funcCacheSize))
+		if !fc.resolved {
+			fc.entry = funcEntryForIndex(rec.funcIndex)
+			if fc.entry == 0 {
+				fc.entry = symbolPCFuncInfoName(symbolBuf, fn.symbolPkg, fn.symbolName)
+			}
+			fc.function = publicFunctionName(funcInfoJoinName(fn.namePkg, fn.nameName))
+			if fc.function == "" {
+				fc.function = publicFunctionName(funcInfoJoinName(fn.symbolPkg, fn.symbolName))
+			}
+			fc.file = funcInfoJoinFile(fn.fileRoot, fn.fileName)
+			fc.line = int(fn.line)
+			if GOOS == "windows" {
+				fc.line = int(fn.line & runtimeFuncInfoLineMask)
+			}
+			fc.resolved = true
+		}
+		entry := fc.entry
+		if entry == 0 {
+			sym := addrInfoSymbol(pc)
+			entry = sym.entry
+		}
+		file := ""
+		fileID := uint64(rec.fileRoot)<<32 | uint64(rec.fileName)
+		if fileID != 0 {
+			var ok bool
+			if file, ok = fileCache[fileID]; !ok {
+				file = funcInfoJoinFile(rec.fileRoot, rec.fileName)
+				fileCache[fileID] = file
+			}
+		}
+		if file == "" {
+			file = fc.file
+		}
+		line := int(rec.line)
+		if line == 0 {
+			line = fc.line
+		}
+		startLine := fc.line
+		if GOOS == "windows" {
+			startLine = int(fn.line)
+		}
+		*(*runtimePCLineFrame)(unsafe.Add(frameBase, uintptr(nframes)*frameSize)) = runtimePCLineFrame{
+			pc:        pc,
+			sequence:  i,
+			entry:     entry,
+			function:  fc.function,
+			file:      file,
+			line:      line,
+			startLine: startLine,
+		}
+		nframes++
+	}
+	frames = frames[:nframes]
+	if GOOS == "windows" {
+		// COFF can fold adjacent zero-byte source anchors onto one final PC.
+		// Associative carrier sections retain their emission order, so collapse
+		// those aliases before the unstable PC sort and let the nearest source
+		// location win. ELF and Mach-O retain their established table path.
+		frames = uniqueRuntimePCLineFrames(frames)
+	}
+	sortRuntimePCLineFrames(frames)
+	frames = uniqueRuntimePCLineFrames(frames)
+	runtimePCLineFrames = frames
+	runtimePCLineIndex = buildRuntimePCLineIndex(frames)
+}
+
+func pcLineInfoForID(id uint64) *runtimePCLineRecord {
+	lo, hi := uintptr(0), runtimePCLineCount
+	for lo < hi {
+		mid := (lo + hi) >> 1
+		rec := pcLineAt(mid)
+		if rec.id >= id {
+			hi = mid
+		} else {
+			lo = mid + 1
+		}
+	}
+	if lo >= runtimePCLineCount {
+		return nil
+	}
+	rec := pcLineAt(lo)
+	if rec.id != id {
+		return nil
+	}
+	return rec
+}
+
+func symbolPC(symbol string) uintptr {
+	if symbol == "" {
+		return 0
+	}
+	buf := make([]byte, len(symbol)+1)
+	copy(buf, symbol)
+	return uintptr(clitedebug.Symbol((*c.Char)(unsafe.Pointer(&buf[0]))))
+}
+
+func sortRuntimePCLineFrames(frames []runtimePCLineFrame) {
+	count := len(frames)
+	if count < 2 {
+		return
+	}
+	// Keep this raw-pointer form in sync with sortRuntimeFuncPCFrames. PC-line
+	// tables are usually larger, so checked slice accesses in the partition
+	// loops can hit the same LLGo fixed-stack exhaustion even sooner.
+	quickSortRuntimePCLineFrames(unsafe.Pointer(&frames[0]), 0, count-1)
+}
+
+func runtimePCLineFrameAt(base unsafe.Pointer, index int) *runtimePCLineFrame {
+	return (*runtimePCLineFrame)(unsafe.Add(base, uintptr(index)*unsafe.Sizeof(runtimePCLineFrame{})))
+}
+
+func swapRuntimePCLineFrames(base unsafe.Pointer, i, j int) {
+	left := runtimePCLineFrameAt(base, i)
+	right := runtimePCLineFrameAt(base, j)
+	tmp := *left
+	*left = *right
+	*right = tmp
+}
+
+func runtimePCLineFrameLess(left, right *runtimePCLineFrame) bool {
+	if left.pc != right.pc {
+		return left.pc < right.pc
+	}
+	// PC anchors do not emit text bytes, so consecutive source statements can
+	// have the same address after optimization. Preserve their linker-section
+	// order and let deduplication below retain the last emitted statement.
+	return left.sequence < right.sequence
+}
+
+func quickSortRuntimePCLineFrames(base unsafe.Pointer, lo, hi int) {
+	for hi-lo > 16 {
+		mid := int(uint(lo+hi) >> 1)
+		if runtimePCLineFrameLess(runtimePCLineFrameAt(base, mid), runtimePCLineFrameAt(base, lo)) {
+			swapRuntimePCLineFrames(base, mid, lo)
+		}
+		if runtimePCLineFrameLess(runtimePCLineFrameAt(base, hi), runtimePCLineFrameAt(base, mid)) {
+			swapRuntimePCLineFrames(base, hi, mid)
+		}
+		if runtimePCLineFrameLess(runtimePCLineFrameAt(base, mid), runtimePCLineFrameAt(base, lo)) {
+			swapRuntimePCLineFrames(base, mid, lo)
+		}
+		pivot := *runtimePCLineFrameAt(base, mid)
+		i, j := lo, hi
+		for {
+			for runtimePCLineFrameLess(runtimePCLineFrameAt(base, i), &pivot) {
+				i++
+			}
+			for runtimePCLineFrameLess(&pivot, runtimePCLineFrameAt(base, j)) {
+				j--
+			}
+			if i >= j {
+				break
+			}
+			swapRuntimePCLineFrames(base, i, j)
+			i++
+			j--
+		}
+		if j-lo < hi-i {
+			quickSortRuntimePCLineFrames(base, lo, j)
+			lo = i
+		} else {
+			quickSortRuntimePCLineFrames(base, i, hi)
+			hi = j
+		}
+	}
+	for i := lo + 1; i <= hi; i++ {
+		x := *runtimePCLineFrameAt(base, i)
+		j := i - 1
+		for j >= lo && runtimePCLineFrameLess(&x, runtimePCLineFrameAt(base, j)) {
+			*runtimePCLineFrameAt(base, j+1) = *runtimePCLineFrameAt(base, j)
+			j--
+		}
+		*runtimePCLineFrameAt(base, j+1) = x
+	}
+}
+
+func uniqueRuntimePCLineFrames(frames []runtimePCLineFrame) []runtimePCLineFrame {
+	if len(frames) < 2 {
+		return frames
+	}
+	base := unsafe.Pointer(&frames[0])
+	size := unsafe.Sizeof(frames[0])
+	count := len(frames)
+	n := 1
+	for i := 1; i < count; i++ {
+		current := (*runtimePCLineFrame)(unsafe.Add(base, uintptr(i)*size))
+		previous := (*runtimePCLineFrame)(unsafe.Add(base, uintptr(n-1)*size))
+		if current.pc == previous.pc {
+			*previous = *current
+			continue
+		}
+		*(*runtimePCLineFrame)(unsafe.Add(base, uintptr(n)*size)) = *current
+		n++
+	}
+	return frames[:n]
+}
+
+// buildRuntimePCLineIndex reuses the same Go-style bucket geometry for
+// statement PC-line sites. Go stores dense per-function pcdata; LLGo keeps
+// statement sites as a separate sorted table for now, but the hot PC lookup
+// follows the same bucket/subbucket narrowing.
+func buildRuntimePCLineIndex(frames []runtimePCLineFrame) runtimePCFindIndex {
+	if len(frames) == 0 {
+		return runtimePCFindIndex{}
+	}
+	frameCount := len(frames)
+	frameBase := &frames[0]
+	frameSize := unsafe.Sizeof(*frameBase)
+	base := frameBase.pc &^ (runtimePCFindBucketSize - 1)
+	last := (*runtimePCLineFrame)(unsafe.Add(unsafe.Pointer(frameBase), uintptr(frameCount-1)*frameSize)).pc
+	if last < base {
+		return runtimePCFindIndex{}
+	}
+	nbuckets := (last-base)/runtimePCFindBucketSize + 1
+	if nbuckets > 1<<20 && nbuckets > uintptr(frameCount)*64 {
+		return runtimePCFindIndex{}
+	}
+	buckets := make([]runtimePCFindBucket, nbuckets)
+	bucketCount := len(buckets)
+	bucketBase := unsafe.Pointer(&buckets[0])
+	bucketSize := unsafe.Sizeof(buckets[0])
+	subSize := runtimePCFindBucketSize / runtimePCFindSubbucket
+	for b := 0; b < bucketCount; b++ {
+		bucket := (*runtimePCFindBucket)(unsafe.Add(bucketBase, uintptr(b)*bucketSize))
+		bucketStart := base + uintptr(b)*runtimePCFindBucketSize
+		baseIdx := runtimePCLineFrameIndexUnsafe(frameBase, frameCount, bucketStart)
+		if baseIdx < 0 {
+			baseIdx = 0
+		}
+		if baseIdx > frameCount-1 {
+			baseIdx = frameCount - 1
+		}
+		bucket.idx = uint32(baseIdx)
+		subbucketBase := unsafe.Pointer(&bucket.subbuckets[0])
+		for s := 0; s < runtimePCFindSubbucket; s++ {
+			pc := bucketStart + uintptr(s)*subSize
+			subIdx := runtimePCLineFrameIndexUnsafe(frameBase, frameCount, pc)
+			if subIdx < 0 {
+				subIdx = 0
+			}
+			if subIdx > frameCount-1 {
+				subIdx = frameCount - 1
+			}
+			// delta counts deduplicated PCs inside one bucket, so it is
+			// bounded by the bucket size and always fits in uint16.
+			delta := subIdx - baseIdx
+			if delta < 0 || delta > 0xffff {
+				return runtimePCFindIndex{}
+			}
+			*(*uint16)(unsafe.Add(subbucketBase, uintptr(s)*unsafe.Sizeof(uint16(0)))) = uint16(delta)
+		}
+	}
+	return runtimePCFindIndex{base: base, buckets: buckets}
+}
+
+func runtimePCLineFrameRange(pc uintptr) (int, int) {
+	frames := runtimePCLineFrames
+	if lo, hi, ok := runtimePCFindRange(runtimePCLineIndex, len(frames), pc); ok {
+		return lo, hi
+	}
+	return 0, len(frames)
+}
+
+func runtimePCLineFrameIndex(pc uintptr, exact bool) int {
+	frames := runtimePCLineFrames
+	if len(frames) == 0 {
+		return -1
+	}
+	lo, hi := runtimePCLineFrameRange(pc)
+	return runtimePCLineFrameIndexInRange(frames, pc, exact, lo, hi)
+}
+
+func runtimePCLineFrameIndexBinary(frames []runtimePCLineFrame, pc uintptr, exact bool) int {
+	return runtimePCLineFrameIndexInRange(frames, pc, exact, 0, len(frames))
+}
+
+// runtimePCLineFrameIndexUnsafe is the unchecked build-time counterpart of
+// runtimePCLineFrameIndexBinary. base points at n validated frames.
+func runtimePCLineFrameIndexUnsafe(base *runtimePCLineFrame, n int, pc uintptr) int {
+	lo, hi := 0, n
+	size := unsafe.Sizeof(*base)
+	for lo < hi {
+		mid := int(uint(lo+hi) >> 1)
+		frame := (*runtimePCLineFrame)(unsafe.Add(unsafe.Pointer(base), uintptr(mid)*size))
+		if frame.pc > pc {
+			hi = mid
+		} else {
+			lo = mid + 1
+		}
+	}
+	return lo - 1
+}
+
+func runtimePCLineFrameIndexInRange(frames []runtimePCLineFrame, pc uintptr, exact bool, lo, hi int) int {
+	for lo < hi {
+		mid := int(uint(lo+hi) >> 1)
+		if frames[mid].pc > pc || (exact && frames[mid].pc == pc) {
+			hi = mid
+		} else {
+			lo = mid + 1
+		}
+	}
+	if exact {
+		if lo >= len(frames) || frames[lo].pc != pc {
+			return -1
+		}
+		return lo
+	}
+	idx := lo - 1
+	if idx < 0 {
+		return -1
+	}
+	return idx
+}
+
+func pcLineFrameForPC(pc, entry uintptr) (pcSymbol, bool) {
+	if pc == 0 {
+		return pcSymbol{}, false
+	}
+	initRuntimePCLineFrames()
+	frames := runtimePCLineFrames
+	idx := runtimePCLineFrameIndex(pc, false)
+	if idx < 0 {
+		return pcSymbol{}, false
+	}
+	frame := frames[idx]
+	// When the caller knows the function entry, only accept a site from the
+	// same function. A site with an unresolved entry cannot prove it belongs
+	// to the queried function, so it must be rejected too — otherwise a
+	// nearest-below hit from a neighboring function leaks its file/line.
+	if entry != 0 && frame.entry != entry {
+		return pcSymbol{}, false
+	}
+	return pcSymbol{
+		pc:        pc,
+		entry:     frame.entry,
+		function:  frame.function,
+		file:      frame.file,
+		line:      frame.line,
+		startLine: frame.startLine,
+		ok:        true,
+	}, true
+}
+
+func pcLineFrameForExactPC(pc uintptr) (pcSymbol, bool) {
+	if pc == 0 {
+		return pcSymbol{}, false
+	}
+	initRuntimePCLineFrames()
+	frames := runtimePCLineFrames
+	idx := runtimePCLineFrameIndex(pc, true)
+	if idx < 0 {
+		return pcSymbol{}, false
+	}
+	frame := frames[idx]
+	return pcSymbol{
+		pc:        pc,
+		entry:     frame.entry,
+		function:  frame.function,
+		file:      frame.file,
+		line:      frame.line,
+		startLine: frame.startLine,
+		ok:        true,
+	}, true
+}
+
+func mergePCLineSymbol(base, line pcSymbol) pcSymbol {
+	if line.entry == 0 {
+		line.entry = base.entry
+	}
+	if line.function == "" {
+		line.function = base.function
+	}
+	if line.file == "" {
+		line.file = base.file
+	}
+	if line.line == 0 {
+		line.line = base.line
+	}
+	if line.startLine == 0 {
+		line.startLine = base.startLine
+	}
+	line.ok = true
+	return line
+}
+
+// prebuiltTextContains reports whether pc falls inside the text range the
+// prebuilt table covers (first entry .. end-of-text sentinel). When the
+// link-phase rewrite was skipped (e.g. blob overflow) the first-use frame
+// table provides the bounds instead — the pc-1 return-address convention
+// and the walk bound must not silently turn off with the fast table, or
+// frames get attributed to the next statement (a return address equals the
+// following anchor exactly).
+func prebuiltTextContains(pc uintptr) bool {
+	if n := len(runtimePrebuiltFtab); n > 0 {
+		return pc >= runtimePrebuiltBase && pc-runtimePrebuiltBase < uintptr(runtimePrebuiltFtab[n-1].entryOff)
+	}
+	if frames := runtimeFuncPCFrames; len(frames) > 0 {
+		const lastFuncSlack = 1 << 20
+		return pc >= frames[0].entry && pc < frames[len(frames)-1].entry+lastFuncSlack
+	}
+	return false
+}
+
+// frameSymbolResultCache memoizes full symbolization results per pc. Deep
+// CallersFrames walks re-symbolize the same return addresses on every walk,
+// and a miss below costs a dladdr; entries are immutable heap nodes so the
+// benign-racy word-sized store never tears.
+type frameSymbolResult struct {
+	pc  uintptr
+	sym pcSymbol
+}
+
+const frameSymbolResultCacheSize = 4096
+
+var frameSymbolResultCache [frameSymbolResultCacheSize]*frameSymbolResult
+
+// minLegalPC: nothing below the zero page can be code. Values under it are
+// null-ish slots or shadow-stack synthetic markers, never return addresses.
+const minLegalPC = 4096
+
+func frameSymbol(pc uintptr) pcSymbol {
+	if pc > minLegalPC {
+		i := (pc >> 2) & uintptr(len(frameSymbolResultCache)-1)
+		if e := frameSymbolResultCache[i]; e != nil && e.pc == pc {
+			return e.sym
+		}
+		sym := frameSymbolUncached(pc)
+		frameSymbolResultCache[i] = &frameSymbolResult{pc: pc, sym: sym}
+		return sym
+	}
+	return frameSymbolUncached(pc)
+}
+
+func frameSymbolUncached(pc uintptr) pcSymbol {
+	if pc&3 != 0 && !prebuiltTextContains(pc+1) {
+		// Unaligned pcs outside the text range are shadow-stack synthetic
+		// markers. Text-range pcs — return addresses minus one, and on
+		// amd64 any instruction pc — flow through the normal lookups:
+		// pcline nearest-below is byte-exact, no alignment games (rounding
+		// by instruction size was an arm64-only assumption).
+		if frame, ok := rtdebug.FrameForPC(pc); ok {
+			return pcSymbol{
+				pc:        pc,
+				entry:     frame.Entry,
+				function:  frame.Function,
+				file:      frame.File,
+				line:      frame.Line,
+				startLine: frame.StartLine,
+				ok:        true,
+			}
+		}
+	}
+	if pc == 0 {
+		sym := addrInfoSymbol(pc)
+		if frame, ok := rtdebug.FrameForPC(pc); ok {
+			return pcSymbol{
+				pc:        pc,
+				entry:     frame.Entry,
+				function:  frame.Function,
+				file:      frame.File,
+				line:      frame.Line,
+				startLine: frame.StartLine,
+				ok:        true,
+			}
+		}
+		return sym
+	}
+	if lineSym, ok := pcLineFrameForExactPC(pc); ok {
+		return lineSym
+	}
+	if lineSym, ok := pcLineFrameForExactPC(pc - 1); ok {
+		lineSym.pc = pc
+		return lineSym
+	}
+	// Resolve through the prebuilt table before touching the dynamic
+	// loader: frames in packages without pcline records (the runtime
+	// itself) otherwise cost a dladdr each on the first full-stack walk.
+	if runtimeFuncPCFramesBuilt() {
+		if funcSym, ok := funcPCFrameForPC(pc); ok {
+			funcSym.pc = pc
+			return refinePCSymbolLine(funcSym, pc)
+		}
+	}
+	sym := addrInfoSymbol(pc)
+	if lineSym, ok := pcLineFrameForPC(pc, sym.entry); ok {
+		return mergePCLineSymbol(sym, lineSym)
+	}
+	if sym.entry == 0 || pc > sym.entry {
+		if callSym := addrInfoSymbol(pc - 1); callSym.ok {
+			if lineSym, ok := pcLineFrameForPC(pc-1, callSym.entry); ok {
+				lineSym.pc = pc
+				return mergePCLineSymbol(callSym, lineSym)
+			}
+			callSym.pc = pc
+			return callSym
+		}
+	}
+	if !sym.ok {
+		if funcSym, ok := funcPCFrameForPC(pc); ok {
+			return funcSym
+		}
+	}
+	if frame, ok := rtdebug.FrameForPC(pc); ok {
+		return pcSymbol{
+			pc:        pc,
+			entry:     frame.Entry,
+			function:  frame.Function,
+			file:      frame.File,
+			line:      frame.Line,
+			startLine: frame.StartLine,
+			ok:        true,
+		}
+	}
+	return sym
+}
+
 func (ci *Frames) Next() (frame Frame, more bool) {
+	ensureRuntimePCLN()
 	for len(ci.frames) < 2 {
 		// Find the next frame.
 		// We need to look for 2 frames so we know what
@@ -92,17 +2172,51 @@ func (ci *Frames) Next() (frame Frame, more bool) {
 		} else {
 			pc, ci.callers = ci.callers[0], ci.callers[1:]
 		}
-		info := &debug.Info{}
-		if debug.Addrinfo(unsafe.Pointer(pc), info) == 0 {
-			break
+		// Physical pcs are return addresses; attribute them to the call
+		// instruction (Go's pc-1 convention). Statement labels can land
+		// exactly on a return address — the next statement's marker sits
+		// right after the call — so a raw-pc nearest-below lookup would
+		// report the following line. Synthetic shadow-stack pcs live
+		// outside the text range and keep raw-pc semantics.
+		lookupPC := pc
+		if prebuiltTextContains(pc) {
+			lookupPC = pc - 1
+		}
+		sym := frameSymbol(lookupPC)
+		sym.pc = pc
+		if GOOS == "windows" {
+			// Win64 keeps the wrapper marker in the high bit of the private
+			// start-line field while walking. Public Frames expose only the Go
+			// source line, matching the standard runtime API.
+			sym.startLine = int(uint32(sym.startLine) & runtimeFuncInfoLineMask)
+		}
+		if !sym.ok {
+			ci.frames = append(ci.frames, Frame{
+				PC:        pc,
+				Function:  unknownFunctionName(pc),
+				File:      "",
+				Line:      0,
+				startLine: 0,
+				Entry:     0,
+			})
+			continue
+		}
+		fn := sym.function
+		if fn == "" {
+			fn = unknownFunctionName(pc)
+		}
+		var f *Func
+		if sym.entry != 0 || fn != "" {
+			f = frameFuncForPC(pc, sym, fn)
 		}
 		ci.frames = append(ci.frames, Frame{
 			PC:        pc,
-			Function:  safeGoString(info.Fname, "<unknown function>"),
-			File:      safeGoString(info.Sname, "<unknown file>"),
-			Line:      0,
-			startLine: 0,
-			Entry:     uintptr(info.Saddr),
+			Func:      f,
+			Function:  fn,
+			File:      sym.file,
+			Line:      sym.line,
+			startLine: sym.startLine,
+			Entry:     sym.entry,
 		})
 	}
 
@@ -137,7 +2251,34 @@ func CallersFrames(callers []uintptr) *Frames {
 
 // A Func represents a Go function in the running binary.
 type Func struct {
-	opaque struct{} // unexported field to disallow conversions
+	entry uintptr
+	name  string
+	pc    uintptr
+	file  string
+	line  int
+}
+
+func (f *Func) Name() string {
+	if f == nil {
+		return ""
+	}
+	return f.name
+}
+
+func (f *Func) Entry() uintptr {
+	if f == nil {
+		return 0
+	}
+	return f.entry
+}
+
+func (f *Func) FileLine(pc uintptr) (file string, line int) {
+	ensureRuntimePCLN()
+	if f != nil && f.pc == pc && (f.file != "" || f.line != 0) {
+		return f.file, f.line
+	}
+	sym := frameSymbol(pc)
+	return sym.file, sym.line
 }
 
 // moduledata records information about the layout of the executable

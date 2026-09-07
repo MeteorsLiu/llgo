@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2024 The GoPlus Authors (goplus.org). All rights reserved.
+ * Copyright (c) 2024 The XGo Authors (xgo.dev). All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -18,19 +18,45 @@ package ssa
 
 import (
 	"runtime"
+	"strings"
 
-	"github.com/goplus/llvm"
+	archcfg "github.com/xgo-dev/llgo/internal/goarch"
+	"github.com/xgo-dev/llgo/internal/optlevel"
+	intllvm "github.com/xgo-dev/llgo/internal/xtool/llvm"
+	"github.com/xgo-dev/llvm"
 )
 
 // -----------------------------------------------------------------------------
 
 type Target struct {
-	GOOS   string
-	GOARCH string
-	GOARM  string // "5", "6", "7" (default)
+	GOOS                    string
+	GOARCH                  string
+	GO386                   string // "sse2" (default) or "softfloat"
+	GOAMD64                 string // "v1" (default), "v2", "v3", or "v4"
+	GOARM                   string // "5", "6", "7" (default), with optional float mode
+	GOARM64                 string // "v8.0" (default) through "v9.5", with optional extensions
+	Target                  string // target name from -target flag (e.g., "esp32", "arm7tdmi", "wasi")
+	LLVMTarget              string // physical LLVM target selected by a target configuration
+	WasmABI                 string // explicit WebAssembly ecosystem ABI/profile
+	OptLevel                optlevel.Level
+	SaturatingFloatToUint32 bool
 }
 
-func (p *Target) targetData() llvm.TargetData {
+func (p *Target) effectiveGOOS() string {
+	if p.GOOS == "" {
+		return runtime.GOOS
+	}
+	return p.GOOS
+}
+
+func (p *Target) effectiveGOARCH() string {
+	if p.GOARCH == "" {
+		return runtime.GOARCH
+	}
+	return p.GOARCH
+}
+
+func (p *Target) targetInfo() (llvm.TargetData, llvm.TargetMachine) {
 	spec := p.Spec()
 	if spec.Triple == "" {
 		spec.Triple = llvm.DefaultTargetTriple()
@@ -39,30 +65,66 @@ func (p *Target) targetData() llvm.TargetData {
 	if err != nil {
 		panic(err)
 	}
-	machine := t.CreateTargetMachine(spec.Triple, spec.CPU, spec.Features, llvm.CodeGenLevelDefault, llvm.RelocDefault, llvm.CodeModelDefault)
-	return machine.CreateTargetData()
+	machine := t.CreateTargetMachineWithOptions(
+		spec.Triple,
+		spec.CPU,
+		spec.Features,
+		p.codeGenOptLevel(),
+		p.targetRelocMode(),
+		llvm.CodeModelDefault,
+		p.targetMachineOptions(),
+	)
+	return machine.CreateTargetData(), machine
 }
 
-/*
-func (p *Program) targetMachine() llvm.TargetMachine {
-	if p.tm.C == nil {
-		spec := p.target.toSpec()
-		target, err := llvm.GetTargetFromTriple(spec.triple)
-		if err != nil {
-			panic(err)
-		}
-		p.tm = target.CreateTargetMachine(
-			spec.triple,
-			spec.cpu,
-			spec.features,
-			llvm.CodeGenLevelDefault,
-			llvm.RelocDefault,
-			llvm.CodeModelDefault,
-		)
+func (p *Target) effectiveOptLevel() optlevel.Level {
+	if p != nil && p.OptLevel.IsValid() {
+		return p.OptLevel
 	}
-	return p.tm
+	if p != nil && p.Target != "" {
+		return optlevel.TargetDefault
+	}
+	return optlevel.Default
 }
-*/
+
+func (p *Target) codeGenOptLevel() llvm.CodeGenOptLevel {
+	switch p.effectiveOptLevel() {
+	case optlevel.O0:
+		return llvm.CodeGenLevelNone
+	case optlevel.O1:
+		return llvm.CodeGenLevelLess
+	case optlevel.O3:
+		return llvm.CodeGenLevelAggressive
+	case optlevel.O2, optlevel.Os, optlevel.Oz:
+		return llvm.CodeGenLevelDefault
+	default:
+		return llvm.CodeGenLevelNone
+	}
+}
+
+func (p *Target) targetRelocMode() llvm.RelocMode {
+	if p.useNativeObjectSections() {
+		return llvm.RelocPIC
+	}
+	return llvm.RelocDefault
+}
+
+func (p *Target) targetMachineOptions() llvm.TargetMachineOptions {
+	if !p.useNativeObjectSections() {
+		return llvm.TargetMachineOptions{}
+	}
+	return llvm.TargetMachineOptions{
+		FunctionSections:   true,
+		DataSections:       true,
+		UniqueSectionNames: true,
+	}
+}
+
+func (p *Target) useNativeObjectSections() bool {
+	goos := p.effectiveGOOS()
+	goarch := p.effectiveGOARCH()
+	return p.Target == "" && goos == runtime.GOOS && goarch == runtime.GOARCH && goarch != "wasm"
+}
 
 type TargetSpec struct {
 	Triple   string
@@ -70,94 +132,114 @@ type TargetSpec struct {
 	Features string
 }
 
+func (p *Target) goArchitectureSetting(value string) string {
+	if p.Target != "" {
+		return ""
+	}
+	return value
+}
+
 func (p *Target) Spec() (spec TargetSpec) {
 	// Configure based on GOOS/GOARCH environment variables (falling back to
 	// runtime.GOOS/runtime.GOARCH), and generate a LLVM target based on it.
-	var llvmarch string
-	var goarch = p.GOARCH
-	var goos = p.GOOS
-	if goarch == "" {
-		goarch = runtime.GOARCH
+	goarch := p.effectiveGOARCH()
+	goos := p.effectiveGOOS()
+	goarm := p.goArchitectureSetting(p.GOARM)
+	spec.Triple = intllvm.GetTargetTripleWithGOARM(goos, goarch, goarm)
+	// A native toolchain profile can select a physical ABI triple that differs
+	// from the GOOS/GOARCH default (for example Windows GNU instead of MSVC).
+	// Named embedded targets keep their existing backend triple here: their
+	// external compiler may support a target such as Xtensa that the host LLVM
+	// library used to build LLGo does not register.
+	if p.LLVMTarget != "" && (p.Target == "" || p.WasmABI != "") {
+		spec.Triple = p.LLVMTarget
 	}
-	if goos == "" {
-		goos = runtime.GOOS
+	// Build validates these settings before constructing Target. Spec also
+	// accepts hand-built Targets, so it intentionally uses each resolver's
+	// documented Go-default fallback when its error cannot be returned here.
+	backendArch := goarch
+	if p.WasmABI != "" && strings.HasPrefix(p.LLVMTarget, "wasm") {
+		// Some legacy freestanding/component target configs borrow linux/arm
+		// only for source selection. Their physical backend remains wasm and
+		// must not receive ARM CPU features.
+		backendArch = "wasm"
 	}
-	switch goarch {
-	case "386":
-		llvmarch = "i386"
-	case "amd64":
-		llvmarch = "x86_64"
-	case "arm64":
-		llvmarch = "aarch64"
-	case "arm":
-		switch p.GOARM {
-		case "5":
-			llvmarch = "armv5"
-		case "6":
-			llvmarch = "armv6"
-		default:
-			llvmarch = "armv7"
-		}
-	case "wasm":
-		llvmarch = "wasm32"
-	default:
-		llvmarch = goarch
-	}
-	llvmvendor := "unknown"
-	llvmos := goos
-	switch goos {
-	case "darwin":
-		// Use macosx* instead of darwin, otherwise darwin/arm64 will refer
-		// to iOS!
-		llvmos = "macosx"
-		if llvmarch == "aarch64" {
-			// Looks like Apple prefers to call this architecture ARM64
-			// instead of AArch64.
-			llvmarch = "arm64"
-			llvmos = "macosx"
-		}
-		llvmvendor = "apple"
-	case "wasip1":
-		llvmos = "wasip1"
-	}
-	// Target triples (which actually have four components, but are called
-	// triples for historical reasons) have the form:
-	//   arch-vendor-os-environment
-	spec.Triple = llvmarch + "-" + llvmvendor + "-" + llvmos
-	if llvmos == "windows" {
-		spec.Triple += "-gnu"
-	} else if goarch == "arm" {
-		spec.Triple += "-gnueabihf"
-	}
-	switch goarch {
+	switch backendArch {
 	case "386":
 		spec.CPU = "pentium4"
-		spec.Features = "+cx8,+fxsr,+mmx,+sse,+sse2,+x87"
+		go386, _ := archcfg.Resolve386(p.goArchitectureSetting(p.GO386))
+		if go386 == "softfloat" {
+			spec.Features = "+cx8,+fxsr,+mmx,+soft-float,-sse,-sse2,-x87"
+		} else {
+			spec.Features = "+cx8,+fxsr,+mmx,+sse,+sse2,+x87"
+		}
 	case "amd64":
+		goamd64, _ := archcfg.ResolveAMD64(p.goArchitectureSetting(p.GOAMD64))
 		spec.CPU = "x86-64"
+		if goamd64 != "v1" {
+			spec.CPU += "-" + goamd64
+		}
 		spec.Features = "+cx8,+fxsr,+mmx,+sse,+sse2,+x87"
 	case "arm":
 		spec.CPU = "generic"
-		switch llvmarch {
-		case "armv5":
-			spec.Features = "+armv5t,+strict-align,-aes,-bf16,-d32,-dotprod,-fp-armv8,-fp-armv8d16,-fp-armv8d16sp,-fp-armv8sp,-fp16,-fp16fml,-fp64,-fpregs,-fullfp16,-mve.fp,-neon,-sha2,-thumb-mode,-vfp2,-vfp2sp,-vfp3,-vfp3d16,-vfp3d16sp,-vfp3sp,-vfp4,-vfp4d16,-vfp4d16sp,-vfp4sp"
-		case "armv6":
+		arm, _ := archcfg.ParseARM(goarm)
+		switch arm.Version {
+		case "5":
+			if arm.SoftFloat {
+				spec.Features = "+armv5t,+strict-align,-aes,-bf16,-d32,-dotprod,-fp-armv8,-fp-armv8d16,-fp-armv8d16sp,-fp-armv8sp,-fp16,-fp16fml,-fp64,-fpregs,-fullfp16,-mve.fp,-neon,-sha2,-thumb-mode,-vfp2,-vfp2sp,-vfp3,-vfp3d16,-vfp3d16sp,-vfp3sp,-vfp4,-vfp4d16,-vfp4d16sp,-vfp4sp"
+			} else {
+				// GOARM=5,hardfloat explicitly enables VFPv2 without also
+				// carrying contradictory disable tokens for the same features.
+				spec.Features = "+armv5t,+strict-align,-aes,-bf16,-d32,-dotprod,-fp-armv8,-fp-armv8d16,-fp-armv8d16sp,-fp-armv8sp,-fp16,-fp16fml,+fp64,+fpregs,-fullfp16,-mve.fp,-neon,-sha2,-thumb-mode,+vfp2,+vfp2sp,-vfp3,-vfp3d16,-vfp3d16sp,-vfp3sp,-vfp4,-vfp4d16,-vfp4d16sp,-vfp4sp"
+			}
+		case "6":
 			spec.Features = "+armv6,+dsp,+fp64,+strict-align,+vfp2,+vfp2sp,-aes,-d32,-fp-armv8,-fp-armv8d16,-fp-armv8d16sp,-fp-armv8sp,-fp16,-fp16fml,-fullfp16,-neon,-sha2,-thumb-mode,-vfp3,-vfp3d16,-vfp3d16sp,-vfp3sp,-vfp4,-vfp4d16,-vfp4d16sp,-vfp4sp"
-		case "armv7":
+		case "7":
 			spec.Features = "+armv7-a,+d32,+dsp,+fp64,+neon,+vfp2,+vfp2sp,+vfp3,+vfp3d16,+vfp3d16sp,+vfp3sp,-aes,-fp-armv8,-fp-armv8d16,-fp-armv8d16sp,-fp-armv8sp,-fp16,-fp16fml,-fullfp16,-sha2,-thumb-mode,-vfp4,-vfp4d16,-vfp4d16sp,-vfp4sp"
+		}
+		if arm.SoftFloat {
+			spec.Features += ",+soft-float"
 		}
 	case "arm64":
 		spec.CPU = "generic"
-		if goos == "darwin" {
-			spec.Features = "+neon"
-		} else { // windows, linux
-			spec.Features = "+neon,-fmv"
+		arm64, _ := archcfg.ParseARM64(p.goArchitectureSetting(p.GOARM64))
+		archFeature := arm64.Version + "a"
+		if arm64.Version == "v9.0" {
+			archFeature = "v9a"
 		}
+		features := make([]string, 0, 5)
+		if arm64.Version != "v8.0" {
+			features = append(features, "+"+archFeature)
+		}
+		features = append(features, "+neon")
+		if arm64.LSE {
+			features = append(features, "+lse")
+		}
+		if arm64.Crypto {
+			features = append(features, "+crypto")
+		}
+		if goos != "darwin" { // windows, linux
+			features = append(features, "-fmv")
+		}
+		spec.Features = strings.Join(features, ",")
 	case "wasm":
 		spec.CPU = "generic"
 		spec.Features = "+bulk-memory,+mutable-globals,+nontrapping-fptoint,+sign-ext"
 	}
 	return
+}
+
+func StripModuleTarget(ir string) string {
+	var b strings.Builder
+	for _, line := range strings.SplitAfter(ir, "\n") {
+		trimmed := strings.TrimSuffix(line, "\n")
+		if strings.HasPrefix(trimmed, "target datalayout = ") ||
+			strings.HasPrefix(trimmed, "target triple = ") {
+			continue
+		}
+		b.WriteString(line)
+	}
+	return b.String()
 }
 
 // -----------------------------------------------------------------------------

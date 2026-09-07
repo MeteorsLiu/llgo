@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2024 The GoPlus Authors (goplus.org). All rights reserved.
+ * Copyright (c) 2024 The XGo Authors (xgo.dev). All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,19 +15,22 @@
  */
 
 // Copyright 2009 The Go Authors. All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Use of this source code is governed by a BSD-style license.
+// See LICENSES/Go-BSD-3-Clause.txt at this module root for license terms.
 
 package reflect
 
 import (
 	"strconv"
+	"sync"
+	"unicode"
+	"unicode/utf8"
 	"unsafe"
 
-	"github.com/goplus/llgo/runtime/abi"
-	"github.com/goplus/llgo/runtime/internal/lib/sync"
-	"github.com/goplus/llgo/runtime/internal/runtime"
-	"github.com/goplus/llgo/runtime/internal/runtime/goarch"
+	"github.com/xgo-dev/llgo/runtime/abi"
+	clite "github.com/xgo-dev/llgo/runtime/internal/clite"
+	"github.com/xgo-dev/llgo/runtime/internal/runtime"
+	"github.com/xgo-dev/llgo/runtime/internal/runtime/goarch"
 )
 
 // A Kind represents the specific kind of type that a Type represents.
@@ -100,6 +103,18 @@ const (
 	SendDir                                 // chan<-
 	BothDir = RecvDir | SendDir             // chan
 )
+
+func (d ChanDir) String() string {
+	switch d {
+	case SendDir:
+		return "chan<-"
+	case RecvDir:
+		return "<-chan"
+	case BothDir:
+		return "chan"
+	}
+	return "ChanDir" + strconv.Itoa(int(d))
+}
 
 // arrayType represents a fixed array type.
 type arrayType = abi.ArrayType
@@ -290,9 +305,17 @@ func (t *rtype) Method(i int) (m Method) {
 	}
 	mt := FuncOf(in, out, ft.Variadic())
 	m.Type = mt
-	m.Func = Value{&mt.(*rtype).t, p.Tfn_, fl}
+	m.Func = methodFuncValue(&mt.(*rtype).t, p.Tfn_, fl)
 	m.Index = i
 	return m
+}
+
+func methodFuncValue(ft *abi.Type, fn unsafe.Pointer, fl flag) Value {
+	ct := closureOf((*funcType)(unsafe.Pointer(ft)))
+	c := unsafe_New(ct)
+	*(*unsafe.Pointer)(c) = fn
+	*(*unsafe.Pointer)(add(c, goarch.PtrSize, "closure data field")) = nil
+	return Value{ct, c, fl | flagIndir}
 }
 
 func (t *rtype) MethodByName(name string) (m Method, ok bool) {
@@ -333,6 +356,9 @@ func (t *rtype) PkgPath() string {
 	}
 	ut := t.uncommon()
 	if ut == nil {
+		if t.t.Kind() == abi.UnsafePointer {
+			return "unsafe"
+		}
 		return ""
 	}
 	return ut.PkgPath_
@@ -380,6 +406,10 @@ func toRType(t *abi.Type) *rtype {
 func elem(t *abi.Type) *abi.Type {
 	et := t.Elem()
 	if et != nil {
+		if et.IsClosure() {
+			ft := toFuncType(et.StructType())
+			return &ft.Type
+		}
 		return et
 	}
 	panic("reflect: Elem of invalid type " + stringFor(t))
@@ -450,7 +480,7 @@ func (t *rtype) In(i int) Type {
 		panic("reflect: In of non-func type " + t.String())
 	}
 	tt := (*abi.FuncType)(unsafe.Pointer(t))
-	return toType(tt.In[i])
+	return toPublicType(tt.In[i])
 }
 
 func (t *rtype) NumIn() int {
@@ -474,7 +504,24 @@ func (t *rtype) Out(i int) Type {
 		panic("reflect: Out of non-func type " + t.String())
 	}
 	tt := (*abi.FuncType)(unsafe.Pointer(t))
-	return toType(tt.Out[i])
+	return toPublicType(tt.Out[i])
+}
+
+func toPublicType(typ *abi.Type) Type {
+	if typ.IsClosure() {
+		typ = &toFuncType((*abi.StructType)(unsafe.Pointer(typ))).Type
+	} else if typ.Kind() == abi.Pointer {
+		elem := typ.Elem()
+		if elem == nil || !elem.IsClosure() {
+			return toType(typ)
+		}
+		// A pointer to a function uses a pointer to LLGo's closure struct in
+		// its physical signature. Canonicalize the element before exposing
+		// the reflect.Type, otherwise *NamedFunc from a function parameter is
+		// not identical to PointerTo(TypeOf(NamedFunc)).
+		return PointerTo(toPublicType(elem))
+	}
+	return toType(typ)
 }
 
 func (t *rtype) IsVariadic() bool {
@@ -635,7 +682,7 @@ func (t *structType) Field(i int) (f StructField) {
 		panic("reflect: Field index out of bounds")
 	}
 	p := &t.Fields[i]
-	f.Type = toType(p.Typ)
+	f.Type = toPublicType(p.Typ)
 	f.Name = p.Name_
 	f.Anonymous = p.Embedded()
 	if !abi.IsExported(p.Name_) {
@@ -817,12 +864,124 @@ func TypeOf(i any) Type {
 	}
 	// check closure type
 	if eface.typ.IsClosure() {
-		ft := eface.typ.StructType().Fields[0].Typ.FuncType()
+		ft := toFuncType(eface.typ.StructType())
 		return toType(&ft.Type)
 	}
 	// Noescape so this doesn't make i to escape. See the comment
 	// at Value.typ for why this is safe.
 	return toType((*abi.Type)(unsafe.Pointer(eface.typ)))
+}
+
+var namedFuncMap sync.Map // map[*abi.StructType]*abi.FuncType
+
+func toFuncType(typ *abi.StructType) *abi.FuncType {
+	if !typ.HasName() {
+		return typ.Fields[0].Typ.FuncType()
+	}
+	if i, ok := namedFuncMap.Load(typ); ok {
+		return i.(*abi.FuncType)
+	}
+	size := unsafe.Sizeof(abi.FuncType{})
+	u := typ.Uncommon()
+	if u != nil {
+		size += unsafe.Sizeof(abi.UncommonType{}) + uintptr(u.Mcount)*unsafe.Sizeof(abi.Method{})
+	}
+	ftyp := typ.Fields[0].Typ.FuncType()
+	ptr := runtime.AllocU(size)
+	t := (*abi.FuncType)(ptr)
+	t.Size_ = ftyp.Size_
+	t.PtrBytes = ftyp.PtrBytes
+	t.Hash = fnv1(typ.Hash, []byte("-funcType")...)
+	t.TFlag = ftyp.TFlag | abi.TFlagNamed
+	t.Align_ = ftyp.Align_
+	t.FieldAlign_ = ftyp.FieldAlign_
+	t.Kind_ = ftyp.Kind_
+	t.Equal = ftyp.Equal
+	t.GCData = ftyp.GCData
+	t.Str_ = typ.Str_
+	t.In = ftyp.In
+	t.Out = ftyp.Out
+	if typ.TFlag&abi.TFlagExtraStar != 0 {
+		t.TFlag |= abi.TFlagExtraStar
+	}
+	if u != nil {
+		t.TFlag |= abi.TFlagUncommon
+		tu := t.Uncommon()
+		tu.PkgPath_ = u.PkgPath_
+		tu.Mcount = u.Mcount
+		tu.Xcount = u.Xcount
+		tu.Moff = u.Moff
+		uptr := add(unsafe.Pointer(u), uintptr(u.Moff), "t.mcount > 0")
+		tptr := add(unsafe.Pointer(tu), uintptr(tu.Moff), "t.mcount > 0")
+
+		for i := 0; i < int(u.Mcount); i++ {
+			uelemPtr := add(uptr, uintptr(i)*unsafe.Sizeof(abi.Method{}), "accessing method element")
+			telemPtr := add(tptr, uintptr(i)*unsafe.Sizeof(abi.Method{}), "accessing method element")
+			*(*abi.Method)(telemPtr) = *(*abi.Method)(uelemPtr)
+		}
+	}
+	tt, _ := namedFuncMap.LoadOrStore(typ, t)
+	return tt.(*abi.FuncType)
+}
+
+func toClosureType(typ *abi.FuncType) *abi.StructType {
+	size := unsafe.Sizeof(abi.StructType{})
+	u := typ.Uncommon()
+	if u != nil {
+		size += unsafe.Sizeof(abi.UncommonType{}) + uintptr(u.Mcount)*unsafe.Sizeof(abi.Method{})
+	}
+	ftyp := typ
+	fnstr := funcStr(ftyp)
+	for _, t := range typelist {
+		if t.Kind() == abi.Func && t.String() == fnstr {
+			ftyp = t.FuncType()
+			break
+		}
+	}
+	ptr := runtime.AllocU(size)
+	t := (*abi.StructType)(ptr)
+	t.Size_ = ftyp.Size_
+	t.PtrBytes = ftyp.PtrBytes
+	t.Hash = fnv1(typ.Hash, []byte("-structType")...)
+	t.TFlag = ftyp.TFlag | abi.TFlagNamed | abi.TFlagClosure
+	t.Align_ = ftyp.Align_
+	t.FieldAlign_ = ftyp.FieldAlign_
+	t.Kind_ = uint8(abi.Struct)
+	t.Equal = ftyp.Equal
+	t.GCData = ftyp.GCData
+	t.Str_ = typ.Str_
+	t.Fields = []abi.StructField{
+		abi.StructField{
+			Name_: "$f",
+			Typ:   &ftyp.Type,
+		}, abi.StructField{
+			Name_:  "$data",
+			Typ:    unsafePointerType,
+			Offset: pointerSize,
+		},
+	}
+	t.PkgPath_ = ""
+	if typ.TFlag&abi.TFlagExtraStar != 0 {
+		t.TFlag |= abi.TFlagExtraStar
+	}
+	if u != nil {
+		t.TFlag |= abi.TFlagUncommon
+		tu := t.Uncommon()
+		tu.PkgPath_ = u.PkgPath_
+		tu.Mcount = u.Mcount
+		tu.Xcount = u.Xcount
+		tu.Moff = u.Moff
+		uptr := add(unsafe.Pointer(u), uintptr(u.Moff), "t.mcount > 0")
+		tptr := add(unsafe.Pointer(tu), uintptr(tu.Moff), "t.mcount > 0")
+
+		for i := 0; i < int(u.Mcount); i++ {
+			uelemPtr := add(uptr, uintptr(i)*unsafe.Sizeof(abi.Method{}), "accessing method element")
+			telemPtr := add(tptr, uintptr(i)*unsafe.Sizeof(abi.Method{}), "accessing method element")
+			*(*abi.Method)(telemPtr) = *(*abi.Method)(uelemPtr)
+		}
+	}
+	namedFuncMap.Store(t, typ)
+	return t
 }
 
 // rtypeOf directly extracts the *rtype of the provided value.
@@ -858,26 +1017,27 @@ func (t *rtype) ptrTo() *abi.Type {
 	}
 
 	// Look in known types.
-	s := "*" + t.String()
-	// // TODO typesByString
-	// /*
-	// 	for _, tt := range typesByString(s) {
-	// 		p := (*ptrType)(unsafe.Pointer(tt))
-	// 		if p.Elem != &t.t {
-	// 			continue
-	// 		}
-	// 		pi, _ := ptrMap.LoadOrStore(t, p)
-	// 		return &pi.(*ptrType).Type
-	// 	}
-	// */
+	for _, tt := range typesByString("*" + t.String()) {
+		p := (*ptrType)(unsafe.Pointer(tt))
+		if p.Elem != &t.t {
+			continue
+		}
+		pi, _ := ptrMap.LoadOrStore(t, p)
+		return &pi.(*ptrType).Type
+	}
 
 	// Create a new ptrType starting with the description
 	// of an *unsafe.Pointer.
 	var iptr any = (*unsafe.Pointer)(nil)
 	prototype := *(**ptrType)(unsafe.Pointer(&iptr))
 	pp := *prototype
-
-	pp.Str_ = s //resolveReflectName(newName(s, "", false, false))
+	if at.TFlag&abi.TFlagExtraStar != 0 {
+		pp.Str_ = "**" + at.Str_
+		pp.TFlag &= ^abi.TFlagExtraStar
+	} else {
+		pp.Str_ = at.Str_
+		pp.TFlag |= abi.TFlagExtraStar
+	}
 	pp.PtrToThis_ = nil
 
 	// For the type structures linked into the binary, the
@@ -937,7 +1097,7 @@ func (t *rtype) Comparable() bool {
 
 // implements reports whether the type V implements the interface type T.
 //
-//go:linkname implements github.com/goplus/llgo/runtime/internal/runtime.Implements
+//go:linkname implements github.com/xgo-dev/llgo/runtime/internal/runtime.Implements
 func implements(T, V *abi.Type) bool
 
 // specialChannelAssignability reports whether a value x of channel type V
@@ -1091,20 +1251,90 @@ func SliceOf(t Type) Type {
 		return slice.(Type)
 	}
 
-	/*
-		// Look in known types.
-		s := "[]" + stringFor(typ)
-		for _, tt := range typesByString(s) {
-			slice := (*sliceType)(unsafe.Pointer(tt))
-			if slice.Elem == typ {
-				ti, _ := lookupCache.LoadOrStore(ckey, toRType(tt))
-				return ti.(Type)
-			}
+	// Look in known types.
+	s := "[]" + stringFor(typ)
+	for _, tt := range typesByString(s) {
+		slice := (*sliceType)(unsafe.Pointer(tt))
+		if slice.Elem == typ {
+			ti, _ := lookupCache.LoadOrStore(ckey, toRType(tt))
+			return ti.(Type)
 		}
-	*/
+	}
 
-	slice := runtime.SliceOf(typ)
-	ti, _ := lookupCache.LoadOrStore(ckey, toRType(slice))
+	// Make a slice type.
+	var islice any = ([]unsafe.Pointer)(nil)
+	prototype := *(**sliceType)(unsafe.Pointer(&islice))
+	slice := *prototype
+	slice.TFlag = 0
+	slice.Str_ = s
+	slice.Hash = fnv1(typ.Hash, '[')
+	slice.Elem = typ
+	slice.PtrToThis_ = nil
+
+	ti, _ := lookupCache.LoadOrStore(ckey, toRType(&slice.Type))
+	return ti.(Type)
+}
+
+// ChanOf returns the channel type with the given direction and element type.
+// For example, if t represents int, ChanOf(RecvDir, t) represents <-chan int.
+//
+// The gc runtime imposes a limit of 64 kB on channel element types.
+// If t's size is equal to or exceeds this limit, ChanOf panics.
+func ChanOf(dir ChanDir, t Type) Type {
+	typ := t.common()
+
+	// Look in cache.
+	ckey := cacheKey{Chan, typ, nil, uintptr(dir)}
+	if ch, ok := lookupCache.Load(ckey); ok {
+		return ch.(*rtype)
+	}
+
+	// This restriction is imposed by the gc compiler and the runtime.
+	if typ.Size_ >= 1<<16 {
+		panic("reflect.ChanOf: element size too large")
+	}
+
+	// Look in known types.
+	var s string
+	switch dir {
+	default:
+		panic("reflect.ChanOf: invalid dir")
+	case SendDir:
+		s = "chan<- " + stringFor(typ)
+	case RecvDir:
+		s = "<-chan " + stringFor(typ)
+	case BothDir:
+		typeStr := stringFor(typ)
+		if typeStr[0] == '<' {
+			// typ is recv chan, need parentheses as "<-" associates with leftmost
+			// chan possible, see:
+			// * https://golang.org/ref/spec#Channel_types
+			// * https://github.com/golang/go/issues/39897
+			s = "chan (" + typeStr + ")"
+		} else {
+			s = "chan " + typeStr
+		}
+	}
+	for _, tt := range typesByString(s) {
+		ch := (*chanType)(unsafe.Pointer(tt))
+		if ch.Elem == typ && ch.Dir == abi.ChanDir(dir) {
+			ti, _ := lookupCache.LoadOrStore(ckey, toRType(tt))
+			return ti.(Type)
+		}
+	}
+
+	// Make a channel type.
+	var ichan any = (chan unsafe.Pointer)(nil)
+	prototype := *(**chanType)(unsafe.Pointer(&ichan))
+	ch := *prototype
+	ch.TFlag = abi.TFlagRegularMemory
+	ch.Dir = abi.ChanDir(dir)
+	ch.Str_ = s
+	ch.Hash = fnv1(typ.Hash, 'c', byte(dir))
+	ch.Elem = typ
+	ch.PtrToThis_ = nil
+
+	ti, _ := lookupCache.LoadOrStore(ckey, toRType(&ch.Type))
 	return ti.(Type)
 }
 
@@ -1158,7 +1388,10 @@ func FuncOf(in, out []Type, variadic bool) Type {
 
 	// Make a func type.
 	var ifunc any = (func())(nil)
-	prototype := *(**funcType)(unsafe.Pointer(&ifunc))
+	// Closures are always struct{fn *funcType, data unsafe.Pointer}
+	// This is guaranteed by closureOf() construction
+	closureType := *(**abi.StructType)(unsafe.Pointer(&ifunc))
+	prototype := closureType.Fields[0].Typ.FuncType()
 	ft := &funcType{}
 	*ft = *prototype
 	ft.In = make([]*abi.Type, len(in))
@@ -1183,7 +1416,7 @@ func FuncOf(in, out []Type, variadic bool) Type {
 
 	ft.TFlag = 0
 	ft.Hash = hash
-	ft.Kind_ = uint8(abi.Func)
+	ft.Kind_ = uint8(abi.Func) | abi.KindDirectIface
 	if variadic {
 		ft.TFlag |= abi.TFlagVariadic
 	}
@@ -1208,21 +1441,18 @@ func FuncOf(in, out []Type, variadic bool) Type {
 		funcLookupCache.m.Store(hash, append(rts, tt))
 		return toType(tt)
 	}
-	str := funcStr(ft)
 
-	//TODO typesByString
-	// for _, tt := range typesByString(str) {
-	// 	if haveIdenticalUnderlyingType(&ft.Type, tt, true) {
-	// 		return addToCache(tt)
-	// 	}
-	// }
+	str := funcStr(ft)
+	for _, tt := range typesByString(str) {
+		if haveIdenticalUnderlyingType(&ft.Type, tt, true) {
+			return addToCache(tt)
+		}
+	}
 
 	// Populate the remaining fields of ft and store in cache.
 	ft.Str_ = str
 	ft.PtrToThis_ = nil
-
-	rt := runtime.Func(ft.In, ft.Out, variadic)
-	return addToCache(&rt.Type)
+	return addToCache(&ft.Type)
 }
 
 func stringFor(t *abi.Type) string {
@@ -1271,27 +1501,34 @@ func funcStr(ft *funcType) string {
 // not implement Go's == operator), MapOf panics.
 func MapOf(key, elem Type) Type {
 	ktyp := key.common()
-	etyp := elem.common()
+	publicElem := elem.common()
+	etyp := publicElem
+	if etyp.Kind() == abi.Func {
+		// Map bucket operations copy elements using the element descriptor.
+		// Use LLGo's physical two-word closure there; Elem converts it back
+		// to the public function type returned by this API.
+		etyp = closureOf(etyp.FuncType())
+	}
 
 	if ktyp.Equal == nil {
 		panic("reflect.MapOf: invalid key type " + stringFor(ktyp))
 	}
 
 	// Look in cache.
-	ckey := cacheKey{Map, ktyp, etyp, 0}
+	ckey := cacheKey{Map, ktyp, publicElem, 0}
 	if mt, ok := lookupCache.Load(ckey); ok {
 		return mt.(Type)
 	}
 
 	// Look in known types.
-	s := "map[" + stringFor(ktyp) + "]" + stringFor(etyp)
-	// for _, tt := range typesByString(s) {
-	// 	mt := (*mapType)(unsafe.Pointer(tt))
-	// 	if mt.Key == ktyp && mt.Elem == etyp {
-	// 		ti, _ := lookupCache.LoadOrStore(ckey, toRType(tt))
-	// 		return ti.(Type)
-	// 	}
-	// }
+	s := "map[" + stringFor(ktyp) + "]" + stringFor(publicElem)
+	for _, tt := range typesByString(s) {
+		mt := (*mapType)(unsafe.Pointer(tt))
+		if mt.Key == ktyp && toPublicType(mt.Elem).common() == publicElem {
+			ti, _ := lookupCache.LoadOrStore(ckey, toRType(tt))
+			return ti.(Type)
+		}
+	}
 
 	// Make a map type.
 	// Note: flag values must match those used in the TMAP case
@@ -1300,7 +1537,7 @@ func MapOf(key, elem Type) Type {
 	mt := **(**mapType)(unsafe.Pointer(&imap))
 	mt.Str_ = s
 	mt.TFlag = 0
-	mt.Hash = fnv1(etyp.Hash, 'm', byte(ktyp.Hash>>24), byte(ktyp.Hash>>16), byte(ktyp.Hash>>8), byte(ktyp.Hash))
+	mt.Hash = fnv1(publicElem.Hash, 'm', byte(ktyp.Hash>>24), byte(ktyp.Hash>>16), byte(ktyp.Hash>>8), byte(ktyp.Hash))
 	mt.Key = ktyp
 	mt.Elem = etyp
 	mt.Bucket = bucketOf(ktyp, etyp)
@@ -1502,4 +1739,935 @@ func emitGCMask(out []byte, base uintptr, typ *abi.Type, n uintptr) {
 	// 		}
 	// 	}
 	// }
+}
+
+// ArrayOf returns the array type with the given length and element type.
+// For example, if t represents int, ArrayOf(5, t) represents [5]int.
+//
+// If the resulting type would be larger than the available address space,
+// ArrayOf panics.
+func ArrayOf(length int, elem Type) Type {
+	if length < 0 {
+		panic("reflect: negative length passed to ArrayOf")
+	}
+
+	typ := elem.common()
+
+	// Look in cache.
+	ckey := cacheKey{Array, typ, nil, uintptr(length)}
+	if array, ok := lookupCache.Load(ckey); ok {
+		return array.(Type)
+	}
+
+	// Look in known types.
+	s := "[" + strconv.Itoa(length) + "]" + stringFor(typ)
+	for _, tt := range typesByString(s) {
+		array := (*arrayType)(unsafe.Pointer(tt))
+		if array.Elem == typ {
+			ti, _ := lookupCache.LoadOrStore(ckey, toRType(tt))
+			return ti.(Type)
+		}
+	}
+
+	// Make an array type.
+	var iarray any = [1]unsafe.Pointer{}
+	prototype := *(**arrayType)(unsafe.Pointer(&iarray))
+	array := *prototype
+	array.TFlag = typ.TFlag & abi.TFlagRegularMemory
+	array.Str_ = s
+	array.Hash = fnv1(typ.Hash, '[')
+	for n := uint32(length); n > 0; n >>= 8 {
+		array.Hash = fnv1(array.Hash, byte(n))
+	}
+	array.Hash = fnv1(array.Hash, ']')
+	array.Elem = typ
+	array.PtrToThis_ = nil
+	if typ.Size_ > 0 {
+		max := ^uintptr(0) / typ.Size_
+		if uintptr(length) > max {
+			panic("reflect.ArrayOf: array size would exceed virtual address space")
+		}
+	}
+	array.Size_ = typ.Size_ * uintptr(length)
+	if length > 0 && typ.Pointers() {
+		array.PtrBytes = typ.Size_*uintptr(length-1) + typ.PtrBytes
+	} else {
+		array.PtrBytes = 0
+	}
+	array.Align_ = typ.Align_
+	array.FieldAlign_ = typ.FieldAlign_
+	array.Len = uintptr(length)
+	array.Slice = &(SliceOf(elem).(*rtype).t)
+
+	switch {
+	case array.PtrBytes == 0:
+		// No pointers.
+		array.GCData = nil
+
+	case length == 1:
+		// In memory, 1-element array looks just like the element.
+		// We share the bitmask with the element type.
+		array.TFlag |= typ.TFlag & abi.TFlagGCMaskOnDemand
+		array.GCData = typ.GCData
+
+	case array.PtrBytes <= abi.MaxPtrmaskBytes*8*goarch.PtrSize:
+		// Create pointer mask by repeating the element bitmask Len times.
+		n := (array.PtrBytes/goarch.PtrSize + 7) / 8
+		// Runtime needs pointer masks to be a multiple of uintptr in size.
+		n = (n + goarch.PtrSize - 1) &^ (goarch.PtrSize - 1)
+		mask := make([]byte, n)
+		emitGCMask(mask, 0, typ, array.Len)
+		array.GCData = &mask[0]
+
+	default:
+		// Runtime will build the mask if needed. We just need to allocate
+		// space to store it.
+		array.TFlag |= abi.TFlagGCMaskOnDemand
+		array.GCData = (*byte)(unsafe.Pointer(new(uintptr)))
+	}
+
+	etyp := typ
+	esize := etyp.Size()
+
+	array.Equal = nil
+	if eequal := etyp.Equal; eequal != nil {
+		array.Equal = func(p, q unsafe.Pointer) bool {
+			for i := 0; i < length; i++ {
+				pi := arrayAt(p, i, esize, "i < length")
+				qi := arrayAt(q, i, esize, "i < length")
+				if !eequal(pi, qi) {
+					return false
+				}
+
+			}
+			return true
+		}
+	}
+
+	switch {
+	case length == 1 && !typ.IfaceIndir():
+		// array of 1 direct iface type can be direct
+		array.Kind_ |= abi.KindDirectIface
+	default:
+		array.Kind_ &^= abi.KindDirectIface
+	}
+
+	ti, _ := lookupCache.LoadOrStore(ckey, toRType(&array.Type))
+	return ti.(Type)
+}
+
+// The structLookupCache caches StructOf lookups.
+// StructOf does not share the common lookupCache since we need to pin
+// the memory associated with *structTypeFixedN.
+var structLookupCache struct {
+	sync.Mutex // Guards stores (but not loads) on m.
+
+	// m is a map[uint32][]Type keyed by the hash calculated in StructOf.
+	// Elements in m are append-only and thus safe for concurrent reading.
+	m sync.Map
+}
+
+type structTypeUncommon struct {
+	structType
+	u uncommonType
+}
+
+// isLetter reports whether a given 'rune' is classified as a Letter.
+func isLetter(ch rune) bool {
+	return 'a' <= ch && ch <= 'z' || 'A' <= ch && ch <= 'Z' || ch == '_' || ch >= utf8.RuneSelf && unicode.IsLetter(ch)
+}
+
+// isValidFieldName checks if a string is a valid (struct) field name or not.
+//
+// According to the language spec, a field name should be an identifier.
+//
+// identifier = letter { letter | unicode_digit } .
+// letter = unicode_letter | "_" .
+func isValidFieldName(fieldName string) bool {
+	for i, c := range fieldName {
+		if i == 0 && !isLetter(c) {
+			return false
+		}
+
+		if !(isLetter(c) || unicode.IsDigit(c)) {
+			return false
+		}
+	}
+
+	return len(fieldName) > 0
+}
+
+// This must match cmd/compile/internal/compare.IsRegularMemory
+func isRegularMemory(t Type) bool {
+	switch t.Kind() {
+	case Array:
+		elem := t.Elem()
+		if isRegularMemory(elem) {
+			return true
+		}
+		return elem.Comparable() && t.Len() == 0
+	case Int8, Int16, Int32, Int64, Int, Uint8, Uint16, Uint32, Uint64, Uint, Uintptr, Chan, Pointer, Bool, UnsafePointer:
+		return true
+	case Struct:
+		num := t.NumField()
+		switch num {
+		case 0:
+			return true
+		case 1:
+			field := t.Field(0)
+			if field.Name == "_" {
+				return false
+			}
+			return isRegularMemory(field.Type)
+		default:
+			for i := 0; i < num; i++ {
+				field := t.Field(i)
+				if field.Name == "_" || !isRegularMemory(field.Type) || isPaddedField(t, i) {
+					return false
+				}
+			}
+			return true
+		}
+	}
+	return false
+}
+
+// isPaddedField reports whether the i'th field of struct type t is followed
+// by padding.
+func isPaddedField(t Type, i int) bool {
+	field := t.Field(i)
+	if i+1 < t.NumField() {
+		return field.Offset+field.Type.Size() != t.Field(i+1).Offset
+	}
+	return field.Offset+field.Type.Size() != t.Size()
+}
+
+// StructOf returns the struct type containing fields.
+// The Offset and Index fields are ignored and computed as they would be
+// by the compiler.
+//
+// StructOf currently does not support promoted methods of embedded fields
+// and panics if passed unexported StructFields.
+func StructOf(fields []StructField) Type {
+	var (
+		hash       = fnv1(0, []byte("struct {")...)
+		size       uintptr
+		typalign   uint8
+		comparable = true
+		methods    []abi.Method
+
+		fs   = make([]structField, len(fields))
+		repr = make([]byte, 0, 64)
+		fset = map[string]struct{}{} // fields' names
+	)
+
+	lastzero := uintptr(0)
+	repr = append(repr, "struct {"...)
+	pkgpath := ""
+	for i, field := range fields {
+		if field.Name == "" {
+			panic("reflect.StructOf: field " + strconv.Itoa(i) + " has no name")
+		}
+		if !isValidFieldName(field.Name) {
+			panic("reflect.StructOf: field " + strconv.Itoa(i) + " has invalid name")
+		}
+		if field.Type == nil {
+			panic("reflect.StructOf: field " + strconv.Itoa(i) + " has no type")
+		}
+		f, fpkgpath := runtimeStructField(field)
+		ft := f.Typ
+		if fpkgpath != "" {
+			if pkgpath == "" {
+				pkgpath = fpkgpath
+			} else if pkgpath != fpkgpath {
+				panic("reflect.Struct: fields with different PkgPath " + pkgpath + " and " + fpkgpath)
+			}
+		}
+
+		// Update string and hash
+		name := f.Name_
+		hash = fnv1(hash, []byte(name)...)
+		if !f.Embedded() {
+			repr = append(repr, (" " + name)...)
+		} else {
+			// Embedded field
+			if f.Typ.Kind() == abi.Pointer {
+				// Embedded ** and *interface{} are illegal
+				elem := ft.Elem()
+				if k := elem.Kind(); k == abi.Pointer || k == abi.Interface {
+					panic("reflect.StructOf: illegal embedded field type " + stringFor(ft))
+				}
+			}
+
+			switch Kind(f.Typ.Kind()) {
+			case Interface:
+				ift := (*interfaceType)(unsafe.Pointer(ft))
+				for _, m := range ift.Methods {
+					if m.PkgPath() != "" {
+						// TODO(sbinet).  Issue 15924.
+						panic("reflect: embedded interface with unexported method(s) not implemented")
+					}
+
+					fnStub := clite.Func(embeddedIfaceMethStub)
+					methods = append(methods, abi.Method{
+						Name_: m.Name(),
+						Mtyp_: m.Typ_,
+						Ifn_:  fnStub,
+						Tfn_:  fnStub,
+					})
+				}
+			case Pointer:
+				ptr := (*ptrType)(unsafe.Pointer(ft))
+				if unt := ptr.Uncommon(); unt != nil {
+					if i > 0 && unt.Mcount > 0 {
+						// Issue 15924.
+						panic("reflect: embedded type with methods not implemented if type is not first field")
+					}
+					if len(fields) > 1 {
+						panic("reflect: embedded type with methods not implemented if there is more than one field")
+					}
+					for _, m := range unt.Methods() {
+						if m.PkgPath() != "" {
+							// TODO(sbinet).
+							// Issue 15924.
+							panic("reflect: embedded interface with unexported method(s) not implemented")
+						}
+						methods = append(methods, abi.Method{
+							Name_: m.Name(),
+							Mtyp_: m.Mtyp_,
+							Ifn_:  m.Ifn_,
+							Tfn_:  m.Tfn_,
+						})
+					}
+				}
+				if unt := ptr.Elem.Uncommon(); unt != nil {
+					for _, m := range unt.Methods() {
+						if m.PkgPath() != "" {
+							// TODO(sbinet)
+							// Issue 15924.
+							panic("reflect: embedded interface with unexported method(s) not implemented")
+						}
+						methods = append(methods, abi.Method{
+							Name_: m.Name(),
+							Mtyp_: m.Mtyp_,
+							Ifn_:  m.Ifn_,
+							Tfn_:  m.Tfn_,
+						})
+					}
+				}
+			default:
+				if unt := ft.Uncommon(); unt != nil {
+					if i > 0 && unt.Mcount > 0 {
+						// Issue 15924.
+						panic("reflect: embedded type with methods not implemented if type is not first field")
+					}
+					if len(fields) > 1 && ft.Kind_&abi.KindDirectIface != 0 {
+						panic("reflect: embedded type with methods not implemented for non-pointer type")
+					}
+					for _, m := range unt.Methods() {
+						if m.PkgPath() != "" {
+							// TODO(sbinet)
+							// Issue 15924.
+							panic("reflect: embedded interface with unexported method(s) not implemented")
+						}
+						methods = append(methods, abi.Method{
+							Name_: m.Name(),
+							Mtyp_: m.Mtyp_,
+							Ifn_:  m.Ifn_,
+							Tfn_:  m.Tfn_,
+						})
+
+					}
+				}
+			}
+		}
+		if _, dup := fset[name]; dup && name != "_" {
+			panic("reflect.StructOf: duplicate field " + name)
+		}
+		fset[name] = struct{}{}
+
+		hash = fnv1(hash, byte(ft.Hash>>24), byte(ft.Hash>>16), byte(ft.Hash>>8), byte(ft.Hash))
+
+		repr = append(repr, (" " + stringFor(ft))...)
+		if f.Tag_ != "" {
+			hash = fnv1(hash, []byte(f.Tag_)...)
+			repr = append(repr, (" " + strconv.Quote(f.Tag_))...)
+		}
+		if i < len(fields)-1 {
+			repr = append(repr, ';')
+		}
+
+		comparable = comparable && (ft.Equal != nil)
+
+		offset := align(size, uintptr(ft.Align_))
+		if offset < size {
+			panic("reflect.StructOf: struct size would exceed virtual address space")
+		}
+		if ft.Align_ > typalign {
+			typalign = ft.Align_
+		}
+		size = offset + ft.Size_
+		if size < offset {
+			panic("reflect.StructOf: struct size would exceed virtual address space")
+		}
+		f.Offset = offset
+
+		if ft.Size_ == 0 {
+			lastzero = size
+		}
+
+		fs[i] = f
+	}
+
+	if size > 0 && lastzero == size {
+		// This is a non-zero sized struct that ends in a
+		// zero-sized field. We add an extra byte of padding,
+		// to ensure that taking the address of the final
+		// zero-sized field can't manufacture a pointer to the
+		// next object in the heap. See issue 9401.
+		size++
+		if size == 0 {
+			panic("reflect.StructOf: struct size would exceed virtual address space")
+		}
+	}
+
+	var typ *structType
+	var ut *uncommonType
+
+	if len(methods) == 0 {
+		t := new(structTypeUncommon)
+		typ = &t.structType
+		ut = &t.u
+	} else {
+		// A *rtype representing a struct is followed directly in memory by an
+		// array of method objects representing the methods attached to the
+		// struct. To get the same layout for a run time generated type, we
+		// need an array directly following the uncommonType memory.
+		// A similar strategy is used for funcTypeFixed4, ...funcTypeFixedN.
+		tt := New(StructOf([]StructField{
+			{Name: "S", Type: TypeOf(structType{})},
+			{Name: "U", Type: TypeOf(uncommonType{})},
+			{Name: "M", Type: ArrayOf(len(methods), TypeOf(methods[0]))},
+		}))
+
+		typ = (*structType)(tt.Elem().Field(0).Addr().UnsafePointer())
+		ut = (*uncommonType)(tt.Elem().Field(1).Addr().UnsafePointer())
+
+		copy(tt.Elem().Field(2).Slice(0, len(methods)).Interface().([]abi.Method), methods)
+	}
+	// TODO(sbinet): Once we allow embedding multiple types,
+	// methods will need to be sorted like the compiler does.
+	// TODO(sbinet): Once we allow non-exported methods, we will
+	// need to compute xcount as the number of exported methods.
+	ut.Mcount = uint16(len(methods))
+	ut.Xcount = ut.Mcount
+	ut.Moff = uint32(unsafe.Sizeof(uncommonType{}))
+
+	if len(fs) > 0 {
+		repr = append(repr, ' ')
+	}
+	repr = append(repr, '}')
+	hash = fnv1(hash, '}')
+	str := string(repr)
+
+	// Round the size up to be a multiple of the alignment.
+	s := align(size, uintptr(typalign))
+	if s < size {
+		panic("reflect.StructOf: struct size would exceed virtual address space")
+	}
+	size = s
+
+	// Make the struct type.
+	var istruct any = struct{}{}
+	prototype := *(**structType)(unsafe.Pointer(&istruct))
+	*typ = *prototype
+	typ.Fields = fs
+	if pkgpath != "" {
+		typ.PkgPath_ = pkgpath
+	}
+
+	// Look in cache.
+	if ts, ok := structLookupCache.m.Load(hash); ok {
+		for _, st := range ts.([]Type) {
+			t := st.common()
+			if haveIdenticalUnderlyingType(&typ.Type, t, true) {
+				return toType(t)
+			}
+		}
+	}
+
+	// Not in cache, lock and retry.
+	structLookupCache.Lock()
+	defer structLookupCache.Unlock()
+	if ts, ok := structLookupCache.m.Load(hash); ok {
+		for _, st := range ts.([]Type) {
+			t := st.common()
+			if haveIdenticalUnderlyingType(&typ.Type, t, true) {
+				return toType(t)
+			}
+		}
+	}
+
+	addToCache := func(t Type) Type {
+		var ts []Type
+		if ti, ok := structLookupCache.m.Load(hash); ok {
+			ts = ti.([]Type)
+		}
+		structLookupCache.m.Store(hash, append(ts, t))
+		return t
+	}
+
+	// Look in known types.
+	for _, t := range typesByString(str) {
+		if haveIdenticalUnderlyingType(&typ.Type, t, true) {
+			// even if 't' wasn't a structType with methods, we should be ok
+			// as the 'u uncommonType' field won't be accessed except when
+			// tflag&abi.TFlagUncommon is set.
+			return addToCache(toType(t))
+		}
+	}
+
+	typ.Str_ = str
+	if isRegularMemory(toType(&typ.Type)) {
+		typ.TFlag = abi.TFlagRegularMemory
+	} else {
+		typ.TFlag = 0
+	}
+	typ.Hash = hash
+	typ.Size_ = size
+	typ.PtrBytes = typeptrdata(&typ.Type)
+	typ.Align_ = typalign
+	typ.FieldAlign_ = typalign
+	typ.PtrToThis_ = nil
+	if len(methods) > 0 {
+		typ.TFlag |= abi.TFlagUncommon
+	}
+
+	if typ.PtrBytes == 0 {
+		typ.GCData = nil
+	} else if typ.PtrBytes <= abi.MaxPtrmaskBytes*8*goarch.PtrSize {
+		bv := new(bitVector)
+		addTypeBits(bv, 0, &typ.Type)
+		typ.GCData = &bv.data[0]
+	} else {
+		// Runtime will build the mask if needed. We just need to allocate
+		// space to store it.
+		typ.TFlag |= abi.TFlagGCMaskOnDemand
+		typ.GCData = (*byte)(unsafe.Pointer(new(uintptr)))
+	}
+
+	typ.Equal = nil
+	if comparable {
+		typ.Equal = func(p, q unsafe.Pointer) bool {
+			for _, ft := range typ.Fields {
+				pi := add(p, ft.Offset, "&x.field safe")
+				qi := add(q, ft.Offset, "&x.field safe")
+				if !ft.Typ.Equal(pi, qi) {
+					return false
+				}
+			}
+			return true
+		}
+	}
+
+	switch {
+	case len(fs) == 1 && !fs[0].Typ.IfaceIndir():
+		// structs of 1 direct iface type can be direct
+		typ.Kind_ |= abi.KindDirectIface
+	default:
+		typ.Kind_ &^= abi.KindDirectIface
+	}
+
+	return addToCache(toType(&typ.Type))
+}
+
+const (
+	pointerSize  = unsafe.Sizeof(uintptr(0))
+	pointerAlign = uint8(unsafe.Alignof(uintptr(0)))
+)
+
+var closureLookupCache struct {
+	sync.Mutex // Guards stores (but not loads) on m.
+
+	// m is a map[uint32][]*rtype keyed by the hash calculated in FuncOf.
+	// Elements of m are append-only and thus safe for concurrent reading.
+	m sync.Map
+}
+
+// Struct returns a struct type.
+func closureOf(ftyp *abi.FuncType) *abi.Type {
+	if ftyp.HasName() {
+		var t *abi.StructType
+		namedFuncMap.Range(func(key interface{}, value interface{}) bool {
+			if value == ftyp {
+				t = key.(*abi.StructType)
+				return false
+			}
+			return true
+		})
+		if t != nil {
+			return &t.Type
+		}
+		return &toClosureType(ftyp).Type
+	}
+
+	fields := []abi.StructField{
+		abi.StructField{
+			Name_: "$f",
+			Typ:   &ftyp.Type,
+		}, abi.StructField{
+			Name_:  "$data",
+			Typ:    unsafePointerType,
+			Offset: pointerSize,
+		},
+	}
+	size := 2 * pointerSize
+
+	repr := make([]byte, 0, 64)
+	hash := fnv1(0, []byte("struct {")...)
+	repr = append(repr, "struct {"...)
+	for i, f := range fields {
+		if i > 0 {
+			repr = append(repr, ';')
+		}
+		ft := f.Typ
+		repr = append(repr, ' ')
+		repr = append(repr, f.Name_...)
+		repr = append(repr, ' ')
+		repr = append(repr, ft.String()...)
+		hash = fnv1(hash, []byte(f.Name_)...)
+		hash = fnv1(hash, byte(ft.Hash>>24), byte(ft.Hash>>16), byte(ft.Hash>>8), byte(ft.Hash))
+	}
+	repr = append(repr, ' ')
+	repr = append(repr, '}')
+	hash = fnv1(hash, '}')
+	str := string(repr)
+
+	st := &abi.StructType{
+		Type: abi.Type{
+			Size_:       size,
+			Kind_:       uint8(abi.Struct),
+			Str_:        str,
+			TFlag:       abi.TFlagClosure,
+			PtrBytes:    2 * pointerSize,
+			Align_:      pointerAlign,
+			FieldAlign_: pointerAlign,
+			Hash:        hash,
+		},
+		PkgPath_: "",
+		Fields:   fields,
+	}
+
+	closureLookupCache.Lock()
+	defer closureLookupCache.Unlock()
+
+	// Look in cache.
+	if ts, ok := closureLookupCache.m.Load(hash); ok {
+		for _, t := range ts.([]*abi.Type) {
+			if haveIdenticalUnderlyingType(&st.Type, t, true) {
+				return t
+			}
+		}
+	}
+
+	addToCache := func(tt *abi.Type) *abi.Type {
+		var rts []*abi.Type
+		if rti, ok := closureLookupCache.m.Load(hash); ok {
+			rts = rti.([]*abi.Type)
+		}
+		closureLookupCache.m.Store(hash, append(rts, tt))
+		return tt
+	}
+
+	for _, tt := range typesByString(str) {
+		if haveIdenticalUnderlyingType(&st.Type, tt, true) {
+			return addToCache(tt)
+		}
+	}
+	return addToCache(&st.Type)
+}
+
+func structStr(fields []abi.StructField) string {
+	repr := make([]byte, 0, 64)
+	repr = append(repr, "struct {"...)
+	for i, st := range fields {
+		if i > 0 {
+			repr = append(repr, ';')
+		}
+		repr = append(repr, ' ')
+		if !st.Embedded_ {
+			repr = append(repr, st.Name_...)
+			repr = append(repr, ' ')
+		}
+		repr = append(repr, st.Typ.String()...)
+	}
+	if len(fields) > 0 {
+		repr = append(repr, ' ')
+	}
+	repr = append(repr, '}')
+	return string(repr)
+}
+
+// Note: this type must agree with runtime.bitvector.
+type bitVector struct {
+	n    uint32 // number of bits
+	data []byte
+}
+
+// append a bit to the bitmap.
+func (bv *bitVector) append(bit uint8) {
+	if bv.n%(8*goarch.PtrSize) == 0 {
+		// Runtime needs pointer masks to be a multiple of uintptr in size.
+		// Since reflect passes bv.data directly to the runtime as a pointer mask,
+		// we append a full uintptr of zeros at a time.
+		for i := 0; i < goarch.PtrSize; i++ {
+			bv.data = append(bv.data, 0)
+		}
+	}
+	bv.data[bv.n/8] |= bit << (bv.n % 8)
+	bv.n++
+}
+
+func addTypeBits(bv *bitVector, offset uintptr, t *abi.Type) {
+	if !t.Pointers() {
+		return
+	}
+
+	switch Kind(t.Kind_ & abi.KindMask) {
+	case Chan, Func, Map, Pointer, Slice, String, UnsafePointer:
+		// 1 pointer at start of representation
+		for bv.n < uint32(offset/goarch.PtrSize) {
+			bv.append(0)
+		}
+		bv.append(1)
+
+	case Interface:
+		// 2 pointers
+		for bv.n < uint32(offset/goarch.PtrSize) {
+			bv.append(0)
+		}
+		bv.append(1)
+		bv.append(1)
+
+	case Array:
+		// repeat inner type
+		tt := (*arrayType)(unsafe.Pointer(t))
+		for i := 0; i < int(tt.Len); i++ {
+			addTypeBits(bv, offset+uintptr(i)*tt.Elem.Size_, tt.Elem)
+		}
+
+	case Struct:
+		// apply fields
+		tt := (*structType)(unsafe.Pointer(t))
+		for i := range tt.Fields {
+			f := &tt.Fields[i]
+			addTypeBits(bv, offset+f.Offset, f.Typ)
+		}
+	}
+}
+
+// typeptrdata returns the length in bytes of the prefix of t
+// containing pointer data. Anything after this offset is scalar data.
+// keep in sync with ../cmd/compile/internal/reflectdata/reflect.go
+func typeptrdata(t *abi.Type) uintptr {
+	switch t.Kind() {
+	case abi.Struct:
+		st := (*structType)(unsafe.Pointer(t))
+		// find the last field that has pointers.
+		field := -1
+		for i := range st.Fields {
+			ft := st.Fields[i].Typ
+			if ft.Pointers() {
+				field = i
+			}
+		}
+		if field == -1 {
+			return 0
+		}
+		f := st.Fields[field]
+		return f.Offset + f.Typ.PtrBytes
+
+	default:
+		panic("reflect.typeptrdata: unexpected type, " + stringFor(t))
+	}
+}
+
+// align returns the result of rounding x up to a multiple of n.
+// n must be a power of two.
+func align(x, n uintptr) uintptr {
+	return (x + n - 1) &^ (n - 1)
+}
+
+func embeddedIfaceMethStub() {
+	panic("reflect: StructOf does not support methods of embedded interfaces")
+}
+
+// runtimeStructField takes a StructField value passed to StructOf and
+// returns both the corresponding internal representation, of type
+// structField, and the pkgpath value to use for this field.
+func runtimeStructField(field StructField) (structField, string) {
+	if field.Anonymous && field.PkgPath != "" {
+		panic("reflect.StructOf: field \"" + field.Name + "\" is anonymous but has PkgPath set")
+	}
+
+	if field.IsExported() {
+		// Best-effort check for misuse.
+		// Since this field will be treated as exported, not much harm done if Unicode lowercase slips through.
+		c := field.Name[0]
+		if 'a' <= c && c <= 'z' || c == '_' {
+			panic("reflect.StructOf: field \"" + field.Name + "\" is unexported but missing PkgPath")
+		}
+	}
+
+	//	resolveReflectType(field.Type.common()) // install in runtime
+	typ := field.Type.common()
+	if typ.Kind() == abi.Func {
+		typ = closureOf(typ.FuncType())
+	}
+	f := structField{
+		Name_:     field.Name,
+		Typ:       typ,
+		Tag_:      string(field.Tag),
+		Offset:    0,
+		Embedded_: field.Anonymous,
+	}
+	return f, field.PkgPath
+}
+
+//go:linkname typelist github.com/xgo-dev/llgo/runtime/internal/runtime.typelist
+var typelist []*abi.Type
+
+func typesByString(s string) (typs []*abi.Type) {
+	for _, t := range typelist {
+		if t.String() == s {
+			typs = append(typs, t)
+		}
+	}
+	return
+}
+
+func findNamed(pkgPath string, name string) *abi.Type {
+	for _, typ := range typelist {
+		if typ.TFlag&(abi.TFlagNamed|abi.TFlagUncommon) != 0 &&
+			typ.Str_ == name && typ.Uncommon().PkgPath_ == pkgPath {
+			return typ
+		}
+	}
+	return nil
+}
+
+func findElem(kind abi.Kind, elem *abi.Type, extra uintptr) *abi.Type {
+	for _, typ := range typelist {
+		if typ.Kind() == kind && typ.Elem() == elem {
+			switch kind {
+			case abi.Chan:
+				if uintptr(typ.ChanDir()) == extra {
+					return typ
+				}
+			case abi.Array:
+				if uintptr(typ.Len()) == extra {
+					return typ
+				}
+			default:
+				return typ
+			}
+		}
+	}
+	return nil
+}
+
+func findMap(key, elem *abi.Type) *abi.Type {
+	for _, typ := range typelist {
+		if typ.Kind() == abi.Map {
+			if mt := typ.MapType(); mt.Key == key && mt.Elem == elem {
+				return typ
+			}
+		}
+	}
+	return nil
+}
+
+func eqFields(s1, s2 []abi.StructField) bool {
+	n := len(s1)
+	if n != len(s2) {
+		return false
+	}
+	for i := 0; i < n; i++ {
+		f1, f2 := s1[i], s2[i]
+		if f1.Name_ != f2.Name_ || f1.Embedded_ != f2.Embedded_ || f1.Typ != f2.Typ {
+			return false
+		}
+	}
+	return true
+}
+
+func findStruct(pkgPath string, size uintptr, fields []abi.StructField) *abi.Type {
+	for _, typ := range typelist {
+		if typ.Kind() == abi.Struct && typ.Size() == size {
+			if st := typ.StructType(); (st.PkgPath_ == pkgPath) && eqFields(st.Fields, fields) {
+				return typ
+			}
+		}
+	}
+	return nil
+}
+
+func eqImethods(s1, s2 []abi.Imethod) bool {
+	n := len(s1)
+	if n != len(s2) {
+		return false
+	}
+	for i := 0; i < n; i++ {
+		f1, f2 := s1[i], s2[i]
+		if f1.Name_ != f2.Name_ || f1.Typ_ != f2.Typ_ {
+			return false
+		}
+	}
+	return true
+}
+
+func findInterface(pkgPath string, methods []abi.Imethod) *abi.InterfaceType {
+	for _, typ := range typelist {
+		if typ.Kind() == abi.Interface {
+			if it := typ.InterfaceType(); (it.PkgPath_ == pkgPath) && eqImethods(it.Methods, methods) {
+				return it
+			}
+		}
+	}
+	return nil
+}
+
+func eqTypes(s1, s2 []*abi.Type) bool {
+	n := len(s1)
+	if n != len(s2) {
+		return false
+	}
+	for i := 0; i < n; i++ {
+		if s1[i] != s2[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func findFunc(in, out []*abi.Type, variadic bool) *abi.FuncType {
+	for _, typ := range typelist {
+		if typ.Kind() == abi.Func {
+			if ft := typ.FuncType(); ft.Variadic() == variadic && eqTypes(ft.In, in) && eqTypes(ft.Out, out) {
+				return ft
+			}
+		}
+	}
+	return nil
+}
+
+func findClosure(fields []abi.StructField) *abi.Type {
+	for _, typ := range typelist {
+		if typ.Kind() == abi.Struct && typ.Size() == pointerSize {
+			if st := typ.StructType(); st.IsClosure() && eqFields(st.Fields, fields) {
+				return typ
+			}
+		}
+	}
+	return nil
 }

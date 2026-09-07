@@ -2,7 +2,7 @@
 // +build !llgo
 
 /*
- * Copyright (c) 2024 The GoPlus Authors (goplus.org). All rights reserved.
+ * Copyright (c) 2024 The XGo Authors (xgo.dev). All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -78,7 +78,7 @@ func TestSplitPkgConfigFlags(t *testing.T) {
 		ftest("-D VERSION=2.1 -D DEBUG=1", `["-DVERSION=2.1" "-DDEBUG=1"]`)
 	})
 
-	// case for https://github.com/goplus/llgo/issues/1244
+	// case for https://github.com/xgo-dev/llgo/issues/1244
 	t.Run("w_pipe", func(t *testing.T) {
 		ftest("-w -pipe", `["-w" "-pipe"]`)
 		ftest("-Os -w -pipe", `["-Os" "-w" "-pipe"]`)

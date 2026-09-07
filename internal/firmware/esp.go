@@ -1,4 +1,6 @@
-// From tinygo/builder/esp.go
+// Portions of this file are derived from tinygo/builder/esp.go.
+// Copyright (c) 2018-2025 The TinyGo Authors. All rights reserved.
+// See ../../LICENSES/TinyGo-BSD-3-Clause.txt for license terms.
 
 package firmware
 
@@ -37,7 +39,15 @@ func makeESPFirmareImage(infile, outfile, format string) error {
 	// sections, not true ELF segments (similar to how esptool does it).
 	var segments []*espImageSegment
 	for _, section := range inf.Sections {
-		if section.Type != elf.SHT_PROGBITS || section.Size == 0 || section.Flags&elf.SHF_ALLOC == 0 {
+		if section.Size == 0 || section.Flags&elf.SHF_ALLOC == 0 {
+			continue
+		}
+		switch section.Type {
+		case elf.SHT_PROGBITS, elf.SHT_INIT_ARRAY, elf.SHT_PREINIT_ARRAY, elf.SHT_FINI_ARRAY:
+			// Keep allocatable data sections that may contain startup tables.
+			// With some linker layouts, .rodata can be emitted as INIT/PREINIT/FINI_ARRAY
+			// type when constructor arrays are merged into it.
+		default:
 			continue
 		}
 		data, err := section.Data()
@@ -84,10 +94,12 @@ func makeESPFirmareImage(infile, outfile, format string) error {
 	}
 
 	if makeImage {
-		// The bootloader starts at 0x1000, or 4096.
-		// TinyGo doesn't use a separate bootloader and runs the entire
-		// application in the bootloader location.
-		outf.Write(make([]byte, 4096))
+		// For QEMU emulation, we need to place the image at the correct offset.
+		// ESP32 (Xtensa): bootloader starts at 0x1000, so we pad 4KB of zeros.
+		// ESP32-C3 (RISC-V): bootloader starts at 0x0, so no padding needed.
+		if chip == "esp32" {
+			outf.Write(make([]byte, 4096))
+		}
 	}
 
 	// Chip IDs. Source:

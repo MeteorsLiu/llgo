@@ -1,11 +1,11 @@
-//go:build !wasm
+//go:build !wasm && !baremetal
 
 package debug
 
 import (
 	"unsafe"
 
-	c "github.com/goplus/llgo/runtime/internal/clite"
+	c "github.com/xgo-dev/llgo/runtime/internal/clite"
 )
 
 const (
@@ -24,6 +24,9 @@ func Address() unsafe.Pointer
 
 //go:linkname Addrinfo C.llgo_addrinfo
 func Addrinfo(addr unsafe.Pointer, info *Info) c.Int
+
+//go:linkname Symbol C.llgo_symbol
+func Symbol(name *c.Char) unsafe.Pointer
 
 //go:linkname stacktrace C.llgo_stacktrace
 func stacktrace(skip c.Int, ctx unsafe.Pointer, fn func(ctx, pc, offset, sp unsafe.Pointer, name *c.Char) c.Int)

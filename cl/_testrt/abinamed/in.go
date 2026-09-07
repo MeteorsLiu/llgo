@@ -1,10 +1,26 @@
+// LITTEST
+// Scope: common
 package main
 
 import (
 	"unsafe"
 
-	"github.com/goplus/llgo/runtime/abi"
+	"github.com/xgo-dev/llgo/runtime/abi"
 )
+
+// Converting the two named values to interface{} must select their distinct
+// runtime type descriptors; the test body then exercises lazy pointer-to-this
+// and element links from those descriptors.
+// CHECK-LABEL: define void @main.checkBasicNames(){{.*}} {
+// CHECK: insertvalue %"{{.*}}eface" { ptr @_llgo_int32,
+// CHECK: call %"{{.*}}String" @"{{.*}}/runtime/abi.(*Type).String"
+// CHECK: insertvalue %"{{.*}}eface" { ptr @_llgo_uint8,
+// CHECK: call %"{{.*}}String" @"{{.*}}/runtime/abi.(*Type).String"
+// CHECK-LABEL: define void @main.main(){{.*}} {
+// CHECK: insertvalue %"{{.*}}eface" { ptr @_llgo_main.T,
+// CHECK: insertvalue %"{{.*}}eface" { ptr @"_llgo_{{.*}}/runtime/abi.Type",
+// CHECK: call ptr @"{{.*}}/runtime/abi.(*Type).StructType"
+// CHECK: call ptr @"{{.*}}/runtime/abi.(*Type).Elem"
 
 type T struct {
 	p *T
@@ -18,11 +34,21 @@ type eface struct {
 	data unsafe.Pointer
 }
 
-func toEface(i any) *eface {
-	return (*eface)(unsafe.Pointer(&i))
+// checkBasicNames folds the former abitype fixture into this runtime-type
+// owner while preserving the rune/byte descriptor-name regression.
+func checkBasicNames() {
+	var v any = rune(0)
+	if (*eface)(unsafe.Pointer(&v)).typ.String() != "int32" {
+		panic("abi rune error")
+	}
+	v = byte(0)
+	if (*eface)(unsafe.Pointer(&v)).typ.String() != "uint8" {
+		panic("abi byte error")
+	}
 }
 
 func main() {
+	checkBasicNames()
 	e := toEface(T{})
 	e2 := toEface(abi.Type{})
 
@@ -32,8 +58,8 @@ func main() {
 	println(e2.typ.PtrToThis_)
 
 	f0 := e.typ.StructType().Fields[0]
-	if f0.Typ != e.typ.PtrToThis_ {
-		panic("error field 0")
+	if e.typ.PtrToThis_ != nil {
+		panic("methodless pointer-to-this was generated eagerly")
 	}
 	if f0.Typ.Elem() != e.typ {
 		panic("error field 0 elem")
@@ -53,4 +79,12 @@ func main() {
 	if f3.Typ.Elem() != e.typ {
 		panic("error field 3")
 	}
+}
+
+func toEface(i any) *eface {
+	// CHECK-LABEL: define ptr @main.toEface(%"{{.*}}eface" %{{[0-9]+}}){{.*}} {
+	// CHECK: [[TO_EFACE_ADDR:%[0-9]+]] = call ptr @"{{.*}}/runtime/internal/runtime.AllocZ"(i64 16)
+	// CHECK-NEXT: store %"{{.*}}eface" [[TO_EFACE_VALUE:%[0-9]+]], ptr [[TO_EFACE_ADDR]]
+	// CHECK-NEXT: ret ptr [[TO_EFACE_ADDR]]
+	return (*eface)(unsafe.Pointer(&i))
 }

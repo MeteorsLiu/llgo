@@ -1,10 +1,10 @@
-//go:build go1.23
-// +build go1.23
+//go:build go1.23 && !go1.26
+// +build go1.23,!go1.26
 
 package reflect
 
 import (
-	"github.com/goplus/llgo/runtime/abi"
+	"github.com/xgo-dev/llgo/runtime/abi"
 )
 
 // Type is the representation of a Go type.

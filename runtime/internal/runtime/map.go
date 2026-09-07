@@ -1,15 +1,15 @@
 // Copyright 2014 The Go Authors. All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Use of this source code is governed by a BSD-style license.
+// See LICENSES/Go-BSD-3-Clause.txt at this module root for license terms.
 
 package runtime
 
 import (
 	"unsafe"
 
-	"github.com/goplus/llgo/runtime/abi"
-	"github.com/goplus/llgo/runtime/internal/runtime/goarch"
-	"github.com/goplus/llgo/runtime/internal/runtime/math"
+	"github.com/xgo-dev/llgo/runtime/abi"
+	"github.com/xgo-dev/llgo/runtime/internal/runtime/goarch"
+	"github.com/xgo-dev/llgo/runtime/internal/runtime/math"
 )
 
 // This file contains the implementation of Go's map type.
@@ -1439,7 +1439,8 @@ func reflectlite_maplen(h *hmap) int {
 }
 */
 
-const maxZero = 1024 // must match value in reflect/value.go:maxZero cmd/compile/internal/gc/walk.go:zeroValSize
+const maxZero = abi.ZeroValSize
+
 var zeroVal [maxZero]byte
 
 // mapinitnoop is a no-op function known the Go linker; if a given global

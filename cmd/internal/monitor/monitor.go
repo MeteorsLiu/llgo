@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2025 The GoPlus Authors (goplus.org). All rights reserved.
+ * Copyright (c) 2025 The XGo Authors (xgo.dev). All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -20,10 +20,12 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/goplus/llgo/cmd/internal/base"
-	"github.com/goplus/llgo/cmd/internal/flags"
-	"github.com/goplus/llgo/internal/crosscompile"
-	"github.com/goplus/llgo/internal/monitor"
+	"github.com/xgo-dev/llgo/cmd/internal/base"
+	"github.com/xgo-dev/llgo/cmd/internal/flags"
+	"github.com/xgo-dev/llgo/internal/crosscompile"
+	"github.com/xgo-dev/llgo/internal/lto"
+	"github.com/xgo-dev/llgo/internal/monitor"
+	"github.com/xgo-dev/llgo/internal/optlevel"
 )
 
 // Cmd represents the monitor command.
@@ -34,6 +36,8 @@ var Cmd = &base.Command{
 
 func init() {
 	flags.AddCommonFlags(&Cmd.Flag)
+	flags.AddOptLevelFlags(&Cmd.Flag)
+	flags.AddLTOFlag(&Cmd.Flag)
 	flags.AddEmbeddedFlags(&Cmd.Flag)
 	Cmd.Run = runMonitor
 }
@@ -54,7 +58,11 @@ func runMonitor(cmd *base.Command, args []string) {
 
 	var serialPort []string
 	if flags.Target != "" {
-		conf, err := crosscompile.UseTarget(flags.Target)
+		level := flags.OptLevel
+		if !level.IsValid() {
+			level = optlevel.Oz
+		}
+		conf, err := crosscompile.UseTarget(flags.Target, level, flags.ResolveLTOMode(lto.Off))
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "llgo monitor: %v\n", err)
 			os.Exit(1)

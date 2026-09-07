@@ -1,11 +1,9 @@
-
 name: Targets
 
 on:
   push:
-    branches: 
-      - "**"
-      - "!dependabot/**"
+    branches:
+      - main
   pull_request:
     branches: ["**"]
 
@@ -15,17 +13,18 @@ concurrency:
 
 jobs:
   llgo:
-    continue-on-error: true
     timeout-minutes: 30
     strategy:
       matrix:
         os:
-          - macos-latest
-          - ubuntu-24.04
-        llvm: [19]
-    runs-on: ${{matrix.os}}
+          - ubuntu-latest
+        llvm: [22]
+        include:
+          - os: ubuntu-latest
+            runner: ${{ github.repository == 'xgo-dev/llgo' && fromJSON('["qiniu", "ubuntu-24.04-large"]') || 'ubuntu-latest' }}
+    runs-on: ${{ matrix.runner || matrix.os }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - name: Install dependencies
         uses: ./.github/actions/setup-deps
         with:
@@ -33,15 +32,18 @@ jobs:
 
       - name: Set up Go for build
         uses: ./.github/actions/setup-go
-        with:
-          go-version: "1.24.2"
 
       - name: Install
         run: |
           go install ./...
           echo "LLGO_ROOT=$GITHUB_WORKSPACE" >> $GITHUB_ENV
 
-      - name: Build targets
+      - name: Build targets (empty)
         run: |
-          cd _demo/targetsbuild
-          bash build.sh
+          cd _demo/embed/targetsbuild
+          bash build.sh empty
+
+      - name: Build targets (defer)
+        run: |
+          cd _demo/embed/targetsbuild
+          bash build.sh defer

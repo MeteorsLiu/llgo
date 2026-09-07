@@ -1,4 +1,80 @@
+// LITTEST
+// Scope: common
 package main
+
+// Map capacity hints must honor the source integer's signedness before the
+// common runtime size. These were historically separate package compiles.
+// CHECK-LABEL: define i64 @main.fromInt32(i32 %0){{.*}} {
+// CHECK: [[INT_HINT:%[0-9]+]] = sext i32 %0 to i64
+// CHECK-NEXT: [[INT_MAP:%[0-9]+]] = call ptr @"{{.*}}MakeMap"(ptr @"map[_llgo_string]_llgo_int", i64 [[INT_HINT]])
+// CHECK-NEXT: [[INT_LEN:%[0-9]+]] = call i64 @"{{.*}}MapLen"(ptr [[INT_MAP]])
+// CHECK-NEXT: ret i64 [[INT_LEN]]
+
+// CHECK-LABEL: define i64 @main.fromUint32(i32 %0){{.*}} {
+// CHECK: [[UINT_HINT:%[0-9]+]] = zext i32 %0 to i64
+// CHECK-NEXT: [[UINT_MAP:%[0-9]+]] = call ptr @"{{.*}}MakeMap"(ptr @"map[_llgo_string]_llgo_int", i64 [[UINT_HINT]])
+// CHECK-NEXT: [[UINT_LEN:%[0-9]+]] = call i64 @"{{.*}}MapLen"(ptr [[UINT_MAP]])
+// CHECK-NEXT: ret i64 [[UINT_LEN]]
+
+// make1 covers the full lifecycle. Tie every operation to the map returned by
+// MakeMap, while leaving scalar extraction and control flow to focused tests.
+// CHECK-LABEL: define void @main.make1(){{.*}} {
+// CHECK: %[[MAP:[0-9]+]] = call ptr @"{{.*}}/runtime/internal/runtime.MakeMap"(ptr @"map[_llgo_int]_llgo_string", i64 0)
+// CHECK: %[[ASSIGN:[0-9]+]] = call ptr @"{{.*}}/runtime/internal/runtime.MapAssignFast64"(ptr @"map[_llgo_int]_llgo_string", ptr %[[MAP]], i64 1)
+// CHECK: %[[VALUE:[0-9]+]] = call ptr @"{{.*}}/runtime/internal/runtime.MapAccess1Fast64"(ptr @"map[_llgo_int]_llgo_string", ptr %[[MAP]], i64 1)
+// CHECK: %[[ITER:[0-9]+]] = call ptr @"{{.*}}/runtime/internal/runtime.NewMapIter"(ptr @"map[_llgo_int]_llgo_string", ptr %[[MAP]])
+// CHECK: call { i1, ptr, ptr } @"{{.*}}/runtime/internal/runtime.MapIterNext"(ptr %[[ITER]])
+// CHECK: %[[MAP_LEN:[0-9]+]] = call i64 @"{{.*}}/runtime/internal/runtime.MapLen"(ptr %[[MAP]])
+// CHECK: %[[REVERSE:[0-9]+]] = call ptr @"{{.*}}/runtime/internal/runtime.MakeMap"(ptr @"map[_llgo_string]_llgo_int", i64 %[[MAP_LEN]])
+// CHECK: call ptr @"{{.*}}/runtime/internal/runtime.MapAssignFastStr"(ptr @"map[_llgo_string]_llgo_int", ptr %[[REVERSE]], %"{{.*}}/runtime/internal/runtime.String" %{{[0-9]+}})
+// CHECK: call void @"{{.*}}/runtime/internal/runtime.MapDeleteFastStr"(ptr @"map[_llgo_string]_llgo_int", ptr %[[REVERSE]], %"{{.*}}/runtime/internal/runtime.String" {{.*}})
+// CHECK: call { ptr, i1 } @"{{.*}}/runtime/internal/runtime.MapAccess2FastStr"(ptr @"map[_llgo_string]_llgo_int", ptr %[[REVERSE]], %"{{.*}}/runtime/internal/runtime.String" {{.*}})
+
+// Interface keys retain their dynamic type while assignment and iteration use
+// the same any-key map.
+// CHECK-LABEL: define void @main.make2(){{.*}} {
+// A nil map lookup must use the ordinary access lowering and materialize the
+// element zero value returned by the runtime.
+// CHECK: %[[NIL_VALUE_PTR:[0-9]+]] = call ptr @"{{.*}}/runtime/internal/runtime.MapAccess1Fast64"(ptr @"map[_llgo_int]_llgo_string", ptr null, i64 42)
+// CHECK: %[[NIL_VALUE:[0-9]+]] = load %"{{.*}}/runtime/internal/runtime.String", ptr %[[NIL_VALUE_PTR]]
+// CHECK: %[[ANY_MAP:[0-9]+]] = call ptr @"{{.*}}/runtime/internal/runtime.MakeMap"(ptr @"map[_llgo_any]_llgo_int", i64 0)
+// CHECK: insertvalue %"{{.*}}/runtime/internal/runtime.eface" { ptr @_llgo_main.N1, ptr undef }, ptr %{{[0-9]+}}, 1
+// CHECK: call ptr @"{{.*}}/runtime/internal/runtime.MapAssign"(ptr @"map[_llgo_any]_llgo_int", ptr %[[ANY_MAP]], ptr %{{[0-9]+}})
+// CHECK: %[[ANY_ITER:[0-9]+]] = call ptr @"{{.*}}/runtime/internal/runtime.NewMapIter"(ptr @"map[_llgo_any]_llgo_int", ptr %[[ANY_MAP]])
+// CHECK: call { i1, ptr, ptr } @"{{.*}}/runtime/internal/runtime.MapIterNext"(ptr %[[ANY_ITER]])
+
+// Array-of-value and array-of-pointer interface keys both go through dynamic
+// equality, but remain separate source scenarios.
+// CHECK-LABEL: define void @main.make3(){{.*}} {
+// CHECK: call i1 @"{{.*}}/runtime/internal/runtime.EfaceEqual"
+// CHECK: call ptr @"{{.*}}/runtime/internal/runtime.MapAssign"(ptr @"map[_llgo_any]_llgo_int"
+
+// CHECK-LABEL: define void @main.make4(){{.*}} {
+// CHECK: call i1 @"{{.*}}/runtime/internal/runtime.EfaceEqual"
+// CHECK: call ptr @"{{.*}}/runtime/internal/runtime.MapAssign"(ptr @"map[_llgo_any]_llgo_int"
+
+// Channel identity is used both through interface equality and as a direct map
+// key; both operations must consume the channel created here.
+// CHECK-LABEL: define void @main.make5(){{.*}} {
+// CHECK: %[[CHAN:[0-9]+]] = call ptr @"{{.*}}/runtime/internal/runtime.NewChan"(i64 8, i64 0)
+// CHECK: insertvalue %"{{.*}}/runtime/internal/runtime.eface" { ptr @"chan _llgo_int", ptr undef }, ptr %[[CHAN]], 1
+// CHECK: call i1 @"{{.*}}/runtime/internal/runtime.EfaceEqual"
+// CHECK: %[[CHAN_MAP:[0-9]+]] = call ptr @"{{.*}}/runtime/internal/runtime.MakeMap"(ptr @"map[chan _llgo_int]_llgo_int", i64 0)
+// CHECK: call ptr @"{{.*}}/runtime/internal/runtime.MapAssignFast64Ptr"(ptr @"map[chan _llgo_int]_llgo_int", ptr %[[CHAN_MAP]], ptr %[[CHAN]])
+
+// A named map uses its named descriptor for operations even though allocation
+// uses the identical underlying map layout.
+// CHECK-LABEL: define void @main.make6(){{.*}} {
+// CHECK: %[[NAMED_MAP:[0-9]+]] = call ptr @"{{.*}}/runtime/internal/runtime.MakeMap"(ptr @"map[_llgo_int]_llgo_string", i64 0)
+// CHECK: call ptr @"{{.*}}/runtime/internal/runtime.MapAssignFast64"(ptr @_llgo_main.M, ptr %[[NAMED_MAP]], i64 1)
+// CHECK: call ptr @"{{.*}}/runtime/internal/runtime.NewMapIter"(ptr @_llgo_main.M, ptr %[[NAMED_MAP]])
+
+// A local named key has its own descriptor and the literal's two entries are
+// reflected in the allocation hint.
+// CHECK-LABEL: define void @main.make7(){{.*}} {
+// CHECK: %[[LOCAL_MAP:[0-9]+]] = call ptr @"{{.*}}/runtime/internal/runtime.MakeMap"(ptr @"map[_llgo_main.N.7.0]_llgo_string", i64 2)
+// CHECK: call ptr @"{{.*}}/runtime/internal/runtime.MapAssignFast64"(ptr @"map[_llgo_main.N.7.0]_llgo_string", ptr %[[LOCAL_MAP]], i64 1)
+// CHECK: call ptr @"{{.*}}/runtime/internal/runtime.MapAccess1Fast64"(ptr @"map[_llgo_main.N.7.0]_llgo_string", ptr %[[LOCAL_MAP]], i64 1)
 
 func main() {
 	make1()
@@ -47,6 +123,9 @@ func make2() {
 	println(m2, len(m2), m2 == nil, m2 != nil)
 	var m3 map[int]string
 	println(m3, len(m3), m3 == nil, m3 != nil)
+	if got := m3[42]; got != "" {
+		panic("nil map lookup returned a non-zero value")
+	}
 
 	n := make(map[any]int)
 	n[N1{1}] = 100
@@ -125,4 +204,12 @@ func make7() {
 		println(k, v)
 	}
 	println(m[1])
+}
+
+func fromInt32(n int32) int {
+	return len(make(map[string]int, n))
+}
+
+func fromUint32(n uint32) int {
+	return len(make(map[string]int, n))
 }

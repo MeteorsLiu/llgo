@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2024 The GoPlus Authors (goplus.org). All rights reserved.
+ * Copyright (c) 2024 The XGo Authors (xgo.dev). All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -21,8 +21,8 @@ import (
 	"log"
 	"os"
 
-	"github.com/goplus/llgo/xtool/env/llvm"
-	nmtool "github.com/goplus/llgo/xtool/nm"
+	"github.com/xgo-dev/llgo/xtool/env/llvm"
+	nmtool "github.com/xgo-dev/llgo/xtool/nm"
 )
 
 func main() {

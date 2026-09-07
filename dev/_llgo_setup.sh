@@ -1,0 +1,72 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Common setup for dev/llgo*.sh wrappers.
+
+_llgo_setup_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LLGO_ROOT="$(cd "${_llgo_setup_dir}/.." && pwd)"
+LLGO_WORKDIR="${LLGO_CALLER_PWD:-$(pwd -P)}"
+
+_llgo_require_repo_context() {
+	case "$LLGO_WORKDIR" in
+		"$LLGO_ROOT" | "$LLGO_ROOT"/*) ;;
+		*)
+			echo "error: must run inside LLGO_ROOT (${LLGO_ROOT}), got: ${LLGO_WORKDIR}" >&2
+			exit 2
+			;;
+	esac
+
+	for required in go.mod dev/docker-compose.yml; do
+		if [ ! -e "${LLGO_ROOT}/${required}" ]; then
+			echo "error: invalid LLGO_ROOT (${LLGO_ROOT}); missing ${required}" >&2
+			exit 2
+		fi
+	done
+}
+
+_llgo_compute_bin_path() {
+	local gobin gohostos
+	gohostos="$(cd "${LLGO_ROOT}" && go env GOHOSTOS)"
+	gobin="$(cd "${LLGO_ROOT}" && go env GOBIN)"
+	if [ -z "$gobin" ]; then
+		local gopath_raw
+		gopath_raw="$(cd "${LLGO_ROOT}" && go env GOPATH)"
+		if [ "$gohostos" = "windows" ]; then
+			# A drive colon belongs to the path; Windows separates multiple
+			# GOPATH entries with semicolons.
+			gobin="${gopath_raw%%;*}/bin"
+		else
+			gobin="${gopath_raw%%:*}/bin"
+		fi
+	fi
+	if [ "$gohostos" = "windows" ] && command -v cygpath >/dev/null 2>&1; then
+		gobin="$(cygpath -u "$gobin")"
+	fi
+	LLGO_BIN="${gobin}/llgo"
+}
+
+_llgo_ensure_llgo_cli() {
+	if [ -n "${LLGO_TEST_COMPILER:-}" ]; then
+		LLGO_BIN="$LLGO_TEST_COMPILER"
+		if command -v cygpath >/dev/null 2>&1; then
+			LLGO_BIN="$(cygpath -u "$LLGO_BIN")"
+		fi
+		if [ ! -x "$LLGO_BIN" ]; then
+			echo "error: LLGO_TEST_COMPILER is not executable: ${LLGO_TEST_COMPILER}" >&2
+			exit 2
+		fi
+		return
+	fi
+
+	_llgo_compute_bin_path
+
+	(
+		cd "${LLGO_ROOT}"
+		go install -tags=dev ./cmd/llgo
+	)
+}
+
+_llgo_require_repo_context
+
+# shellcheck disable=SC2034 # exported for wrappers to use directly
+export LLGO_ROOT

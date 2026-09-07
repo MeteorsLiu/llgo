@@ -1,0 +1,97 @@
+[TypeChildren]
+*_llgo_main.T:
+    _llgo_main.T
+_llgo_main.T:
+    *_llgo_main.T
+
+[OrdinaryEdges]
+*_llgo_main.T:
+    _llgo_main.T
+    github.com/xgo-dev/llgo/runtime/internal/runtime.memequalptr
+_llgo_main.T:
+    *_llgo_main.T
+    github.com/xgo-dev/llgo/runtime/internal/runtime.memequal0
+main.(*T).M:
+    github.com/xgo-dev/llgo/runtime/internal/runtime.AssertNilDeref
+    github.com/xgo-dev/llgo/runtime/internal/runtime.PanicWrapNilPointer
+    main.T.M
+main.(*T).m:
+    github.com/xgo-dev/llgo/runtime/internal/runtime.AssertNilDeref
+    github.com/xgo-dev/llgo/runtime/internal/runtime.PanicWrapNilPointer
+    main.T.m
+main.init:
+    main.init$guard
+    reflect.init
+main.main:
+    _llgo_main.T
+    github.com/xgo-dev/llgo/runtime/internal/runtime.AllocU
+    github.com/xgo-dev/llgo/runtime/internal/runtime.IfacePtrData
+    reflect.TypeOf
+
+[UseIface]
+main.main:
+    _llgo_main.T
+    _llgo_main.T
+
+[UseIfaceMethod]
+main.main:
+    github.com/xgo-dev/llgo/runtime/internal/lib/reflect.iface$bReUJH2_12QVkFcde1SpCUgXqmhRT8DRulK5lXtpIkY MethodByName _llgo_func$aM2cVUtLQbPq1YHtnabQiM7XJ5Cg5RyV6BIDWrqey7E
+    github.com/xgo-dev/llgo/runtime/internal/lib/reflect.iface$bReUJH2_12QVkFcde1SpCUgXqmhRT8DRulK5lXtpIkY MethodByName _llgo_func$aM2cVUtLQbPq1YHtnabQiM7XJ5Cg5RyV6BIDWrqey7E
+
+[UseNamedMethod]
+main.main:
+    M
+    m
+
+[MethodInfo]
+*_llgo_main.T:
+    0 M _llgo_func$2_iS07vIlF2_rZqWB5eU0IvP_9HviM4MYZNkXZDvbac main.(*T).M main.(*T).M
+    1 main.m _llgo_func$2_iS07vIlF2_rZqWB5eU0IvP_9HviM4MYZNkXZDvbac main.(*T).m main.(*T).m
+_llgo_main.T:
+    0 M _llgo_func$2_iS07vIlF2_rZqWB5eU0IvP_9HviM4MYZNkXZDvbac main.(*T).M main.T.M
+    1 main.m _llgo_func$2_iS07vIlF2_rZqWB5eU0IvP_9HviM4MYZNkXZDvbac main.(*T).m main.T.m
+
+[InterfaceInfo]
+github.com/xgo-dev/llgo/runtime/internal/lib/reflect.iface$bReUJH2_12QVkFcde1SpCUgXqmhRT8DRulK5lXtpIkY:
+    Align _llgo_func$ETeB8WwW04JEq0ztcm-XPTJtuYvtpkjIsAc0-2NT9zA
+    AssignableTo _llgo_func$Kxk9fspGkjXcoNWf2ucHG1vOQ5VHxVtYionfm-DnvWE
+    Bits _llgo_func$ETeB8WwW04JEq0ztcm-XPTJtuYvtpkjIsAc0-2NT9zA
+    CanSeq _llgo_func$YHeRw3AOvQtzv982-ZO3Yn8vh3Fx89RM3VvI8E4iKVk
+    CanSeq2 _llgo_func$YHeRw3AOvQtzv982-ZO3Yn8vh3Fx89RM3VvI8E4iKVk
+    ChanDir _llgo_func$JO3khPIbANSMBmoN6P7ybYAeUBd3Gv6toVUqNeE7qbE
+    Comparable _llgo_func$YHeRw3AOvQtzv982-ZO3Yn8vh3Fx89RM3VvI8E4iKVk
+    ConvertibleTo _llgo_func$Kxk9fspGkjXcoNWf2ucHG1vOQ5VHxVtYionfm-DnvWE
+    Elem _llgo_func$b6KOG2Oj7wt8ogb9H8QPbhEfXhxMMjdxRZgPLK_UOwI
+    Field _llgo_func$Q3NYrysaKgu1MtMuLQwb-k5QcKGHihnt-tV_NlNJQFA
+    FieldAlign _llgo_func$ETeB8WwW04JEq0ztcm-XPTJtuYvtpkjIsAc0-2NT9zA
+    FieldByIndex _llgo_func$LPPtiM49dEPl48CC3WRhXm3YPnfUJEZE_k8Tx3rMuSk
+    FieldByName _llgo_func$dEvABJ5r0MMUlf4smWpIDG5dO8AuGklGdNJ1xneL3UM
+    FieldByNameFunc _llgo_func$xySrXVFC_2LK2oP71R2UryKi6UmdEJUo9k6aQuz4TvI
+    Fields _llgo_func$oBV5vpKn4Ua1AX8aLdZdui_u_jYkARX719I2f59QfI0
+    Implements _llgo_func$Kxk9fspGkjXcoNWf2ucHG1vOQ5VHxVtYionfm-DnvWE
+    In _llgo_func$dPYu3A0LoGTV2Hd8PW4KPw2ITiUSo9q-4Bg9ZrPITnY
+    Ins _llgo_func$8_pqxZCIokgbis1m-GfDe9OwwxKW0spiCo-YwkvkWSQ
+    IsVariadic _llgo_func$YHeRw3AOvQtzv982-ZO3Yn8vh3Fx89RM3VvI8E4iKVk
+    Key _llgo_func$b6KOG2Oj7wt8ogb9H8QPbhEfXhxMMjdxRZgPLK_UOwI
+    Kind _llgo_func$w8Mj2LK8G5p7MIiGWR6MYjyXy3L8SVVzYlT1bb6KNXk
+    Len _llgo_func$ETeB8WwW04JEq0ztcm-XPTJtuYvtpkjIsAc0-2NT9zA
+    Method _llgo_func$FmJJGomlX5kINJGxQdQDCAkD89ySoMslAYFrziWInVc
+    MethodByName _llgo_func$aM2cVUtLQbPq1YHtnabQiM7XJ5Cg5RyV6BIDWrqey7E
+    Methods _llgo_func$9XHZL9qb1KUOQ6EU9OsN3ciYPpEIDSIJvzJ89Pr58Eo
+    Name _llgo_func$zNDVRsWTIpUPKouNUS805RGX--IV9qVK8B31IZbg5to
+    NumField _llgo_func$ETeB8WwW04JEq0ztcm-XPTJtuYvtpkjIsAc0-2NT9zA
+    NumIn _llgo_func$ETeB8WwW04JEq0ztcm-XPTJtuYvtpkjIsAc0-2NT9zA
+    NumMethod _llgo_func$ETeB8WwW04JEq0ztcm-XPTJtuYvtpkjIsAc0-2NT9zA
+    NumOut _llgo_func$ETeB8WwW04JEq0ztcm-XPTJtuYvtpkjIsAc0-2NT9zA
+    Out _llgo_func$dPYu3A0LoGTV2Hd8PW4KPw2ITiUSo9q-4Bg9ZrPITnY
+    Outs _llgo_func$8_pqxZCIokgbis1m-GfDe9OwwxKW0spiCo-YwkvkWSQ
+    OverflowComplex _llgo_func$cGkbH-2LQOLoq64Rqj3WeO56U8al7FfVkf5K1FFbPpE
+    OverflowFloat _llgo_func$uk7PgUVap9GZdvS8R_mZCDbAbqnAbcNryqybtDogUNI
+    OverflowInt _llgo_func$odFOIClZoEVGbTP_BEfZxVM5ex3r8Fj1afUEeP_awp8
+    OverflowUint _llgo_func$7I97sofX8UqJA96mVIy89KPUfSM_efkrR-mJQ9qaHfk
+    PkgPath _llgo_func$zNDVRsWTIpUPKouNUS805RGX--IV9qVK8B31IZbg5to
+    Size _llgo_func$1kITCsyu7hFLMxHLR7kDlvu4SOra_HtrtdFUQH9P13s
+    String _llgo_func$zNDVRsWTIpUPKouNUS805RGX--IV9qVK8B31IZbg5to
+    reflect.common _llgo_func$_FtQJl7A5s1VI_ob-KR67FLMXbIG5TjcVaEFuqM5Lo4
+    reflect.uncommon _llgo_func$tpkXXN4h9pcUPRsL9rq-8-w7qAx06dW7DgXtepA0U1E
+

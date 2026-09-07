@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2024 The GoPlus Authors (goplus.org). All rights reserved.
+ * Copyright (c) 2024 The XGo Authors (xgo.dev). All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -19,9 +19,9 @@ package runtime
 import (
 	"unsafe"
 
-	"github.com/goplus/llgo/runtime/abi"
-	c "github.com/goplus/llgo/runtime/internal/clite"
-	"github.com/goplus/llgo/runtime/internal/runtime/math"
+	"github.com/xgo-dev/llgo/runtime/abi"
+	c "github.com/xgo-dev/llgo/runtime/internal/clite"
+	"github.com/xgo-dev/llgo/runtime/internal/runtime/math"
 )
 
 // -----------------------------------------------------------------------------
@@ -33,10 +33,51 @@ type Slice struct {
 	cap  int
 }
 
-func NewSlice3(base unsafe.Pointer, eltSize, cap, i, j, k int) (s Slice) {
-	if i < 0 || j < i || k < j || k > cap {
-		panic("slice index out of bounds")
+func NewSlice2(base unsafe.Pointer, eltSize, cap int, i, j int64, iSigned, jSigned, upperIsLen bool) (s Slice) {
+	upperCode := boundsSliceAcap
+	if upperIsLen {
+		upperCode = boundsSliceAlen
 	}
+	if boundsOutOfRange(j, jSigned, cap, true) {
+		panicBounds(j, jSigned, cap, upperCode)
+	}
+	if boundsAbove(i, iSigned, j) {
+		panicBounds(i, iSigned, int(j), boundsSliceB)
+	}
+	return newSliceUnchecked(base, eltSize, int(i), int(j), cap)
+}
+
+func NewSlice3Bounds(base unsafe.Pointer, eltSize, cap int, i, j, k int64, iSigned, jSigned, kSigned, upperIsLen bool) (s Slice) {
+	upperCode := boundsSlice3Acap
+	if upperIsLen {
+		upperCode = boundsSlice3Alen
+	}
+	if boundsOutOfRange(k, kSigned, cap, true) {
+		panicBounds(k, kSigned, cap, upperCode)
+	}
+	if boundsAbove(j, jSigned, k) {
+		panicBounds(j, jSigned, int(k), boundsSlice3B)
+	}
+	if boundsAbove(i, iSigned, j) {
+		panicBounds(i, iSigned, int(j), boundsSlice3C)
+	}
+	return newSliceUnchecked(base, eltSize, int(i), int(j), int(k))
+}
+
+func NewSlice3(base unsafe.Pointer, eltSize, cap, i, j, k int) (s Slice) {
+	if k < 0 || k > cap {
+		panic(boundsError{x: int64(k), signed: true, y: cap, code: boundsSlice3Acap})
+	}
+	if j < 0 || j > k {
+		panic(boundsError{x: int64(j), signed: true, y: k, code: boundsSlice3B})
+	}
+	if i < 0 || i > j {
+		panic(boundsError{x: int64(i), signed: true, y: j, code: boundsSlice3C})
+	}
+	return newSliceUnchecked(base, eltSize, i, j, k)
+}
+
+func newSliceUnchecked(base unsafe.Pointer, eltSize, i, j, k int) (s Slice) {
 	s.len = j - i
 	s.cap = k - i
 	if k-i > 0 {
@@ -49,11 +90,11 @@ func NewSlice3(base unsafe.Pointer, eltSize, cap, i, j, k int) (s Slice) {
 
 // SliceAppend append elem data and returns a slice.
 func SliceAppend(src Slice, data unsafe.Pointer, num, etSize int) Slice {
+	oldLen := src.len
+	src = GrowSlice(src, num, etSize)
 	if etSize == 0 {
 		return src
 	}
-	oldLen := src.len
-	src = GrowSlice(src, num, etSize)
 	c.Memcpy(c.Advance(src.data, oldLen*etSize), data, uintptr(num*etSize))
 	return src
 }
@@ -62,9 +103,16 @@ func SliceAppend(src Slice, data unsafe.Pointer, num, etSize int) Slice {
 func GrowSlice(src Slice, num, etSize int) Slice {
 	oldLen := src.len
 	newLen := oldLen + num
+	if newLen < 0 {
+		panicgrowslicelen()
+	}
 	if newLen > src.cap {
 		newCap := nextslicecap(newLen, src.cap)
-		p := AllocZ(uintptr(newCap * etSize))
+		mem, overflow := math.MulUintptr(uintptr(etSize), uintptr(newCap))
+		if overflow || mem > maxAlloc {
+			panicgrowslicelen()
+		}
+		p := AllocZ(mem)
 		if oldLen != 0 {
 			c.Memcpy(p, src.data, uintptr(oldLen*etSize))
 		}
@@ -142,8 +190,32 @@ func panicmakeslicecap() {
 	panic(errorString("makeslice: cap out of range"))
 }
 
+func panicgrowslicelen() {
+	panic(errorString("growslice: len out of range"))
+}
+
 func SliceClear(t *abi.SliceType, s Slice) {
 	c.Memset(s.data, 0, uintptr(s.len)*t.Elem.Size())
+}
+
+func unsafeslice(et *abi.Type, ptr unsafe.Pointer, len int) {
+	if len < 0 {
+		panic(errorString("unsafe.Slice: len out of range"))
+	}
+
+	if et.Size_ == 0 {
+		if ptr == nil && len > 0 {
+			panic(errorString("unsafe.Slice: ptr is nil and len is not zero"))
+		}
+	}
+
+	mem, overflow := math.MulUintptr(et.Size_, uintptr(len))
+	if overflow || mem > -uintptr(ptr) {
+		if ptr == nil {
+			panic(errorString("unsafe.Slice: ptr is nil and len is not zero"))
+		}
+		panic(errorString("unsafe.Slice: len out of range"))
+	}
 }
 
 // -----------------------------------------------------------------------------
