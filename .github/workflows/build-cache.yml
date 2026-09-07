@@ -32,7 +32,7 @@ jobs:
           - os: windows-2022
             llvm: 22
             windows_abi: mingw
-    runs-on: ${{ matrix.runner || matrix.os }}
+    runs-on: ${{ matrix.runner && (github.repository == 'xgo-dev/llgo' && matrix.runner || 'ubuntu-latest') || matrix.os }}
     steps:
       - uses: actions/checkout@v7
 
