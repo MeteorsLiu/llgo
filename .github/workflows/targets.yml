@@ -19,7 +19,10 @@ jobs:
         os:
           - ubuntu-latest
         llvm: [22]
-    runs-on: ${{ github.repository == 'xgo-dev/llgo' && fromJSON('["qiniu", "ubuntu-24.04-large"]') || 'ubuntu-latest' }}
+        include:
+          - os: ubuntu-latest
+            runner: ${{ github.repository == 'xgo-dev/llgo' && fromJSON('["qiniu", "ubuntu-24.04-large"]') || 'ubuntu-latest' }}
+    runs-on: ${{ matrix.runner || matrix.os }}
     steps:
       - uses: actions/checkout@v7
       - name: Install dependencies

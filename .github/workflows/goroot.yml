@@ -53,8 +53,8 @@ jobs:
             windows_arch: "386"
         include:
           - os: ubuntu-latest
-            runner: [qiniu, ubuntu-24.04-large]
-    runs-on: ${{ matrix.runner && (github.repository == 'xgo-dev/llgo' && matrix.runner || 'ubuntu-latest') || matrix.os }}
+            runner: ${{ github.repository == 'xgo-dev/llgo' && fromJSON('["qiniu", "ubuntu-24.04-large"]') || 'ubuntu-latest' }}
+    runs-on: ${{ matrix.runner || matrix.os }}
     steps:
       - uses: actions/checkout@v7
 
