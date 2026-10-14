@@ -46,7 +46,15 @@ func inspect(adapter, executable, directory string, fixture *existingFixture, lo
 	if !capabilities.ReadMemory {
 		return nil, fmt.Errorf("LLDB adapter does not support readMemory")
 	}
-	launch, err := client.send("launch", map[string]any{"program": executable, "cwd": directory, "args": append([]string{}, arguments...), "stopOnEntry": false})
+	// The observation executable carries its DWARF. External lookups such as
+	// Ubuntu's debuginfod can stall each launch on network timeouts.
+	launch, err := client.send("launch", map[string]any{
+		"program":      executable,
+		"cwd":          directory,
+		"args":         append([]string{}, arguments...),
+		"stopOnEntry":  false,
+		"initCommands": []string{"settings set symbols.enable-external-lookup false"},
+	})
 	if err != nil {
 		return nil, err
 	}
