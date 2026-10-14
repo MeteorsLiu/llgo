@@ -301,6 +301,14 @@ jobs:
         with:
           windows-abi: ${{ matrix.abi }}
           windows-arch: ${{ matrix.goarch }}
+      - name: Build the matching host IR tool
+        id: layout-ir-tool
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          # Build before target activation selects the generated program's CRT.
+          go build -o (Join-Path $env:RUNNER_TEMP 'layout-llgen.exe') ./chore/llgen
+          if ($LASTEXITCODE -ne 0) { throw "Building the layout IR tool failed" }
       - name: Activate native Windows target
         uses: ./.github/actions/activate-windows-target
         with:
@@ -318,6 +326,15 @@ jobs:
         run: >-
           ./.github/windows/test-release.ps1
           -Profile '${{ matrix.abi }}' -GoArch '${{ matrix.goarch }}'
+
+      - name: Check installed Windows compiler layouts
+        if: ${{ !cancelled() && steps.layout-ir-tool.outcome == 'success' }}
+        uses: ./.github/actions/check-layout
+        with:
+          llgo: ${{ runner.temp }}/llgo-release-install/bin/llgo.exe
+          llgen: ${{ runner.temp }}/layout-llgen.exe
+          runtime-root: ${{ runner.temp }}/llgo-release-install/current
+          artifact-name: layout-release-windows-${{ matrix.goarch }}-${{ matrix.abi }}
 
   prepare-winget:
     if: needs.prepare.outputs.run_code_ci == 'true'
@@ -414,6 +431,26 @@ jobs:
 
       - name: Test native assembly shared-library calls
         run: bash dev/test_native_asm.sh
+
+      - name: Install layout inspection build dependencies
+        # Keep these after the installed-compiler smoke tests so development
+        # LLVM libraries cannot hide a missing release dependency.
+        uses: ./.github/actions/setup-deps
+        with:
+          llvm-version: 22
+
+      - name: Build the matching IR tool
+        id: layout-ir-tool
+        run: go build -o "$RUNNER_TEMP/layout-llgen" ./chore/llgen
+
+      - name: Check installed Unix compiler layouts
+        if: ${{ !cancelled() && steps.layout-ir-tool.outcome == 'success' }}
+        uses: ./.github/actions/check-layout
+        with:
+          llgo: ${{ runner.temp }}/llgo-release-install/bin/llgo
+          llgen: ${{ runner.temp }}/layout-llgen
+          runtime-root: ${{ runner.temp }}/llgo-release-install/current
+          artifact-name: layout-release-${{ matrix.goos }}-${{ matrix.goarch }}
 
   release:
     permissions:

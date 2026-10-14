@@ -1,0 +1,185 @@
+name: Check Go layouts
+description: Compare existing Go debugger fixtures with the selected native LLGo compiler
+inputs:
+  llgo:
+    description: Path to the already-built LLGo compiler being checked
+    required: true
+  llgen:
+    description: Path to the already-built llgen tool from the same source revision and build configuration
+    required: true
+  artifact-name:
+    description: Unique artifact and temporary-directory name for this invocation
+    required: true
+  source-root:
+    description: Source checkout containing the existing debugger fixtures; defaults to github.workspace
+    required: false
+    default: ""
+  runtime-root:
+    description: LLGO_ROOT for the selected compiler; defaults to source-root
+    required: false
+    default: ""
+runs:
+  using: composite
+  steps:
+    - name: Install Linux debug adapter
+      if: runner.os == 'Linux'
+      shell: bash
+      run: sudo apt-get install -y lldb-22
+
+    - name: Select Windows LLDB runtime installer environment
+      if: runner.os == 'Windows' && env.LLGO_WINDOWS_ARCH != '386' && (env.LLGO_WINDOWS_ABI == 'msvc' || env.LLGO_WINDOWS_ARCH != 'amd64') && env.LLGO_WINDOWS_LLDB_PYTHON_HOME == ''
+      id: python-path
+      shell: powershell
+      run: |
+        $ErrorActionPreference = "Stop"
+        $path = $env:PATH
+        if ($env:LLGO_WINDOWS_ARCH -eq 'arm64') {
+          # Match setup-demo-deps: tool-cache's PowerShell 7 ZIP extraction
+          # can abort on Windows ARM64 before its error handler runs.
+          $pwshDir = (Split-Path (Get-Command pwsh.exe -ErrorAction Stop).Source).TrimEnd('\')
+          $path = (($path -split ';') | Where-Object {
+            $_ -and $_.Trim().Trim('"').TrimEnd('\') -ine $pwshDir
+          }) -join ';'
+        }
+        "path=$path" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+    - name: Install the official Windows LLDB runtime dependency
+      if: runner.os == 'Windows' && env.LLGO_WINDOWS_ARCH != '386' && (env.LLGO_WINDOWS_ABI == 'msvc' || env.LLGO_WINDOWS_ARCH != 'amd64') && env.LLGO_WINDOWS_LLDB_PYTHON_HOME == ''
+      id: python
+      uses: actions/setup-python@v7
+      env:
+        PATH: ${{ steps.python-path.outputs.path }}
+      with:
+        python-version: "3.11.9"
+        architecture: ${{ env.LLGO_WINDOWS_ARCH == 'arm64' && 'arm64' || 'x64' }}
+        update-environment: false
+
+    - name: Install MinGW amd64 debug adapter
+      if: runner.os == 'Windows' && env.LLGO_WINDOWS_ABI == 'mingw' && env.LLGO_WINDOWS_ARCH == 'amd64' && env.LLGO_LLDB == ''
+      id: mingw
+      shell: msys2 {0}
+      env:
+        LAYOUT_SOURCE_ROOT: ${{ inputs.source-root || github.workspace }}
+      run: |
+        set -euo pipefail
+        source "$LAYOUT_SOURCE_ROOT/.github/actions/setup-deps/pacman_retry.sh"
+        repo=https://repo.msys2.org/mingw/clang64
+        prefix=mingw-w64-clang-x86_64
+        pacman_args=(--noconfirm -U)
+        for dependency in cc-libs expat bzip2 mpdecimal ncurses openssl sqlite3 tcl tk tzdata; do
+          pacman_args+=(--assume-installed "$prefix-$dependency")
+        done
+        pacman_with_retry "${pacman_args[@]}" \
+          "$repo/$prefix-python-3.14.6-2-any.pkg.tar.zst" \
+          "$repo/$prefix-lldb-22.1.8-1-any.pkg.tar.zst"
+        echo "lldb=$(cygpath -m /clang64/bin/lldb.exe)" >> "$GITHUB_OUTPUT"
+
+    - name: Prepare Windows debug adapter paths
+      if: runner.os == 'Windows'
+      id: windows
+      shell: pwsh
+      env:
+        LAYOUT_NAME: ${{ inputs.artifact-name }}
+        LAYOUT_MINGW_LLDB: ${{ steps.mingw.outputs.lldb }}
+        LAYOUT_PYTHON: ${{ steps.python.outputs.python-path }}
+      run: |
+        $ErrorActionPreference = "Stop"
+        if ($env:LLGO_WINDOWS_ARCH -notin @('386', 'amd64', 'arm64') -or
+            $env:LLGO_WINDOWS_ABI -notin @('msvc', 'mingw')) {
+          throw "Run setup-deps for the native Windows target before check-layout"
+        }
+        $lldb = if ($env:LAYOUT_MINGW_LLDB) { $env:LAYOUT_MINGW_LLDB } else { $env:LLGO_LLDB }
+        if (-not $lldb -or -not (Test-Path -LiteralPath $lldb)) {
+          throw "The target-native LLDB executable is unavailable"
+        }
+        $pythonHome = $env:LLGO_WINDOWS_LLDB_PYTHON_HOME
+        $pythonPath = $env:LLGO_WINDOWS_LLDB_PYTHONPATH
+        if ($env:LLGO_WINDOWS_ARCH -eq '386') {
+          $lldbRoot = Split-Path (Split-Path $lldb)
+          $pythonHome = Join-Path $lldbRoot 'python'
+          $pythonPath = Join-Path $pythonHome 'lib\python3.14\site-packages'
+          $adapter = Join-Path (Split-Path $lldb) 'lldb-dap.exe'
+        } elseif ($env:LLGO_WINDOWS_ABI -eq 'mingw' -and $env:LLGO_WINDOWS_ARCH -eq 'amd64') {
+          $adapter = Join-Path (Split-Path $lldb) 'lldb-dap.exe'
+        } else {
+          if ($env:LAYOUT_PYTHON) { $pythonHome = Split-Path $env:LAYOUT_PYTHON }
+          if (-not (Test-Path (Join-Path $pythonHome 'python311.dll'))) {
+            throw "The LLVM 22 LLDB runtime dependency is incomplete"
+          }
+          # setup-deps already supplies matching liblldb.dll. Extract only
+          # its omitted DAP executable into this invocation's private folder.
+          $installerArch = if ($env:LLGO_WINDOWS_ARCH -eq 'arm64') { 'woa64' } else { 'win64' }
+          $expected = if ($env:LLGO_WINDOWS_ARCH -eq 'arm64') {
+            '76f44ef1ba6eeb5a65904e9500f042f588fade49952778ce48f0374daa934396'
+          } else {
+            '16e5709785fef73c854646241c4a92c5cd574318d1b33c63330dd7721903e55c'
+          }
+          $destination = Join-Path $env:RUNNER_TEMP ($env:LAYOUT_NAME + '-dap')
+          $installerName = "LLVM-22.1.8-$installerArch.exe"
+          $installer = Join-Path $env:RUNNER_TEMP ($env:LAYOUT_NAME + '-' + $installerName)
+          $url = "https://github.com/llvm/llvm-project/releases/download/llvmorg-22.1.8/$installerName"
+          & curl.exe --fail --location --retry 5 --retry-all-errors --output $installer $url
+          if ($LASTEXITCODE -ne 0) { throw "Downloading the layout debug adapter failed" }
+          $actual = (Get-FileHash -Algorithm SHA256 $installer).Hash
+          if (-not $actual.Equals($expected, [StringComparison]::OrdinalIgnoreCase)) {
+            throw "Layout debug adapter installer SHA-256 is $actual, want $expected"
+          }
+          & (Join-Path $env:ProgramFiles '7-Zip\7z.exe') x -y "-o$destination" $installer 'bin\lldb-dap.exe'
+          if ($LASTEXITCODE -ne 0) { throw "Extracting the layout debug adapter failed" }
+          $adapter = Join-Path $destination 'bin\lldb-dap.exe'
+        }
+        if (-not (Test-Path -LiteralPath $adapter)) { throw "lldb-dap.exe was not found: $adapter" }
+        "adapter=$adapter" >> $env:GITHUB_OUTPUT
+        "lldb=$lldb" >> $env:GITHUB_OUTPUT
+        "python-home=$pythonHome" >> $env:GITHUB_OUTPUT
+        "python-path=$pythonPath" >> $env:GITHUB_OUTPUT
+
+    - name: Compare native layouts on Unix
+      if: runner.os != 'Windows'
+      shell: bash
+      env:
+        LAYOUT_RUNNER: ${{ github.action_path }}/../../../test/debug/layout
+        LAYOUT_SOURCE: ${{ inputs.source-root || github.workspace }}
+        LLGO_ROOT: ${{ inputs.runtime-root || inputs.source-root || github.workspace }}
+        LAYOUT_LLGO: ${{ inputs.llgo }}
+        LAYOUT_LLGEN: ${{ inputs.llgen }}
+        LAYOUT_OUTPUT: ${{ runner.temp }}/${{ inputs.artifact-name }}
+      run: |
+        set -euo pipefail
+        if [[ "$RUNNER_OS" == macOS ]]; then
+          adapter=$(xcrun --find lldb-dap)
+        else
+          adapter="$("${LLVM_CONFIG:-llvm-config}" --bindir)/lldb-dap"
+        fi
+        go -C "$LAYOUT_RUNNER" run . -root "$LAYOUT_SOURCE" \
+          -llgo "$LAYOUT_LLGO" -llgen "$LAYOUT_LLGEN" \
+          -lldb-dap "$adapter" -output "$LAYOUT_OUTPUT"
+
+    - name: Compare native layouts on Windows
+      if: runner.os == 'Windows'
+      shell: pwsh
+      env:
+        LAYOUT_RUNNER: ${{ github.action_path }}/../../../test/debug/layout
+        LAYOUT_SOURCE: ${{ inputs.source-root || github.workspace }}
+        LLGO_ROOT: ${{ inputs.runtime-root || inputs.source-root || github.workspace }}
+        LAYOUT_LLGO: ${{ inputs.llgo }}
+        LAYOUT_LLGEN: ${{ inputs.llgen }}
+        LAYOUT_OUTPUT: ${{ runner.temp }}/${{ inputs.artifact-name }}
+        LAYOUT_ADAPTER: ${{ steps.windows.outputs.adapter }}
+        LLGO_LLDB: ${{ steps.windows.outputs.lldb }}
+        LLGO_WINDOWS_LLDB_PYTHON_HOME: ${{ steps.windows.outputs.python-home }}
+        LLGO_WINDOWS_LLDB_PYTHONPATH: ${{ steps.windows.outputs.python-path }}
+      run: |
+        $ErrorActionPreference = "Stop"
+        go -C $env:LAYOUT_RUNNER run . -root $env:LAYOUT_SOURCE `
+          -llgo $env:LAYOUT_LLGO -llgen $env:LAYOUT_LLGEN `
+          -lldb-dap $env:LAYOUT_ADAPTER -output $env:LAYOUT_OUTPUT
+        if ($LASTEXITCODE -ne 0) { throw "Native Go layout checks failed" }
+
+    - name: Upload layout observations
+      if: always()
+      uses: actions/upload-artifact@v7
+      with:
+        name: ${{ inputs.artifact-name }}
+        path: ${{ runner.temp }}/${{ inputs.artifact-name }}
+        if-no-files-found: warn

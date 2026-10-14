@@ -106,10 +106,13 @@ jobs:
         run: echo "LLGO_ROOT=$GITHUB_WORKSPACE" >> $GITHUB_ENV
 
       - name: Build
+        id: compiler-tools
         shell: bash
         run: |
           set -euo pipefail
           go build -v ./...
+          mkdir -p "$RUNNER_TEMP/llgo-layout-tools"
+          go build -o "$RUNNER_TEMP/llgo-layout-tools/" ./cmd/llgo ./chore/llgen
 
       - name: Validate Windows host-only integration
         if: runner.os == 'Windows'
@@ -274,6 +277,14 @@ jobs:
           flags: go-tests
           disable_search: true
 
+      - name: Check native compiler layouts
+        if: ${{ !cancelled() && steps.compiler-tools.outcome == 'success' }}
+        uses: ./.github/actions/check-layout
+        with:
+          llgo: ${{ runner.temp }}/llgo-layout-tools/llgo${{ runner.os == 'Windows' && '.exe' || '' }}
+          llgen: ${{ runner.temp }}/llgo-layout-tools/llgen${{ runner.os == 'Windows' && '.exe' || '' }}
+          artifact-name: layout-go-${{ matrix.os }}-${{ matrix.windows_abi || 'native' }}
+
   macos-lto-plugin:
     if: needs.prepare.outputs.run_code_ci == 'true'
     needs: prepare
@@ -304,6 +315,12 @@ jobs:
           test -f ltoplugin/build/LLGOLTOPlugin.dylib
           echo "LLGO_LTO_PLUGIN=$GITHUB_WORKSPACE/ltoplugin/build/LLGOLTOPlugin.dylib" >> "$GITHUB_ENV"
 
+      - name: Build development compiler and IR tool
+        id: compiler-tools
+        run: |
+          mkdir -p "$RUNNER_TEMP/llgo-layout-tools"
+          go build -tags=dev -o "$RUNNER_TEMP/llgo-layout-tools/" ./cmd/llgo ./chore/llgen
+
       - name: Test LTO plugin passes, runtime behavior, and retained symbols
         env:
           LLGO_BUILD_CACHE: "off"
@@ -313,6 +330,14 @@ jobs:
           go test -tags=dev -count=1 -timeout=30m \
             -run '^(TestRunAndTestFromTestltoLTOPlugin|TestBuildAndCheckSymbolsFromTestltoLTOPlugin|TestLTOPlugin)' \
             ./cl
+
+      - name: Check development compiler layouts
+        if: ${{ !cancelled() && steps.compiler-tools.outcome == 'success' }}
+        uses: ./.github/actions/check-layout
+        with:
+          llgo: ${{ runner.temp }}/llgo-layout-tools/llgo
+          llgen: ${{ runner.temp }}/llgo-layout-tools/llgen
+          artifact-name: layout-dev-macos
 
   dev-lto-globaldce:
     if: needs.prepare.outputs.run_code_ci == 'true'
@@ -341,7 +366,8 @@ jobs:
         run: echo "LLGO_ROOT=$GITHUB_WORKSPACE" >> $GITHUB_ENV
 
       - name: Build llgo with dev tag
-        run: go install -tags=dev ./cmd/llgo
+        id: compiler-tools
+        run: go install -tags=dev ./cmd/llgo ./chore/llgen
 
       - name: Build LTO plugin
         if: runner.os == 'Linux'
@@ -414,3 +440,11 @@ jobs:
 
       - name: Test C-only embedded deadcode-drop builds
         run: python3 test/sizebuild/runtest.py --target=esp32c3
+
+      - name: Check development compiler layouts
+        if: ${{ !cancelled() && steps.compiler-tools.outcome == 'success' }}
+        uses: ./.github/actions/check-layout
+        with:
+          llgo: ${{ runner.temp }}/go/bin/llgo
+          llgen: ${{ runner.temp }}/go/bin/llgen
+          artifact-name: layout-dev-linux

@@ -74,9 +74,10 @@ jobs:
         run: bash dev/install_wasmer.sh
 
       - name: Install llgo (dev mode)
+        id: compiler-tools
         shell: bash
         run: |
-          go install -tags=dev ./cmd/llgo
+          go install -tags=dev ./cmd/llgo ./chore/llgen
           echo "LLGO_ROOT=$GITHUB_WORKSPACE" >> $GITHUB_ENV
 
       - name: Install esptool.py (for ESP32-C3 tests on Linux)
@@ -86,3 +87,11 @@ jobs:
       - name: Run build cache tests
         shell: bash
         run: bash test/buildcache/test.sh
+
+      - name: Check development compiler layouts
+        if: ${{ !cancelled() && steps.compiler-tools.outcome == 'success' }}
+        uses: ./.github/actions/check-layout
+        with:
+          llgo: ${{ runner.temp }}/go/bin/llgo${{ runner.os == 'Windows' && '.exe' || '' }}
+          llgen: ${{ runner.temp }}/go/bin/llgen${{ runner.os == 'Windows' && '.exe' || '' }}
+          artifact-name: layout-build-cache-${{ matrix.os }}-${{ matrix.windows_abi || 'native' }}

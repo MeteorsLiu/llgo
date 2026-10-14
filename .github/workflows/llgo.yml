@@ -55,15 +55,18 @@ jobs:
         run: echo "LLGO_ROOT=$GITHUB_WORKSPACE" >> "$GITHUB_ENV"
 
       - name: Build stage 1 with Go
+        id: stage1
         run: |
           set -euo pipefail
 
           stage1_dir="$RUNNER_TEMP/llgo-stage1"
           mkdir -p "$stage1_dir"
           go build -o "$stage1_dir/llgo" ./cmd/llgo
+          go build -o "$stage1_dir/llgen" ./chore/llgen
           "$stage1_dir/llgo" version
 
       - name: Build stage 2 with LLGo
+        id: stage2
         run: |
           set -euo pipefail
 
@@ -90,6 +93,22 @@ jobs:
           test "$(command -v llgo)" = "$RUNNER_TEMP/llgo-stage2/llgo"
           (cd _demo/go && LLGO_BUILD_CACHE=off llgo run ./stdlib)
           (cd _demo/c && LLGO_BUILD_CACHE=off llgo run ./hello)
+
+      - name: Check stage 1 layouts
+        if: ${{ !cancelled() && steps.stage1.outcome == 'success' }}
+        uses: ./.github/actions/check-layout
+        with:
+          llgo: ${{ runner.temp }}/llgo-stage1/llgo
+          llgen: ${{ runner.temp }}/llgo-stage1/llgen
+          artifact-name: layout-stage1-${{ matrix.os }}
+
+      - name: Check stage 2 layouts
+        if: ${{ !cancelled() && steps.stage2.outcome == 'success' }}
+        uses: ./.github/actions/check-layout
+        with:
+          llgo: ${{ runner.temp }}/llgo-stage2/llgo
+          llgen: ${{ runner.temp }}/llgo-stage1/llgen
+          artifact-name: layout-stage2-${{ matrix.os }}
 
   llgo:
     permissions:
@@ -167,6 +186,7 @@ jobs:
         uses: ./.github/actions/setup-llgo-cache
 
       - name: Build LLGo and test tools
+        id: compiler-tools
         shell: bash
         run: |
           dev/build_ci_tools.sh "$RUNNER_TEMP/llgo-bin"
@@ -522,6 +542,14 @@ jobs:
             throw "Native debug metadata tests failed with exit code $LASTEXITCODE"
           }
 
+      - name: Check existing Go layouts
+        if: ${{ !cancelled() && steps.compiler-tools.outcome == 'success' }}
+        uses: ./.github/actions/check-layout
+        with:
+          llgo: ${{ runner.temp }}/llgo-bin/llgo${{ runner.os == 'Windows' && '.exe' || '' }}
+          llgen: ${{ runner.temp }}/llgo-bin/llgen${{ runner.os == 'Windows' && '.exe' || '' }}
+          artifact-name: layout-llgo-${{ matrix.os }}-${{ matrix.windows_abi || 'native' }}-${{ matrix.windows_arch || runner.arch }}
+
       # Keep shell setup last so its POSIX compatibility tools cannot affect
       # the native compiler, runtime, demo, or debugger qualification above.
       - name: Set up the MSYS2 host shell for MSVC
@@ -622,8 +650,10 @@ jobs:
       - name: Install GNU libunwind for the changed fault-unwind path
         run: sudo timeout 5m apt-get install -y libunwind8
       - name: Build LLGo
+        id: compiler-tools
         run: |
           go build -o "$RUNNER_TEMP/llgo" ./cmd/llgo
+          go build -o "$RUNNER_TEMP/llgen" ./chore/llgen
           echo "LLGO=$RUNNER_TEMP/llgo" >> "$GITHUB_ENV"
       - name: Run captured closures, hardware faults and synchronization
         run: |
@@ -640,6 +670,14 @@ jobs:
             -run '^(TestNarrowC|TestLinknameNarrowC)' ./test/cgo ./test/llgoext
       - name: Run caller regressions in C shared libraries and archives
         run: dev/test_std_buildmodes.sh ./test/std/runtime
+
+      - name: Check Linux ARM64 layouts
+        if: ${{ !cancelled() && steps.compiler-tools.outcome == 'success' }}
+        uses: ./.github/actions/check-layout
+        with:
+          llgo: ${{ runner.temp }}/llgo
+          llgen: ${{ runner.temp }}/llgen
+          artifact-name: layout-linux-arm64
 
   native-debuggers-intel:
     name: Native debuggers (macOS Intel, GDB values and registry)
@@ -658,11 +696,13 @@ jobs:
       - name: Set up Go
         uses: ./.github/actions/setup-go
       - name: Build LLGo
+        id: compiler-tools
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p "$RUNNER_TEMP/llgo-bin"
           go build -o "$RUNNER_TEMP/llgo-bin/llgo" ./cmd/llgo
+          go build -o "$RUNNER_TEMP/llgo-bin/llgen" ./chore/llgen
           echo "$RUNNER_TEMP/llgo-bin" >> "$GITHUB_PATH"
           echo "LLGO_ROOT=$GITHUB_WORKSPACE" >> "$GITHUB_ENV"
       - name: Run narrow C ABI regressions
@@ -696,6 +736,14 @@ jobs:
         env:
           LLGO_GDB_INTEGRATION: "1"
         run: go test ./cmd/internal/gdb -run '^TestGDBIntegration$' -count=1 -v
+
+      - name: Check Intel Mac layouts
+        if: ${{ !cancelled() && steps.compiler-tools.outcome == 'success' }}
+        uses: ./.github/actions/check-layout
+        with:
+          llgo: ${{ runner.temp }}/llgo-bin/llgo
+          llgen: ${{ runner.temp }}/llgo-bin/llgen
+          artifact-name: layout-macos-amd64
 
   cross-compile:
     if: needs.prepare.outputs.run_code_ci == 'true'
