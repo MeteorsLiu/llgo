@@ -128,6 +128,14 @@ func run(config runConfig, levels string) error {
 	if err != nil {
 		return err
 	}
+	source, err := os.ReadFile(filepath.Join(config.root, "test", "debug", "runtime", "main.go"))
+	if err != nil {
+		return err
+	}
+	annotatedPath := filepath.Join(config.output, "annotated", "main.go")
+	if err := os.Mkdir(filepath.Dir(annotatedPath), 0755); err != nil {
+		return err
+	}
 	report := runReport{GoVersion: config.goversion, GOOS: config.goos, GOARCH: config.goarch, Compiler: strings.TrimSpace(string(compiler))}
 	failed := false
 	for _, level := range config.levels {
@@ -139,7 +147,15 @@ func run(config runConfig, levels string) error {
 		if err := writeJSON(filepath.Join(config.output, "report.json"), report); err != nil {
 			return err
 		}
+		annotated, err := annotatedSource(source, fixture.cases, report)
+		if err != nil {
+			return err
+		}
+		if err := os.WriteFile(annotatedPath, annotated, 0644); err != nil {
+			return err
+		}
 	}
+	fmt.Println("Annotated source:", annotatedPath)
 	if failed {
 		return fmt.Errorf("layout checks failed; see %s", filepath.Join(config.output, "report.json"))
 	}
