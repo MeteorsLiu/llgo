@@ -65,4 +65,17 @@ Comments name the mismatched property and show its observed and expected values.
 
 Capacity diagnostics carry `"warning": true` in `report.json` and appear as `// layoutlint: warning: app capacity = 2; Go reports 8 (O0, O2)` in annotated source. A result containing only warnings has status `warning` and does not make the command exit nonzero; any error still fails the run.
 
-The LLGo workflow invokes the command separately from existing test runners, initially only in `MeteorsLiu/llgo`. It enumerates compiler fixture directories, checks runtime fixtures from the runtime module, and checks existing test packages. The core job reuses the package list printed by its existing runner and prepares `.github/test-go.mod` in a temporary source copy; the focused Linux ARM64 and macOS Intel jobs retain the root module. Reports include the selected input lists, observations and annotated source. Any batch failure fails the final layout check. Fixture discovery includes inputs with specialized build requirements; unsupported inputs remain visible errors rather than being silently omitted. The command itself contains no repository-specific case list or CI hooks.
+The `.github/actions/check-layout` composite action prepares native LLDB, builds and runs layoutlint, and uploads observations even when a check fails. It uses the caller's configured Go/LLVM environment and, on Windows, the target-native LLDB runtime dependencies installed by the existing setup actions. Each nonempty `args` line is passed as one literal command argument without shell expansion:
+
+```yaml
+- uses: ./.github/actions/check-layout
+  with:
+    llgo: llgo
+    llgen: llgen
+    artifact-name: layoutlint
+    args: |
+      -test
+      ./test/go
+```
+
+The LLGo workflow supplies existing compiler fixtures, runtime-module fixtures and test packages, initially only in `MeteorsLiu/llgo`. The core job retains its runner's package selection and prepares `.github/test-go.mod` in a temporary source copy; the focused Linux ARM64 and macOS Intel jobs retain the root module. Each module/build mode has its own action invocation and report. The tool's exit status propagates directly to CI. Inputs with specialized build requirements remain visible errors rather than being silently omitted. Neither the command nor the action contains a repository-specific case list or test-runner hook.

@@ -1,0 +1,115 @@
+name: Check layouts with layoutlint
+description: Prepare native LLDB, check the supplied Go inputs, and upload observations
+inputs:
+  llgo:
+    description: LLGo compiler executable
+    required: true
+  llgen:
+    description: llgen executable from the same source revision
+    required: true
+  artifact-name:
+    description: Unique name for this invocation's report directory and artifact
+    required: true
+  source-root:
+    description: Input working directory; defaults to the checkout
+    default: ""
+  runtime-root:
+    description: LLGO_ROOT; defaults to source-root
+    default: ""
+  args:
+    description: Existing layoutlint arguments, one per line; no shell expansion
+    required: true
+runs:
+  using: composite
+  steps:
+    - name: Prepare Unix LLDB
+      if: runner.os != 'Windows'
+      id: unix
+      shell: bash
+      run: |
+        set -euo pipefail
+        if [[ "$RUNNER_OS" == macOS ]]; then
+          adapter=$(xcrun --find lldb-dap)
+        else
+          sudo apt-get install -y lldb-22
+          adapter="$("${LLVM_CONFIG:-llvm-config}" --bindir)/lldb-dap"
+        fi
+        test -x "$adapter"
+        echo "adapter=$adapter" >> "$GITHUB_OUTPUT"
+
+    - name: Prepare Windows LLDB
+      if: runner.os == 'Windows'
+      id: windows
+      shell: pwsh
+      run: |
+        $ErrorActionPreference = "Stop"
+        if (-not $env:LLGO_LLDB -or -not (Test-Path -LiteralPath $env:LLGO_LLDB)) {
+          throw "Set up the target-native LLDB runtime before check-layout"
+        }
+        if ($env:LLGO_WINDOWS_ARCH -eq '386' -or
+            ($env:LLGO_WINDOWS_ABI -eq 'mingw' -and $env:LLGO_WINDOWS_ARCH -eq 'amd64')) {
+          $adapter = Join-Path (Split-Path $env:LLGO_LLDB) 'lldb-dap.exe'
+        } else {
+          # setup-deps supplies matching DLLs but omits the DAP executable.
+          # Several input batches in one job share this private installation.
+          $destination = Join-Path $env:RUNNER_TEMP 'layoutlint-dap'
+          $adapter = Join-Path $destination 'bin\lldb-dap.exe'
+          if (-not (Test-Path -LiteralPath $adapter)) {
+            $arch = if ($env:LLGO_WINDOWS_ARCH -eq 'arm64') { 'woa64' } else { 'win64' }
+            $expected = if ($env:LLGO_WINDOWS_ARCH -eq 'arm64') {
+              '76f44ef1ba6eeb5a65904e9500f042f588fade49952778ce48f0374daa934396'
+            } else {
+              '16e5709785fef73c854646241c4a92c5cd574318d1b33c63330dd7721903e55c'
+            }
+            $installerName = "LLVM-22.1.8-$arch.exe"
+            $installer = Join-Path $env:RUNNER_TEMP $installerName
+            $url = "https://github.com/llvm/llvm-project/releases/download/llvmorg-22.1.8/$installerName"
+            & curl.exe --fail --location --retry 5 --retry-all-errors --output $installer $url
+            if ($LASTEXITCODE -ne 0) { throw "Downloading the layout debug adapter failed" }
+            $actual = (Get-FileHash -Algorithm SHA256 $installer).Hash
+            if (-not $actual.Equals($expected, [StringComparison]::OrdinalIgnoreCase)) {
+              throw "Layout debug adapter installer SHA-256 is $actual, want $expected"
+            }
+            & (Join-Path $env:ProgramFiles '7-Zip\7z.exe') x -y "-o$destination" $installer 'bin\lldb-dap.exe'
+            if ($LASTEXITCODE -ne 0) { throw "Extracting the layout debug adapter failed" }
+          }
+        }
+        if (-not (Test-Path -LiteralPath $adapter)) { throw "lldb-dap.exe was not found: $adapter" }
+        "adapter=$adapter" >> $env:GITHUB_OUTPUT
+
+    - name: Run layoutlint
+      shell: bash
+      env:
+        LAYOUT_TOOL_ROOT: ${{ github.action_path }}/../../..
+        LAYOUT_SOURCE: ${{ inputs.source-root || github.workspace }}
+        LLGO_ROOT: ${{ inputs.runtime-root || inputs.source-root || github.workspace }}
+        LAYOUT_LLGO: ${{ inputs.llgo }}
+        LAYOUT_LLGEN: ${{ inputs.llgen }}
+        LAYOUT_ADAPTER: ${{ steps.unix.outputs.adapter || steps.windows.outputs.adapter }}
+        LAYOUT_ARGS: ${{ inputs.args }}
+        LAYOUT_OUTPUT: ${{ runner.temp }}/${{ inputs.artifact-name }}
+        GOTOOLCHAIN: local
+        GOWORK: "off"
+        GOENV: "off"
+      run: |
+        set -euo pipefail
+        suffix=
+        if [[ "$RUNNER_OS" == Windows ]]; then suffix=.exe; fi
+        tool_dir=$(mktemp -d "$RUNNER_TEMP/layoutlint-bin.XXXXXX")
+        trap 'rm -r -- "$tool_dir"' EXIT
+        tool="$tool_dir/layoutlint$suffix"
+        GOFLAGS= go -C "$LAYOUT_TOOL_ROOT" build -o "$tool" ./chore/layoutlint
+        args=()
+        while IFS= read -r arg; do
+          [[ -z "$arg" ]] || args+=("$arg")
+        done <<< "$LAYOUT_ARGS"
+        "$tool" -root "$LAYOUT_SOURCE" -llgo "$LAYOUT_LLGO" -llgen "$LAYOUT_LLGEN" \
+          -lldb-dap "$LAYOUT_ADAPTER" -output "$LAYOUT_OUTPUT" "${args[@]}"
+
+    - name: Upload observations and annotated source
+      if: always()
+      uses: actions/upload-artifact@v7
+      with:
+        name: ${{ inputs.artifact-name }}
+        path: ${{ runner.temp }}/${{ inputs.artifact-name }}
+        if-no-files-found: warn
