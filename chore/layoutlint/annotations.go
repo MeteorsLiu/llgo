@@ -56,6 +56,7 @@ func annotatedSource(source []byte, filename string, report runReport) ([]byte, 
 	type annotationKey struct {
 		line                          int
 		check, stage, item, want, got string
+		warning                       bool
 	}
 	type annotation struct {
 		key     annotationKey
@@ -64,7 +65,7 @@ func annotatedSource(source []byte, filename string, report runReport) ([]byte, 
 	}
 	var annotations []annotation
 	groups := make(map[annotationKey]int)
-	total := 0
+	failures, warnings := 0, 0
 	for _, result := range report.Results {
 		for _, diff := range result.Differences {
 			if diff.File != filename {
@@ -122,7 +123,7 @@ func annotatedSource(source []byte, filename string, report runReport) ([]byte, 
 					break
 				}
 			}
-			key := annotationKey{diff.Line, diff.Check, diff.Stage, diff.Item, string(want), string(got)}
+			key := annotationKey{diff.Line, diff.Check, diff.Stage, diff.Item, string(want), string(got), diff.Warning}
 			if valueSize || fieldMatch && label == "reflected size" {
 				key.check = "metadata"
 				key.stage = ""
@@ -132,19 +133,27 @@ func annotatedSource(source []byte, filename string, report runReport) ([]byte, 
 			if !ok {
 				index = len(annotations)
 				groups[key] = index
-				annotations = append(annotations, annotation{key: key, message: fmt.Sprintf("%s = %s%s; expected %s", label, got, unit, want)})
+				message := fmt.Sprintf("%s = %s%s; expected %s", label, got, unit, want)
+				if diff.Warning {
+					message = fmt.Sprintf("warning: %s = %s; Go reports %s", label, got, want)
+				}
+				annotations = append(annotations, annotation{key: key, message: message})
 			}
 			level := "O" + result.Level
 			if !slices.Contains(annotations[index].levels, level) {
 				annotations[index].levels = append(annotations[index].levels, level)
 			}
-			total++
+			if diff.Warning {
+				warnings++
+			} else {
+				failures++
+			}
 		}
 	}
 	slices.SortStableFunc(annotations, func(a, b annotation) int { return a.key.line - b.key.line })
 	var output strings.Builder
 	fmt.Fprintf(&output, "// Layout observations for %s/%s. Source: %s\n", report.GOOS, report.GOARCH, filename)
-	fmt.Fprintf(&output, "// %d failed observations; %d annotations after grouping repeated sizes and optimization levels.\n", total, len(annotations))
+	fmt.Fprintf(&output, "// %d failed observations, %d warnings; %d annotations after grouping repeated sizes and optimization levels.\n", failures, warnings, len(annotations))
 	for _, result := range report.Results {
 		fmt.Fprintf(&output, "// %s O%s: %s", result.Case, result.Level, result.Status)
 		if result.Reason != "" {
@@ -158,7 +167,7 @@ func annotatedSource(source []byte, filename string, report runReport) ([]byte, 
 		text := strings.TrimSuffix(strings.TrimSuffix(line, "\n"), "\r")
 		ending := line[len(text):]
 		output.WriteString(text)
-		separator := " // layout: "
+		separator := " // layoutlint: "
 		for index < len(annotations) && annotations[index].key.line == i+1 {
 			item := annotations[index]
 			fmt.Fprintf(&output, "%s%s (%s)", separator, item.message, strings.Join(item.levels, ", "))

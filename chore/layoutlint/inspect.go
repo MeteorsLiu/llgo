@@ -40,7 +40,7 @@ func inspect(adapter, executable, directory string, fixture *existingFixture, lo
 	var capabilities struct {
 		ReadMemory bool `json:"supportsReadMemoryRequest"`
 	}
-	if err = client.request("initialize", map[string]any{"adapterID": "lldb", "clientID": "llgo-layout", "linesStartAt1": true, "columnsStartAt1": true, "pathFormat": "path", "supportsMemoryReferences": true}, &capabilities); err != nil {
+	if err = client.request("initialize", map[string]any{"adapterID": "lldb", "clientID": "layoutlint", "linesStartAt1": true, "columnsStartAt1": true, "pathFormat": "path", "supportsMemoryReferences": true}, &capabilities); err != nil {
 		return nil, err
 	}
 	if !capabilities.ReadMemory {

@@ -123,7 +123,7 @@ func checkDWARF(c layoutCase, data *dwarf.Data, reference sample) ([]difference,
 	location := c.sourceLocation
 	check := func(name string, want uint64, got int64) {
 		if got < 0 || uint64(got) != want {
-			differences = append(differences, difference{"dwarf", "", c.displayName + "." + name, want, got, location.file, location.line})
+			differences = append(differences, difference{"dwarf", "", c.displayName + "." + name, want, got, location.file, location.line, false})
 		}
 	}
 	check("struct size", reference.Words[6], subject.Size())
@@ -207,7 +207,7 @@ func checkIR(c layoutCase, path string, reference sample) ([]difference, error) 
 				return nil, err
 			}
 			if got > reference.Words[index+4] {
-				differences = append(differences, difference{"ir", "", name + " alignment", reference.Words[index+4], got, field.file, field.line})
+				differences = append(differences, difference{"ir", "", name + " alignment", reference.Words[index+4], got, field.file, field.line, false})
 			}
 			wantType := fmt.Sprintf("i%d", reference.Words[index+3]*8)
 			if field.typ == "float64" {
@@ -220,7 +220,7 @@ func checkIR(c layoutCase, path string, reference sample) ([]difference, error) 
 				wantType = "ptr"
 			}
 			if access[0][1] != wantType {
-				differences = append(differences, difference{"ir", "", name + " access type", wantType, access[0][1], field.file, field.line})
+				differences = append(differences, difference{"ir", "", name + " access type", wantType, access[0][1], field.file, field.line, false})
 			}
 		}
 	}

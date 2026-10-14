@@ -167,6 +167,7 @@ jobs:
         uses: ./.github/actions/setup-llgo-cache
 
       - name: Build LLGo and test tools
+        id: build_tools
         shell: bash
         run: |
           dev/build_ci_tools.sh "$RUNNER_TEMP/llgo-bin"
@@ -208,7 +209,7 @@ jobs:
           fi
           export LLGO="$RUNNER_TEMP/llgo-bin/llgo${tool_suffix}"
           export LLGO_TEST_LLGEN="$RUNNER_TEMP/llgo-bin/llgen${tool_suffix}"
-          dev/test_go_version.sh 1.27
+          dev/test_go_version.sh 1.27 2>&1 | tee "$RUNNER_TEMP/llgo-core-tests.log"
 
           python .github/scripts/check_llgo_coverage.py coverage-llgo.txt
 
@@ -425,7 +426,7 @@ jobs:
         run: cat result.md
 
       - name: Install LLDB for integration tests
-        if: ${{ matrix.os == 'ubuntu-latest' }}
+        if: ${{ matrix.os == 'ubuntu-latest' && !cancelled() && (success() || github.repository == 'MeteorsLiu/llgo' && steps.build_tools.outcome == 'success') }}
         run: sudo apt-get install -y lldb-${{matrix.llvm}} gdb
 
       - name: GDB values, registry and complete worker unwind (Linux)
@@ -438,7 +439,7 @@ jobs:
       - name: Install MinGW LLDB for integration tests
         # R12 qualifies debugger behavior for the new GNU architectures. Keep
         # R11 focused on their language/runtime and C interoperability gates.
-        if: ${{ matrix.os == 'windows-2022' && matrix.windows_abi == 'mingw' && matrix.windows_arch == 'amd64' }}
+        if: ${{ matrix.os == 'windows-2022' && matrix.windows_abi == 'mingw' && matrix.windows_arch == 'amd64' && !cancelled() && (success() || github.repository == 'MeteorsLiu/llgo' && steps.build_tools.outcome == 'success') }}
         shell: msys2 {0}
         env:
           MSYS2_LLDB_PACKAGE_VERSION: "22.1.8-1"
@@ -522,6 +523,152 @@ jobs:
             throw "Native debug metadata tests failed with exit code $LASTEXITCODE"
           }
 
+      # Keep the checker independent of compiler/test runners. Trial it in the
+      # fork before enabling its additional observation builds upstream.
+      - &layout_unix_adapter
+        name: Prepare Unix layoutlint debug adapter
+        id: layout_unix_adapter
+        if: github.repository == 'MeteorsLiu/llgo' && runner.os != 'Windows' && !cancelled() && steps.build_tools.outcome == 'success'
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$RUNNER_OS" == macOS ]]; then
+            adapter=$(xcrun --find lldb-dap)
+          else
+            sudo apt-get install -y lldb-22
+            adapter="$("${LLVM_CONFIG:-llvm-config}" --bindir)/lldb-dap"
+          fi
+          test -x "$adapter"
+          echo "adapter=$adapter" >> "$GITHUB_OUTPUT"
+
+      - &layout_windows_adapter
+        name: Prepare Windows layoutlint debug adapter
+        id: layout_windows_adapter
+        if: github.repository == 'MeteorsLiu/llgo' && runner.os == 'Windows' && !cancelled() && steps.build_tools.outcome == 'success'
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          if (-not $env:LLGO_LLDB -or -not (Test-Path -LiteralPath $env:LLGO_LLDB)) {
+            throw "The target-native LLDB executable is unavailable"
+          }
+          if ($env:LLGO_WINDOWS_ARCH -eq '386' -or
+              ($env:LLGO_WINDOWS_ABI -eq 'mingw' -and $env:LLGO_WINDOWS_ARCH -eq 'amd64')) {
+            $adapter = Join-Path (Split-Path $env:LLGO_LLDB) 'lldb-dap.exe'
+          } else {
+            # setup-deps supplies matching DLLs but omits the DAP executable.
+            $arch = if ($env:LLGO_WINDOWS_ARCH -eq 'arm64') { 'woa64' } else { 'win64' }
+            $expected = if ($env:LLGO_WINDOWS_ARCH -eq 'arm64') {
+              '76f44ef1ba6eeb5a65904e9500f042f588fade49952778ce48f0374daa934396'
+            } else {
+              '16e5709785fef73c854646241c4a92c5cd574318d1b33c63330dd7721903e55c'
+            }
+            $destination = Join-Path $env:RUNNER_TEMP 'layoutlint-dap'
+            $installerName = "LLVM-22.1.8-$arch.exe"
+            $installer = Join-Path $env:RUNNER_TEMP $installerName
+            $url = "https://github.com/llvm/llvm-project/releases/download/llvmorg-22.1.8/$installerName"
+            & curl.exe --fail --location --retry 5 --retry-all-errors --output $installer $url
+            if ($LASTEXITCODE -ne 0) { throw "Downloading the layout debug adapter failed" }
+            $actual = (Get-FileHash -Algorithm SHA256 $installer).Hash
+            if (-not $actual.Equals($expected, [StringComparison]::OrdinalIgnoreCase)) {
+              throw "Layout debug adapter installer SHA-256 is $actual, want $expected"
+            }
+            & (Join-Path $env:ProgramFiles '7-Zip\7z.exe') x -y "-o$destination" $installer 'bin\lldb-dap.exe'
+            if ($LASTEXITCODE -ne 0) { throw "Extracting the layout debug adapter failed" }
+            $adapter = Join-Path $destination 'bin\lldb-dap.exe'
+          }
+          if (-not (Test-Path -LiteralPath $adapter)) { throw "lldb-dap.exe was not found: $adapter" }
+          "adapter=$adapter" >> $env:GITHUB_OUTPUT
+
+      - &layout_check
+        name: Check existing source with layoutlint
+        id: layout_check
+        if: github.repository == 'MeteorsLiu/llgo' && !cancelled() && (steps.layout_unix_adapter.outcome == 'success' || steps.layout_windows_adapter.outcome == 'success')
+        continue-on-error: true
+        shell: bash
+        env:
+          LAYOUT_ADAPTER: ${{ steps.layout_unix_adapter.outputs.adapter || steps.layout_windows_adapter.outputs.adapter }}
+          GOTOOLCHAIN: local
+          GOWORK: "off"
+          GOENV: "off"
+          GOFLAGS: "-tags=llgo"
+        run: |
+          set -euo pipefail
+          suffix=
+          if [[ "$RUNNER_OS" == Windows ]]; then suffix=.exe; fi
+          tools="$RUNNER_TEMP/llgo-bin"
+          compiler="${LLGO:-$tools/llgo$suffix}"
+          output="$RUNNER_TEMP/layoutlint"
+          mkdir -p "$output"
+          common=(-llgo "$compiler" -llgen "$tools/llgen$suffix" -lldb-dap "$LAYOUT_ADAPTER")
+
+          # Enumerate fixture directories, not a second list of case names.
+          fixtures=()
+          for directory in ./cl/_test*/*/; do
+            [[ -d "$directory" ]] || continue
+            directory=${directory%/}
+            [[ ${directory##*/} == _* ]] || fixtures+=("$directory")
+          done
+          printf '%s\n' "${fixtures[@]}" > "$output/fixtures.txt"
+          status=0
+          "$tools/layoutlint$suffix" "${common[@]}" -root "$GITHUB_WORKSPACE" \
+            -output "$output/fixtures" "${fixtures[@]}" || status=1
+
+          # runtime is a separate module; its patterns are relative to it.
+          runtime_fixtures=()
+          for directory in ./runtime/_test/codegen/*/; do
+            [[ -d "$directory" ]] || continue
+            directory=${directory%/}
+            [[ ${directory##*/} == _* ]] || runtime_fixtures+=("./${directory#./runtime/}")
+          done
+          printf '%s\n' "${runtime_fixtures[@]}" > "$output/runtime-fixtures.txt"
+          "$tools/layoutlint$suffix" "${common[@]}" -root "$GITHUB_WORKSPACE/runtime" \
+            -output "$output/runtime" "${runtime_fixtures[@]}" || status=1
+
+          # Reuse the package selection printed by the existing core runner.
+          # The two focused native jobs supply their existing package list.
+          if [[ -n "${LAYOUT_TEST_PACKAGES:-}" ]]; then
+            read -r -a packages <<< "$LAYOUT_TEST_PACKAGES"
+          else
+            awk '/^Shard: [0-9]+\/[0-9]+; packages: [0-9]+$/ { selected=1; next }
+              selected && /^  [^ ]+$/ { sub(/^  /, ""); print; next }
+              selected { exit }' "$RUNNER_TEMP/llgo-core-tests.log" > "$output/packages.txt"
+            packages=()
+            while IFS= read -r package; do packages+=("$package"); done < "$output/packages.txt"
+          fi
+          if [[ ${#packages[@]} == 0 ]]; then
+            echo "No existing test packages were selected" >&2
+            exit 1
+          fi
+          printf '%s\n' "${packages[@]}" > "$output/packages.txt"
+          source="$GITHUB_WORKSPACE"
+          if [[ -z "${LAYOUT_TEST_PACKAGES:-}" ]]; then
+            source=$(mktemp -d "$RUNNER_TEMP/layoutlint-source.XXXXXX")
+            trap 'rm -r -- "$source"' EXIT
+            git archive HEAD | tar -xf - -C "$source"
+            cp .github/test-go.mod "$source/go.mod"
+            cp .github/test-go.sum "$source/go.sum"
+            # Only the core runner uses test-go.mod. The focused native jobs
+            # use the root module. Preparing the core module here also avoids
+            # GOFLAGS=-modfile breaking go/packages' module-free version probe.
+            runtime_root="$source/runtime"
+            if [[ "$RUNNER_OS" == Windows ]]; then runtime_root=$(cygpath -m "$runtime_root"); fi
+            go -C "$source" mod edit -go=1.27 -replace="github.com/xgo-dev/llgo/runtime=$runtime_root"
+          fi
+          "$tools/layoutlint$suffix" "${common[@]}" -root "$source" -test \
+            -output "$output/tests" "${packages[@]}" -- -test.timeout=20m || status=1
+          exit "$status"
+
+      - &layout_report
+        name: Upload layoutlint observations and annotated source
+        if: github.repository == 'MeteorsLiu/llgo' && !cancelled() && steps.build_tools.outcome == 'success'
+        uses: actions/upload-artifact@v7
+        with:
+          name: layoutlint-${{ runner.os }}-${{ runner.arch }}-${{ env.LLGO_WINDOWS_ABI || 'native' }}-${{ env.LLGO_WINDOWS_ARCH || 'host' }}
+          path: ${{ runner.temp }}/layoutlint
+          if-no-files-found: warn
+
       # Keep shell setup last so its POSIX compatibility tools cannot affect
       # the native compiler, runtime, demo, or debugger qualification above.
       - name: Set up the MSYS2 host shell for MSVC
@@ -601,6 +748,14 @@ jobs:
             throw "Complete GDB worker unwind failed with exit code $LASTEXITCODE"
           }
 
+      - &layout_result
+        name: Require successful layoutlint checks
+        if: github.repository == 'MeteorsLiu/llgo' && !cancelled() && steps.build_tools.outcome == 'success'
+        shell: bash
+        env:
+          LAYOUT_OUTCOME: ${{ steps.layout_check.outcome }}
+        run: test "$LAYOUT_OUTCOME" = success
+
   runtime-arm64:
     if: needs.prepare.outputs.run_code_ci == 'true'
     needs: prepare
@@ -612,6 +767,7 @@ jobs:
       LLGO_BUILD_CACHE: "1"
       LLGO_DYNUNWIND: "1"
       LLGO_DYNUNWIND_DEBUG: "1"
+      LAYOUT_TEST_PACKAGES: ./test/go ./test/std/runtime ./test/std/sync ./test/cgo ./test/llgoext
     steps:
       - uses: actions/checkout@v7
       - uses: ./.github/actions/setup-deps
@@ -622,9 +778,14 @@ jobs:
       - name: Install GNU libunwind for the changed fault-unwind path
         run: sudo timeout 5m apt-get install -y libunwind8
       - name: Build LLGo
+        id: build_tools
         run: |
           go build -o "$RUNNER_TEMP/llgo" ./cmd/llgo
           echo "LLGO=$RUNNER_TEMP/llgo" >> "$GITHUB_ENV"
+          if [[ "$GITHUB_REPOSITORY" == MeteorsLiu/llgo ]]; then
+            mkdir -p "$RUNNER_TEMP/llgo-bin"
+            go build -o "$RUNNER_TEMP/llgo-bin/" ./chore/llgen ./chore/layoutlint
+          fi
       - name: Run captured closures, hardware faults and synchronization
         run: |
           set -euo pipefail
@@ -640,6 +801,11 @@ jobs:
             -run '^(TestNarrowC|TestLinknameNarrowC)' ./test/cgo ./test/llgoext
       - name: Run caller regressions in C shared libraries and archives
         run: dev/test_std_buildmodes.sh ./test/std/runtime
+      - *layout_unix_adapter
+      - *layout_windows_adapter
+      - *layout_check
+      - *layout_report
+      - *layout_result
 
   native-debuggers-intel:
     name: Native debuggers (macOS Intel, GDB values and registry)
@@ -649,6 +815,8 @@ jobs:
       contents: read
     runs-on: macos-15-intel
     timeout-minutes: 45
+    env:
+      LAYOUT_TEST_PACKAGES: ./test/cgo ./test/llgoext
     steps:
       - uses: actions/checkout@v7
       - name: Install compiler dependencies
@@ -658,11 +826,15 @@ jobs:
       - name: Set up Go
         uses: ./.github/actions/setup-go
       - name: Build LLGo
+        id: build_tools
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p "$RUNNER_TEMP/llgo-bin"
           go build -o "$RUNNER_TEMP/llgo-bin/llgo" ./cmd/llgo
+          if [[ "$GITHUB_REPOSITORY" == MeteorsLiu/llgo ]]; then
+            go build -o "$RUNNER_TEMP/llgo-bin/" ./chore/llgen ./chore/layoutlint
+          fi
           echo "$RUNNER_TEMP/llgo-bin" >> "$GITHUB_PATH"
           echo "LLGO_ROOT=$GITHUB_WORKSPACE" >> "$GITHUB_ENV"
       - name: Run narrow C ABI regressions
@@ -696,6 +868,11 @@ jobs:
         env:
           LLGO_GDB_INTEGRATION: "1"
         run: go test ./cmd/internal/gdb -run '^TestGDBIntegration$' -count=1 -v
+      - *layout_unix_adapter
+      - *layout_windows_adapter
+      - *layout_check
+      - *layout_report
+      - *layout_result
 
   cross-compile:
     if: needs.prepare.outputs.run_code_ci == 'true'

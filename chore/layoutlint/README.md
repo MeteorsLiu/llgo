@@ -1,24 +1,24 @@
-# Go/LLGo layout checker
+# layoutlint
 
 This standalone Go tool takes Go package patterns or source files, builds observation copies with Go and LLGo, and uses native `lldb-dap` to check the LLGo executable. Input programs need no layout-specific comments or breakpoint markers. There is no built-in fixture or case list.
 
-Build the tool with `go build -o /path/to/layout .` from this directory. Supply the existing LLGo compiler, `llgen`, and native debug adapter:
+This developer command lives beside `chore/llgen` and `chore/litgen`; the littest checking library itself lives in `internal/littest`. Build it from the repository root with `go build -o /path/to/layoutlint ./chore/layoutlint`. It is part of the root module and is also installed by the existing `go install ./...` tool build. Supply the existing LLGo compiler, `llgen`, and native debug adapter:
 
 ```sh
-layout -root /path/to/project \
+layoutlint -root /path/to/project \
   -llgo /path/to/llgo -llgen /path/to/llgen \
   -lldb-dap /path/to/lldb-dap ./some/package
 
-layout -root /path/to/project \
+layoutlint -root /path/to/project \
   -llgo /path/to/llgo -llgen /path/to/llgen \
   -lldb-dap /path/to/lldb-dap first.go second.go
 
-layout -root /path/to/project -test \
+layoutlint -root /path/to/project -test \
   -llgo /path/to/llgo -llgen /path/to/llgen \
   -lldb-dap /path/to/lldb-dap ./some/package -- -test.run=TestExample
 ```
 
-`-root` is the input's working directory and defaults to the current directory. With no positional input, the pattern is `.`. `-test` builds and runs existing tests with `go test -c` and `llgo test -c`; it also accepts selected `_test.go` files. Arguments following `--` after the input are passed to both executables. `-opt 0,2` is the default. `-output` must name a new directory; otherwise the tool creates and prints a temporary artifact directory.
+`-root` is the input's working directory and defaults to the current directory. With no positional input, the pattern is `.`. `-test` builds and runs existing tests with `go test -c` and `llgo test -c`, including packages containing only external `package name_test` files; it also accepts selected `_test.go` files. Arguments following `--` after the input are passed to both executables. `-opt 0,2` is the default. `-output` must name a new directory; otherwise the tool creates and prints a temporary artifact directory. Invoke separate modules with their own `-root` rather than combining their package patterns in one call.
 
 Configure LLVM and `LLGO_ROOT` for the compiler being tested. `LLVM_CONFIG` locates LLVM's tools. The LLVM linker must be available to the compiler, and the native debug adapter must be able to launch local processes. No Python script or LLGo debugger presentation plugin is used.
 
@@ -47,18 +47,22 @@ The Go run supplies the baseline. LLDB stops inside the generated observer, read
 
 `PtrBytes` is a metadata check, not a GC-liveness test. Pointer values compare nilness rather than cross-process addresses; root struct pointers are dereferenced once. Map values compare length, not iteration order. Struct value comparisons recurse through fields accessible to the input package, avoiding foreign private state such as a test framework's timestamps and stack PCs. The input must produce a corresponding observation sequence in both runs; different sequences or payload lengths are reported as errors, not accepted as layout passes.
 
+Slice capacity differences between Go and LLGo are warnings: append can expose different allocation size classes. Both capacities remain in the observations and diagnostics, including slices nested inside other values. Types, sizes, lengths and element values still require equality. LLDB's raw slice capacity must match LLGo's own reflected capacity, and a capacity below the slice length is an error. Existing input assertions about capacity are unchanged.
+
 `llgo:cdecl`, `llgo:stdcall` and legacy `llgo:type C` types are excluded from ordinary-layout comparisons, as are containing types that depend on their representation. Exclusions are named in the report. A program that cannot build with the Go reference compiler is reported as an error; the tool has no fixture-specific source removal rules.
 
 ## Reports and source diagnostics
 
-The output contains a top-level `report.json`, separate build/debug artifacts for each input and optimization level, and an `annotated` directory for each input. Each run retains its observation source, executables, logs, baseline, expectation, LLDB observations, DWARF artifacts and LLVM IR. Progress identifies the current package and build/debug phase.
+The output contains a top-level `report.json`, separate build/debug artifacts for each input and optimization level, and an `annotated` directory for each input. Each run retains its selected observation source, executables, logs, baseline, expectation, LLDB observations, DWARF artifacts and LLVM IR. Complete module workspaces are temporary and are removed after each check. A failed package load or comparison is recorded without preventing other inputs from running; any failure makes the final exit status nonzero. Progress identifies the current package and build/debug phase.
 
 Annotated source appends diagnostics to the affected declaration or statement:
 
 ```go
-fn func(string) (int, error) // layout: reflected size = 8 bytes; expected 16 (O0, O2)
+fn func(string) (int, error) // layoutlint: reflected size = 8 bytes; expected 16 (O0, O2)
 ```
 
 Comments name the mismatched property and show its observed and expected values. Size errors point to the variable declaration or struct field, while value errors point to the observed statement. Repeated size errors and identical optimization results share one annotation; different values remain separate. Full evidence and original file/line locations remain in JSON. Missing symbols, debugger errors, or missing DWARF/IR fail the run. Known compiler discrepancies remain failures.
 
-This change provides the checker itself. It does not install a CI workflow or select a fixed debugging program for callers.
+Capacity diagnostics carry `"warning": true` in `report.json` and appear as `// layoutlint: warning: app capacity = 2; Go reports 8 (O0, O2)` in annotated source. A result containing only warnings has status `warning` and does not make the command exit nonzero; any error still fails the run.
+
+The LLGo workflow invokes the command separately from existing test runners, initially only in `MeteorsLiu/llgo`. It enumerates compiler fixture directories, checks runtime fixtures from the runtime module, and checks existing test packages. The core job reuses the package list printed by its existing runner and prepares `.github/test-go.mod` in a temporary source copy; the focused Linux ARM64 and macOS Intel jobs retain the root module. Reports include the selected input lists, observations and annotated source. Any batch failure fails the final layout check. Fixture discovery includes inputs with specialized build requirements; unsupported inputs remain visible errors rather than being silently omitted. The command itself contains no repository-specific case list or CI hooks.

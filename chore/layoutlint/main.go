@@ -1,4 +1,4 @@
-// Command layout compares Go source packages with LLGo through native LLDB.
+// Command layoutlint compares Go source packages with LLGo through native LLDB.
 package main
 
 import (
@@ -80,7 +80,7 @@ func run(config runConfig, levels string, patterns []string) error {
 		}
 	}
 	if config.output == "" {
-		config.output, err = os.MkdirTemp("", "llgo-layout-*")
+		config.output, err = os.MkdirTemp("", "llgo-layoutlint-*")
 	} else {
 		config.output, err = filepath.Abs(config.output)
 		if err == nil {
@@ -138,8 +138,14 @@ func run(config runConfig, levels string, patterns []string) error {
 			directory := filepath.Join(config.output, fmt.Sprintf("case-%d-O%s", caseIndex, level))
 			result := runExisting(config, fixture, level, directory)
 			report.Results = append(report.Results, result)
-			failed = failed || result.Status != "pass"
-			fmt.Printf("%s %s O%s: %d differences %s\n", strings.ToUpper(result.Status), fixture.name, level, len(result.Differences), result.Reason)
+			failed = failed || result.Status != "pass" && result.Status != "warning"
+			warnings := 0
+			for _, diff := range result.Differences {
+				if diff.Warning {
+					warnings++
+				}
+			}
+			fmt.Printf("%s %s O%s: %d differences, %d warnings %s\n", strings.ToUpper(result.Status), fixture.name, level, len(result.Differences)-warnings, warnings, result.Reason)
 			if err := writeJSON(filepath.Join(config.output, "report.json"), report); err != nil {
 				return err
 			}
@@ -160,7 +166,20 @@ func runExisting(config runConfig, fixture *existingFixture, level, directory st
 	if err := os.MkdirAll(directory, 0755); err != nil {
 		return fail(err)
 	}
-	workRoot := filepath.Join(directory, "work")
+	if fixture.loadError != nil {
+		return fail(fixture.loadError)
+	}
+	scratch, err := os.MkdirTemp("", "llgo-layoutlint-work-")
+	if err != nil {
+		return fail(err)
+	}
+	defer func() {
+		if err := os.RemoveAll(scratch); err != nil {
+			result.Status = "error"
+			result.Reason += fmt.Sprintf("; remove observation workspace: %v", err)
+		}
+	}()
+	workRoot := filepath.Join(scratch, "work")
 	// Keep the module boundary and package paths intact. A package such as
 	// example.org/project/a must not become a submodule requiring its own parent.
 	if err := copyModule(fixture.moduleRoot, workRoot, config.output); err != nil {
@@ -174,8 +193,19 @@ func runExisting(config runConfig, fixture *existingFixture, level, directory st
 		return fail(err)
 	}
 	work := filepath.Join(workRoot, relative)
+	sourceRoot := filepath.Join(directory, "source")
+	sourceDirectory := filepath.Join(sourceRoot, relative)
+	if err := os.MkdirAll(sourceDirectory, 0755); err != nil {
+		return fail(err)
+	}
+	if err := os.WriteFile(filepath.Join(sourceRoot, "go.mod"), []byte(fixture.module), 0644); err != nil {
+		return fail(err)
+	}
 	for _, file := range fixture.files {
 		if err := os.WriteFile(filepath.Join(work, filepath.Base(file.path)), []byte(file.instrumented), 0644); err != nil {
+			return fail(err)
+		}
+		if err := os.WriteFile(filepath.Join(sourceDirectory, filepath.Base(file.path)), []byte(file.instrumented), 0644); err != nil {
 			return fail(err)
 		}
 	}
@@ -275,23 +305,29 @@ func runExisting(config runConfig, fixture *existingFixture, level, directory st
 	}
 	// Give llgen a source view where existing test functions are ordinary Go
 	// files. This retains their types without requiring a synthetic test main.
-	irDirectories := make(map[string]string)
+	type irInput struct{ directory, artifacts string }
+	irDirectories := make(map[string]irInput)
 	for _, file := range fixture.files {
-		irDir, ok := irDirectories[file.packagePath]
+		input, ok := irDirectories[file.packagePath]
 		if !ok {
-			irRoot := filepath.Join(directory, fmt.Sprintf("ir-%d", len(irDirectories)))
+			name := fmt.Sprintf("ir-%d", len(irDirectories))
+			irRoot := filepath.Join(scratch, name)
 			if err := copyModule(fixture.moduleRoot, irRoot, config.output); err != nil {
 				return fail(err)
 			}
 			if err := os.WriteFile(filepath.Join(irRoot, "go.mod"), []byte(fixture.module), 0644); err != nil {
 				return fail(err)
 			}
-			irDir = filepath.Join(irRoot, relative)
+			irDir := filepath.Join(irRoot, relative)
 			if file.packageName != fixture.files[0].packageName {
 				irDir += "_test"
 			}
-			irDirectories[file.packagePath] = irDir
+			input = irInput{directory: irDir, artifacts: filepath.Join(directory, name)}
+			irDirectories[file.packagePath] = input
 			if err := os.MkdirAll(irDir, 0755); err != nil {
+				return fail(err)
+			}
+			if err := os.Mkdir(input.artifacts, 0755); err != nil {
 				return fail(err)
 			}
 		}
@@ -299,21 +335,29 @@ func runExisting(config runConfig, fixture *existingFixture, level, directory st
 		if name != filepath.Base(file.path) {
 			name += "_layout.go"
 		}
-		if err := os.WriteFile(filepath.Join(irDir, name), []byte(file.instrumented), 0644); err != nil {
+		if err := os.WriteFile(filepath.Join(input.directory, name), []byte(file.instrumented), 0644); err != nil {
 			return fail(err)
 		}
 	}
-	for prefix, irDir := range irDirectories {
+	for prefix, input := range irDirectories {
+		irDir := input.directory
 		fmt.Println("  DWARF and IR:", prefix)
-		packagePath, err := runCommand(irDir, filepath.Join(irDir, "go-list.log"), "go", "list", "-f", "{{.ImportPath}}", ".")
+		packagePath, err := runCommand(irDir, filepath.Join(input.artifacts, "go-list.log"), "go", "list", "-f", "{{.ImportPath}}", ".")
 		if err != nil {
 			return fail(err)
 		}
-		if _, err := runCommand(irDir, filepath.Join(irDir, "llgen.log"), config.llgen, "-phase=pre-abi", "."); err != nil {
+		if _, err := runCommand(irDir, filepath.Join(input.artifacts, "llgen.log"), config.llgen, "-phase=pre-abi", "."); err != nil {
 			return fail(err)
 		}
-		irPath := filepath.Join(irDir, "llgo_autogen.ll")
-		if _, err := runCommand(irDir, filepath.Join(irDir, "verify-ir.log"), filepath.Join(config.toolDir, "opt"+executableSuffix(config.goos)), "-passes=verify", "-disable-output", irPath); err != nil {
+		ir, err := os.ReadFile(filepath.Join(irDir, "llgo_autogen.ll"))
+		if err != nil {
+			return fail(err)
+		}
+		irPath := filepath.Join(input.artifacts, "llgo_autogen.ll")
+		if err := os.WriteFile(irPath, ir, 0644); err != nil {
+			return fail(err)
+		}
+		if _, err := runCommand(irDir, filepath.Join(input.artifacts, "verify-ir.log"), filepath.Join(config.toolDir, "opt"+executableSuffix(config.goos)), "-passes=verify", "-disable-output", irPath); err != nil {
 			return fail(err)
 		}
 		for i, c := range fixture.cases {
@@ -331,8 +375,12 @@ func runExisting(config runConfig, fixture *existingFixture, level, directory st
 		}
 	}
 	result.Status = "pass"
-	if len(result.Differences) != 0 {
-		result.Status = "fail"
+	for _, diff := range result.Differences {
+		if !diff.Warning {
+			result.Status = "fail"
+			break
+		}
+		result.Status = "warning"
 	}
 	return result
 }

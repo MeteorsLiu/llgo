@@ -38,6 +38,7 @@ type existingFixture struct {
 	sites                       []observationSite
 	files                       []sourceFile
 	excluded                    []string
+	loadError                   error
 }
 
 type sourceEdit struct {
@@ -51,15 +52,6 @@ func loadFixtures(config runConfig, patterns []string) ([]*existingFixture, erro
 	if err != nil {
 		return nil, err
 	}
-	var packageErrors []string
-	for _, pkg := range loaded {
-		for _, failure := range pkg.Errors {
-			packageErrors = append(packageErrors, failure.Error())
-		}
-	}
-	if len(packageErrors) != 0 {
-		return nil, fmt.Errorf("load input: %s", strings.Join(packageErrors, "\n"))
-	}
 	var fixtures []*existingFixture
 	for _, pkg := range loaded {
 		if pkg.ForTest != "" && pkg.ForTest != pkg.PkgPath || strings.HasSuffix(pkg.PkgPath, ".test") {
@@ -70,72 +62,9 @@ func loadFixtures(config runConfig, patterns []string) ([]*existingFixture, erro
 		}) {
 			continue
 		}
-		if len(pkg.Syntax) == 0 {
-			return nil, fmt.Errorf("%s has no Go source", pkg.ID)
-		}
-		fixture := &existingFixture{name: pkg.PkgPath, directory: filepath.Dir(pkg.GoFiles[0]), arguments: []string{"."}, test: config.test}
-		if pkg.PkgPath == "command-line-arguments" {
-			fixture.arguments = nil
-			for _, file := range pkg.GoFiles {
-				fixture.arguments = append(fixture.arguments, filepath.Base(file))
-			}
-			fixture.name = filepath.Base(pkg.GoFiles[0])
-		}
-		if !config.test && pkg.Name != "main" {
-			return nil, fmt.Errorf("%s is a library package; use -test to observe its existing tests", pkg.PkgPath)
-		}
-		modulePath := pkg.PkgPath
-		if modulePath == "command-line-arguments" {
-			modulePath = "layout-observation"
-		}
-		moduleDir := fixture.directory
-		var moduleData []byte
-		for {
-			var readErr error
-			moduleData, readErr = os.ReadFile(filepath.Join(moduleDir, "go.mod"))
-			if readErr == nil {
-				break
-			}
-			if !os.IsNotExist(readErr) {
-				return nil, readErr
-			}
-			parent := filepath.Dir(moduleDir)
-			if parent == moduleDir {
-				moduleData = []byte("module " + modulePath + "\n\ngo " + strings.TrimPrefix(config.goversion, "go") + "\n")
-				moduleDir = fixture.directory
-				break
-			}
-			moduleDir = parent
-		}
-		moduleFile, err := modfile.Parse("go.mod", moduleData, nil)
+		fixture, err := loadFixture(config, pkg, loaded)
 		if err != nil {
-			return nil, err
-		}
-		for _, replace := range moduleFile.Replace {
-			if replace.New.Version == "" && !filepath.IsAbs(replace.New.Path) {
-				if err := moduleFile.AddReplace(replace.Old.Path, replace.Old.Version, filepath.Join(moduleDir, replace.New.Path), ""); err != nil {
-					return nil, err
-				}
-			}
-		}
-		moduleFile.Cleanup()
-		formatted, err := moduleFile.Format()
-		if err != nil {
-			return nil, err
-		}
-		fixture.module = string(formatted)
-		fixture.moduleRoot = moduleDir
-		if err := discoverPackage(fixture, pkg); err != nil {
-			return nil, err
-		}
-		if config.test {
-			for _, external := range loaded {
-				if external.ForTest == pkg.PkgPath && external.PkgPath == pkg.PkgPath+"_test" {
-					if err := discoverPackage(fixture, external); err != nil {
-						return nil, err
-					}
-				}
-			}
+			fixture = &existingFixture{name: pkg.PkgPath, loadError: err}
 		}
 		fixtures = append(fixtures, fixture)
 	}
@@ -143,6 +72,95 @@ func loadFixtures(config runConfig, patterns []string) ([]*existingFixture, erro
 		return nil, fmt.Errorf("no input packages matched %q", patterns)
 	}
 	return fixtures, nil
+}
+
+func loadFixture(config runConfig, pkg *packages.Package, loaded []*packages.Package) (*existingFixture, error) {
+	var packageErrors []string
+	for _, failure := range pkg.Errors {
+		packageErrors = append(packageErrors, failure.Error())
+	}
+	if len(packageErrors) != 0 {
+		return nil, fmt.Errorf("load input: %s", strings.Join(packageErrors, "\n"))
+	}
+	source := pkg
+	if config.test && len(source.Syntax) == 0 {
+		// A directory containing only package p_test has an empty p package.
+		// Keep p as the build input and locate its source through p_test.
+		for _, external := range loaded {
+			if external.ForTest == pkg.PkgPath && external.PkgPath == pkg.PkgPath+"_test" {
+				source = external
+				break
+			}
+		}
+	}
+	if len(source.Syntax) == 0 {
+		return nil, fmt.Errorf("%s has no Go source", pkg.ID)
+	}
+	fixture := &existingFixture{name: pkg.PkgPath, directory: filepath.Dir(source.GoFiles[0]), arguments: []string{"."}, test: config.test}
+	if pkg.PkgPath == "command-line-arguments" {
+		fixture.arguments = nil
+		for _, file := range source.GoFiles {
+			fixture.arguments = append(fixture.arguments, filepath.Base(file))
+		}
+		fixture.name = filepath.Base(source.GoFiles[0])
+	}
+	if !config.test && pkg.Name != "main" {
+		return nil, fmt.Errorf("%s is a library package; use -test to observe its existing tests", pkg.PkgPath)
+	}
+	modulePath := pkg.PkgPath
+	if modulePath == "command-line-arguments" {
+		modulePath = "layout-observation"
+	}
+	moduleDir := fixture.directory
+	var moduleData []byte
+	for {
+		var readErr error
+		moduleData, readErr = os.ReadFile(filepath.Join(moduleDir, "go.mod"))
+		if readErr == nil {
+			break
+		}
+		if !os.IsNotExist(readErr) {
+			return nil, readErr
+		}
+		parent := filepath.Dir(moduleDir)
+		if parent == moduleDir {
+			moduleData = []byte("module " + modulePath + "\n\ngo " + strings.TrimPrefix(config.goversion, "go") + "\n")
+			moduleDir = fixture.directory
+			break
+		}
+		moduleDir = parent
+	}
+	moduleFile, err := modfile.Parse("go.mod", moduleData, nil)
+	if err != nil {
+		return nil, err
+	}
+	for _, replace := range moduleFile.Replace {
+		if replace.New.Version == "" && !filepath.IsAbs(replace.New.Path) {
+			if err := moduleFile.AddReplace(replace.Old.Path, replace.Old.Version, filepath.Join(moduleDir, replace.New.Path), ""); err != nil {
+				return nil, err
+			}
+		}
+	}
+	moduleFile.Cleanup()
+	formatted, err := moduleFile.Format()
+	if err != nil {
+		return nil, err
+	}
+	fixture.module = string(formatted)
+	fixture.moduleRoot = moduleDir
+	if err := discoverPackage(fixture, pkg); err != nil {
+		return nil, err
+	}
+	if config.test {
+		for _, external := range loaded {
+			if external.ForTest == pkg.PkgPath && external.PkgPath == pkg.PkgPath+"_test" {
+				if err := discoverPackage(fixture, external); err != nil {
+					return nil, err
+				}
+			}
+		}
+	}
+	return fixture, nil
 }
 
 func discoverPackage(fixture *existingFixture, pkg *packages.Package) error {
