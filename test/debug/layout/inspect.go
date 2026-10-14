@@ -6,7 +6,6 @@ import (
 	"path/filepath"
 	"reflect"
 	"strconv"
-	"strings"
 )
 
 type sample struct {
@@ -28,7 +27,7 @@ func byteOrder(words []uint64) binary.ByteOrder {
 	return binary.BigEndian
 }
 
-func inspect(adapter, executable string, fixture *existingFixture, logPath string, reference []sample) (samples []sample, err error) {
+func inspect(adapter, executable, directory string, fixture *existingFixture, logPath string, reference []sample, layoutWords []uint64, arguments []string) (samples []sample, err error) {
 	client, err := startDAP(adapter, logPath)
 	if err != nil {
 		return nil, err
@@ -47,36 +46,31 @@ func inspect(adapter, executable string, fixture *existingFixture, logPath strin
 	if !capabilities.ReadMemory {
 		return nil, fmt.Errorf("LLDB adapter does not support readMemory")
 	}
-	launch, err := client.send("launch", map[string]any{"program": executable, "cwd": filepath.Dir(executable), "stopOnEntry": false})
+	launch, err := client.send("launch", map[string]any{"program": executable, "cwd": directory, "args": append([]string{}, arguments...), "stopOnEntry": false})
 	if err != nil {
 		return nil, err
 	}
 	if err = client.event("initialized", nil); err != nil {
 		return nil, err
 	}
-	line := 0
-	for i, text := range strings.Split(fixture.observerSource, "\n") {
-		if strings.Contains(text, "LLDB_BREAK: layout_snapshot") {
-			if line != 0 {
-				return nil, fmt.Errorf("duplicate snapshot marker")
-			}
-			line = i + 1
+	lines := make(map[int]bool)
+	for _, file := range fixture.files {
+		if file.checkpointLine == 0 {
+			continue
 		}
-	}
-	if line == 0 {
-		return nil, fmt.Errorf("missing snapshot marker")
-	}
-	var breakpoints struct {
-		Breakpoints []struct {
-			Verified bool   `json:"verified"`
-			Message  string `json:"message"`
-		} `json:"breakpoints"`
-	}
-	if err = client.request("setBreakpoints", map[string]any{"source": map[string]any{"path": filepath.Join(filepath.Dir(executable), "layout_observe.go")}, "breakpoints": []map[string]int{{"line": line}}}, &breakpoints); err != nil {
-		return nil, err
-	}
-	if len(breakpoints.Breakpoints) != 1 || !breakpoints.Breakpoints[0].Verified {
-		return nil, fmt.Errorf("LLDB did not resolve snapshot breakpoint: %+v", breakpoints.Breakpoints)
+		var breakpoints struct {
+			Breakpoints []struct {
+				Verified bool   `json:"verified"`
+				Message  string `json:"message"`
+			} `json:"breakpoints"`
+		}
+		if err = client.request("setBreakpoints", map[string]any{"source": map[string]any{"path": filepath.Join(directory, filepath.Base(file.path))}, "breakpoints": []map[string]int{{"line": file.checkpointLine}}}, &breakpoints); err != nil {
+			return nil, err
+		}
+		if len(breakpoints.Breakpoints) != 1 || !breakpoints.Breakpoints[0].Verified {
+			return nil, fmt.Errorf("LLDB did not resolve %s:%d: %+v", file.path, file.checkpointLine, breakpoints.Breakpoints)
+		}
+		lines[file.checkpointLine] = true
 	}
 	if err = client.request("configurationDone", struct{}{}, nil); err != nil {
 		return nil, err
@@ -84,7 +78,7 @@ func inspect(adapter, executable string, fixture *existingFixture, logPath strin
 	if err = client.response(launch, nil); err != nil {
 		return nil, err
 	}
-	order, word := byteOrder(reference[0].Words), int(reference[0].Words[17])
+	order, word := byteOrder(layoutWords), int(layoutWords[17])
 	for stage, want := range reference {
 		var stopped struct {
 			Reason   string `json:"reason"`
@@ -105,7 +99,7 @@ func inspect(adapter, executable string, fixture *existingFixture, logPath strin
 		if err = client.request("stackTrace", map[string]any{"threadId": stopped.ThreadID, "levels": 1}, &stack); err != nil {
 			return samples, err
 		}
-		if len(stack.Frames) != 1 || stack.Frames[0].Line != line {
+		if len(stack.Frames) != 1 || !lines[stack.Frames[0].Line] {
 			return samples, fmt.Errorf("unexpected snapshot frame: %+v", stack.Frames)
 		}
 		var evaluated struct {
@@ -134,7 +128,7 @@ func inspect(adapter, executable string, fixture *existingFixture, logPath strin
 		for i := range current.Words {
 			current.Words[i] = order.Uint64(data[i*8:])
 		}
-		if int(id) < len(fixture.cases) {
+		if id%2 == 0 {
 			stride := current.Words[2]
 			if stride != 0 {
 				current.Memory, err = client.readMemory(current.Words[1], int(stride*elementCount))

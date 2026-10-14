@@ -6,7 +6,6 @@ import (
 	"go/ast"
 	"go/format"
 	"go/parser"
-	"go/token"
 	"strconv"
 	"strings"
 )
@@ -17,22 +16,6 @@ var fixtureTemplate string
 const headerWords = 19
 const fieldWords = 6
 const elementCount = 2
-
-func skipReason(c layoutCase) (string, error) {
-	f, err := parser.ParseFile(token.NewFileSet(), "declarations.go", "package main\n"+c.declaration, parser.ParseComments)
-	if err != nil {
-		return "", err
-	}
-	for _, group := range f.Comments {
-		for _, comment := range group.List {
-			text := strings.TrimSpace(strings.TrimPrefix(comment.Text, "//"))
-			if text == "llgo:cdecl" || text == "llgo:stdcall" || strings.HasPrefix(text, "llgo:type C") {
-				return "special ABI declaration: " + text, nil
-			}
-		}
-	}
-	return "", nil
-}
 
 type selectorStep struct {
 	name  string
@@ -75,7 +58,7 @@ func selectorSteps(path string) ([]selectorStep, error) {
 
 func generate(c layoutCase, id int) (string, error) {
 	var body strings.Builder
-	fmt.Fprintf(&body, "func layoutType_%d() {\n var items [2]%s\n layoutRoots=append(layoutRoots,unsafe.Pointer(&items))\n", id, c.name)
+	fmt.Fprintf(&body, "func layoutType_%d() {\n layoutMu.Lock(); defer layoutMu.Unlock()\n var items [2]%s\n layoutRoots=append(layoutRoots,unsafe.Pointer(&items))\n", id, c.name)
 	fmt.Fprintf(&body, "observation:=make([]uint64,%d)\n", headerWords+len(c.fields)*fieldWords)
 	fmt.Fprintln(&body, `var boxed any=items[0]
  typeAddress:=(*[2]unsafe.Pointer)(unsafe.Pointer(&boxed))[0]

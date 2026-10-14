@@ -177,7 +177,7 @@ func (c *dapClient) event(name string, result any) error {
 		}
 		for _, message := range c.responses {
 			if !message.Success {
-				return fmt.Errorf("LLDB %s: %s", message.Command, message.Message)
+				return fmt.Errorf("LLDB %s: %s (%s)", message.Command, message.Message, message.Body)
 			}
 		}
 		if err := c.receive(); err != nil {

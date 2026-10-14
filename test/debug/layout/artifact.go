@@ -61,6 +61,9 @@ func underlyingDWARF(t dwarf.Type) dwarf.Type {
 func checkDWARF(c layoutCase, data *dwarf.Data, reference sample) ([]difference, error) {
 	var subject *dwarf.StructType
 	reader := data.Reader()
+	observer := fmt.Sprintf("%s.layoutType_%d", c.irPrefix, reference.Words[0])
+	inside := false
+	depth := 0
 	for {
 		entry, err := reader.Next()
 		if err != nil {
@@ -69,20 +72,44 @@ func checkDWARF(c layoutCase, data *dwarf.Data, reference sample) ([]difference,
 		if entry == nil {
 			break
 		}
-		if entry.Tag != dwarf.TagStructType && entry.Tag != dwarf.TagTypedef {
+		if entry.Tag == 0 {
+			if inside {
+				depth--
+				if depth == 0 {
+					break
+				}
+			}
 			continue
 		}
 		name, _ := entry.Val(dwarf.AttrName).(string)
-		if name != c.name && !strings.HasSuffix(name, "."+c.name) {
+		if !inside {
+			if entry.Tag == dwarf.TagSubprogram && name == observer {
+				inside = true
+				depth = 1
+			}
 			continue
 		}
-		typ, err := data.Type(entry.Offset)
+		if entry.Children {
+			depth++
+		}
+		if entry.Tag != dwarf.TagVariable || name != "items" {
+			continue
+		}
+		offset, ok := entry.Val(dwarf.AttrType).(dwarf.Offset)
+		if !ok {
+			return nil, fmt.Errorf("DWARF %s.items has no type reference", observer)
+		}
+		typ, err := data.Type(offset)
 		if err != nil {
 			return nil, err
 		}
-		st, ok := underlyingDWARF(typ).(*dwarf.StructType)
+		array, ok := underlyingDWARF(typ).(*dwarf.ArrayType)
+		if !ok || array.Count != elementCount {
+			return nil, fmt.Errorf("DWARF %s.items is not a [%d] array", observer, elementCount)
+		}
+		st, ok := underlyingDWARF(array.Type).(*dwarf.StructType)
 		if !ok || st.Incomplete {
-			continue
+			return nil, fmt.Errorf("DWARF %s.items has no complete struct element", observer)
 		}
 		if subject != nil && subject.String() != st.String() {
 			return nil, fmt.Errorf("conflicting DWARF %s definitions", c.name)
@@ -90,16 +117,18 @@ func checkDWARF(c layoutCase, data *dwarf.Data, reference sample) ([]difference,
 		subject = st
 	}
 	if subject == nil {
-		return nil, fmt.Errorf("%s struct is missing from DWARF", c.name)
+		return nil, fmt.Errorf("%s.items struct is missing from DWARF", observer)
 	}
 	var differences []difference
+	location := c.sourceLocation
 	check := func(name string, want uint64, got int64) {
 		if got < 0 || uint64(got) != want {
-			differences = append(differences, difference{"dwarf", "", c.name + "." + name, want, got})
+			differences = append(differences, difference{"dwarf", "", c.displayName + "." + name, want, got, location.file, location.line})
 		}
 	}
 	check("struct size", reference.Words[6], subject.Size())
 	for i, field := range c.fields {
+		location = field.sourceLocation
 		steps, err := selectorSteps(field.path)
 		if err != nil {
 			return nil, err
@@ -154,7 +183,7 @@ func checkIR(c layoutCase, path string, reference sample) ([]difference, error) 
 			continue
 		}
 		for _, operation := range []string{"Read", "Write"} {
-			name := fmt.Sprintf("main.layout%s_%s_%d", operation, c.name, i)
+			name := fmt.Sprintf("%s.layout%s_%s_%d", c.irPrefix, operation, c.name, i)
 			function := regexp.MustCompile(`(?m)^define [^\n]*@"?` + regexp.QuoteMeta(name) + `"?\([^\n]*\{\n([\s\S]*?)^}`)
 			match := function.FindStringSubmatch(ir)
 			if match == nil {
@@ -178,7 +207,7 @@ func checkIR(c layoutCase, path string, reference sample) ([]difference, error) 
 				return nil, err
 			}
 			if got > reference.Words[index+4] {
-				differences = append(differences, difference{"ir", "", name + " alignment", reference.Words[index+4], got})
+				differences = append(differences, difference{"ir", "", name + " alignment", reference.Words[index+4], got, field.file, field.line})
 			}
 			wantType := fmt.Sprintf("i%d", reference.Words[index+3]*8)
 			if field.typ == "float64" {
@@ -191,7 +220,7 @@ func checkIR(c layoutCase, path string, reference sample) ([]difference, error) 
 				wantType = "ptr"
 			}
 			if access[0][1] != wantType {
-				differences = append(differences, difference{"ir", "", name + " access type", wantType, access[0][1]})
+				differences = append(differences, difference{"ir", "", name + " access type", wantType, access[0][1], field.file, field.line})
 			}
 		}
 	}

@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"reflect"
 	"slices"
-	"strings"
 )
 
 type difference struct {
@@ -14,13 +13,16 @@ type difference struct {
 	Item  string `json:"item"`
 	Want  any    `json:"want"`
 	Got   any    `json:"got"`
+	File  string `json:"file"`
+	Line  int    `json:"line"`
 }
 
 func compare(c layoutCase, reference, observed []sample) []difference {
 	var differences []difference
+	location := c.sourceLocation
 	check := func(category, name string, want, got uint64) {
 		if want != got {
-			differences = append(differences, difference{category, "", c.name + "." + name, want, got})
+			differences = append(differences, difference{category, "", c.displayName + "." + name, want, got, location.file, location.line})
 		}
 	}
 	want, got := reference[0].Words, observed[0].Words
@@ -36,6 +38,7 @@ func compare(c layoutCase, reference, observed []sample) []difference {
 	check("layout", "object address modulo alignment", 0, got[1]%want[4])
 	check("layout", "metadata size vs actual stride", got[2], got[6])
 	for i, field := range c.fields {
+		location = field.sourceLocation
 		index := headerWords + i*fieldWords
 		for j, name := range []string{"unsafe offset", "physical offset", "metadata offset", "size", "alignment", "kind"} {
 			category := "metadata"
@@ -46,6 +49,7 @@ func compare(c layoutCase, reference, observed []sample) []difference {
 		}
 	}
 	order, word := byteOrder(want), int(want[17])
+	location = c.sourceLocation
 	raw := observed[0].TypeData
 	check("metadata", "raw descriptor size", want[6], readInteger(order, raw[:word]))
 	check("metadata", "raw descriptor PtrBytes", want[7], readInteger(order, raw[word:word*2]))
@@ -57,16 +61,11 @@ func compare(c layoutCase, reference, observed []sample) []difference {
 
 func compareValues(site observationSite, reference, observed sample, layoutWords []uint64) []difference {
 	var differences []difference
-	category := "access"
-	if strings.Contains(site.label, "param") || strings.HasPrefix(site.label, "struct_values") {
-		category = "call_return"
-	}
-	if strings.HasPrefix(site.label, "interface_") || strings.HasPrefix(site.label, "container_") || strings.HasPrefix(site.label, "function_") {
-		category = "value_semantics"
-	}
+	category := site.check
+	location := site.sourceLocation
 	check := func(name string, want, got uint64) {
 		if want != got {
-			differences = append(differences, difference{category, site.label, name, want, got})
+			differences = append(differences, difference{category, site.label, name, want, got, location.file, location.line})
 		}
 	}
 	order, word := byteOrder(layoutWords), int(layoutWords[17])
@@ -75,14 +74,16 @@ func compareValues(site observationSite, reference, observed sample, layoutWords
 		slot, n := want[j], int(want[j+3])
 		name := site.names[slot]
 		check(name+" slot", slot, got[j])
+		location = site.locations[slot]
 		check(name+" size", want[j+2], got[j+2])
+		location = site.sourceLocation
 		if got[j+3] != uint64(n) {
 			check(name+" value length", uint64(n), got[j+3])
 			return differences
 		}
 		payload := want[j+4 : j+4+n]
 		if !slices.Equal(payload, got[j+4:j+4+n]) {
-			differences = append(differences, difference{category, site.label, name + " value", payload, got[j+4 : j+4+n]})
+			differences = append(differences, difference{category, site.label, name + " value", payload, got[j+4 : j+4+n], site.file, site.line})
 		}
 		for _, raw := range observed.Values {
 			if raw.Slot != slot {
@@ -113,7 +114,7 @@ func compareValues(site observationSite, reference, observed sample, layoutWords
 					wantText[i] = byte(value)
 				}
 				if !slices.Equal(wantText, raw.Text) {
-					differences = append(differences, difference{category, site.label, name + " raw text", string(wantText), string(raw.Text)})
+					differences = append(differences, difference{category, site.label, name + " raw text", string(wantText), string(raw.Text), site.file, site.line})
 				}
 			case reflect.Slice:
 				check(name+" raw length", payload[1], readInteger(order, raw.Data[word:word*2]))

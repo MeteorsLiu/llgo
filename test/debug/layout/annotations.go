@@ -6,96 +6,72 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 )
 
-// annotatedSource renders existing results beside their source declarations or
-// checkpoints. It does not add assertions or change the report's differences.
-func annotatedSource(source []byte, cases []layoutCase, report runReport) ([]byte, error) {
+func writeAnnotations(directory string, files []sourceFile, report runReport, caseName string) error {
+	if err := os.MkdirAll(directory, 0755); err != nil {
+		return err
+	}
+	filtered := report
+	filtered.Results = nil
+	for _, result := range report.Results {
+		if result.Case == caseName {
+			filtered.Results = append(filtered.Results, result)
+		}
+	}
+	for _, file := range files {
+		annotated, err := annotatedSource([]byte(file.original), file.path, filtered)
+		if err != nil {
+			return err
+		}
+		if err := os.WriteFile(filepath.Join(directory, filepath.Base(file.path)), annotated, 0644); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// annotatedSource only renders facts already recorded by the checker. Locations
+// come from the input AST, so diagnostics do not depend on fixture names or markers.
+func annotatedSource(source []byte, filename string, report runReport) ([]byte, error) {
 	fset := token.NewFileSet()
-	file, err := parser.ParseFile(fset, "main.go", source, parser.ParseComments)
+	file, err := parser.ParseFile(fset, filename, source, parser.ParseComments)
 	if err != nil {
 		return nil, err
 	}
-	declarations := make(map[string]int)
-	fields := make(map[string]int)
+	fields := make(map[int][]string)
 	ast.Inspect(file, func(node ast.Node) bool {
-		spec, ok := node.(*ast.TypeSpec)
-		if !ok {
-			return true
-		}
-		declarations[spec.Name.Name] = fset.Position(spec.Pos()).Line
-		if st, ok := spec.Type.(*ast.StructType); ok {
-			for _, field := range st.Fields.List {
-				for _, name := range field.Names {
-					fields[spec.Name.Name+"."+name.Name] = fset.Position(field.Pos()).Line
-				}
+		if field, ok := node.(*ast.Field); ok {
+			line := fset.Position(field.Pos()).Line
+			for _, name := range field.Names {
+				fields[line] = append(fields[line], name.Name)
 			}
 		}
-		return false
+		return true
 	})
-	checkpoints := make(map[string]int)
-	for _, group := range file.Comments {
-		for _, comment := range group.List {
-			label, ok := strings.CutPrefix(comment.Text, "// LLDB_BREAK: ")
-			if !ok {
-				continue
-			}
-			line := fset.Position(comment.Pos()).Line
-			// A marker may end a multiline call, e.g. interface_values. Put
-			// the annotation before the statement, not among its arguments.
-			ast.Inspect(file, func(node ast.Node) bool {
-				switch node.(type) {
-				case *ast.ExprStmt, *ast.AssignStmt, *ast.ReturnStmt, *ast.IncDecStmt:
-					start, end := fset.Position(node.Pos()).Line, fset.Position(node.End()).Line
-					if start <= line && line <= end {
-						checkpoints[label] = start
-					}
-				}
-				return true
-			})
-		}
-	}
 	type annotationKey struct {
-		line    int
-		message string
+		line                          int
+		check, stage, item, want, got string
 	}
 	type annotation struct {
-		annotationKey
-		levels []string
+		key     annotationKey
+		message string
+		levels  []string
 	}
 	var annotations []annotation
 	groups := make(map[annotationKey]int)
 	total := 0
 	for _, result := range report.Results {
 		for _, diff := range result.Differences {
-			line := 0
-			if diff.Stage != "" {
-				line = checkpoints[diff.Stage]
-			} else {
-				for _, c := range cases {
-					if strings.HasPrefix(diff.Item, c.name+".") {
-						line = declarations[c.name]
-					}
-					for i, field := range c.fields {
-						fieldMatch := strings.HasPrefix(diff.Item, c.name+"."+field.path+" ")
-						readMatch := strings.HasPrefix(diff.Item, fmt.Sprintf("main.layoutRead_%s_%d ", c.name, i))
-						writeMatch := strings.HasPrefix(diff.Item, fmt.Sprintf("main.layoutWrite_%s_%d ", c.name, i))
-						if fieldMatch || readMatch || writeMatch {
-							// Nested offsets are relative to the outer struct. For
-							// StructWithAllTypeFields.arr2[0].i, annotate arr2.
-							name := field.path
-							if end := strings.IndexAny(name, ".["); end >= 0 {
-								name = name[:end]
-							}
-							line = fields[c.name+"."+name]
-						}
-					}
-				}
+			if diff.File != filename {
+				continue
 			}
-			if line == 0 {
-				return nil, fmt.Errorf("cannot locate source for %s/%s: %s", diff.Check, diff.Stage, diff.Item)
+			if diff.Line < 1 || diff.Line > strings.Count(string(source), "\n")+1 {
+				return nil, fmt.Errorf("invalid source location %s:%d", filename, diff.Line)
 			}
 			want, err := json.Marshal(diff.Want)
 			if err != nil {
@@ -105,16 +81,58 @@ func annotatedSource(source []byte, cases []layoutCase, report runReport) ([]byt
 			if err != nil {
 				return nil, err
 			}
-			check := diff.Check
-			if diff.Stage != "" {
-				check += "/" + diff.Stage
+			label := diff.Item
+			valueSize := diff.Stage != "" && strings.HasSuffix(diff.Item, " size")
+			fieldMatch := false
+			if diff.Stage == "" || valueSize {
+				if dot := strings.LastIndex(label, "."); dot >= 0 {
+					label = label[dot+1:]
+				}
+				for _, name := range fields[diff.Line] {
+					if trimmed, ok := strings.CutPrefix(label, name+" "); ok {
+						label = trimmed
+						fieldMatch = true
+					}
+				}
+				if (diff.Check == "metadata" || valueSize) && label == "size" && fieldMatch {
+					label = "reflected size"
+				}
 			}
-			key := annotationKey{line, fmt.Sprintf("%s: %s; want=%s; got=%s", check, diff.Item, want, got)}
+			if valueSize && !fieldMatch {
+				label = strings.TrimSuffix(label, " size") + " reflected size"
+			}
+			if diff.Check == "dwarf" {
+				label = "DWARF " + label
+			}
+			if diff.Check == "ir" {
+				operation := "load"
+				if strings.Contains(diff.Item, ".layoutWrite_") {
+					operation = "store"
+				}
+				property := "access type"
+				if strings.HasSuffix(diff.Item, " alignment") {
+					property = "alignment"
+				}
+				label = "LLVM " + operation + " " + property
+			}
+			unit := ""
+			for _, suffix := range []string{"size", "PtrBytes", "offset", "stride", "alignment", "Sizeof", "Alignof"} {
+				if strings.HasSuffix(label, suffix) {
+					unit = " bytes"
+					break
+				}
+			}
+			key := annotationKey{diff.Line, diff.Check, diff.Stage, diff.Item, string(want), string(got)}
+			if valueSize || fieldMatch && label == "reflected size" {
+				key.check = "metadata"
+				key.stage = ""
+				key.item = label
+			}
 			index, ok := groups[key]
 			if !ok {
 				index = len(annotations)
 				groups[key] = index
-				annotations = append(annotations, annotation{annotationKey: key})
+				annotations = append(annotations, annotation{key: key, message: fmt.Sprintf("%s = %s%s; expected %s", label, got, unit, want)})
 			}
 			level := "O" + result.Level
 			if !slices.Contains(annotations[index].levels, level) {
@@ -123,14 +141,12 @@ func annotatedSource(source []byte, cases []layoutCase, report runReport) ([]byt
 			total++
 		}
 	}
-	slices.SortStableFunc(annotations, func(a, b annotation) int { return a.line - b.line })
+	slices.SortStableFunc(annotations, func(a, b annotation) int { return a.key.line - b.key.line })
 	var output strings.Builder
-	fmt.Fprintf(&output, "// Layout observations for %s/%s from report.json.\n", report.GOOS, report.GOARCH)
-	output.WriteString("// Source: test/debug/runtime/main.go; source line numbers below refer to that file.\n")
-	output.WriteString("// Annotations locate failed observations, not confirmed compiler root causes.\n")
-	fmt.Fprintf(&output, "// %d differences, %d annotations; identical results across optimization levels are grouped.\n", total, len(annotations))
+	fmt.Fprintf(&output, "// Layout observations for %s/%s. Source: %s\n", report.GOOS, report.GOARCH, filename)
+	fmt.Fprintf(&output, "// %d failed observations; %d annotations after grouping repeated sizes and optimization levels.\n", total, len(annotations))
 	for _, result := range report.Results {
-		fmt.Fprintf(&output, "// %s O%s: %s (%d differences)", result.Case, result.Level, result.Status, len(result.Differences))
+		fmt.Fprintf(&output, "// %s O%s: %s", result.Case, result.Level, result.Status)
 		if result.Reason != "" {
 			fmt.Fprintf(&output, "; reason=%q", result.Reason)
 		}
@@ -139,13 +155,17 @@ func annotatedSource(source []byte, cases []layoutCase, report runReport) ([]byt
 	output.WriteByte('\n')
 	index := 0
 	for i, line := range strings.SplitAfter(string(source), "\n") {
-		indent := line[:len(line)-len(strings.TrimLeft(line, " \t"))]
-		for index < len(annotations) && annotations[index].line == i+1 {
+		text := strings.TrimSuffix(strings.TrimSuffix(line, "\n"), "\r")
+		ending := line[len(text):]
+		output.WriteString(text)
+		separator := " // layout: "
+		for index < len(annotations) && annotations[index].key.line == i+1 {
 			item := annotations[index]
-			fmt.Fprintf(&output, "%s// LAYOUT-FAIL [%s] source:%d %s\n", indent, strings.Join(item.levels, ","), item.line, item.message)
+			fmt.Fprintf(&output, "%s%s (%s)", separator, item.message, strings.Join(item.levels, ", "))
+			separator = "; "
 			index++
 		}
-		output.WriteString(line)
+		output.WriteString(ending)
 	}
 	return []byte(output.String()), nil
 }

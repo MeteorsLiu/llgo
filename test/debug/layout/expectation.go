@@ -2,10 +2,6 @@ package main
 
 import (
 	"fmt"
-	"go/ast"
-	"go/importer"
-	"go/parser"
-	"go/token"
 	"go/types"
 )
 
@@ -66,25 +62,11 @@ func expectedLayout(typ types.Type, sizes types.Sizes) *expectedType {
 }
 
 func expectedReference(c layoutCase, goarch string, reference []sample) ([]sample, error) {
-	fset := token.NewFileSet()
-	source, err := parser.ParseFile(fset, "declarations.go", "package main\n"+c.declaration, 0)
-	if err != nil {
-		return nil, err
-	}
 	sizes := types.SizesFor("gc", goarch)
 	if sizes == nil {
 		return nil, fmt.Errorf("no Go layout rules for %s", goarch)
 	}
-	config := types.Config{Importer: importer.Default(), Sizes: sizes, IgnoreFuncBodies: true}
-	pkg, err := config.Check("layoutcase", fset, []*ast.File{source}, nil)
-	if err != nil {
-		return nil, err
-	}
-	obj := pkg.Scope().Lookup("subject")
-	if obj == nil {
-		return nil, fmt.Errorf("subject declaration is missing")
-	}
-	typ := obj.Type()
+	typ := c.typ
 	layout := expectedLayout(typ, sizes)
 	if !layout.closure {
 		return reference, nil

@@ -5,10 +5,12 @@ import (
  "math"
  "reflect"
  "runtime"
+ "sync"
  "unsafe"
 )
 
 var layoutRoots []unsafe.Pointer
+var layoutMu sync.Mutex
 
 type layoutTypePrefix struct {
  size uintptr
@@ -62,8 +64,16 @@ func layoutValue(words []uint64, v reflect.Value) []uint64 {
   for i := 0; i < v.Len(); i++ { words = layoutValue(words, v.Index(i)) }
   return words
  case reflect.Struct:
-  words = append(words, uint64(v.NumField()))
-  for i := 0; i < v.NumField(); i++ { words = layoutValue(words, v.Field(i)) }
+  // Foreign private fields are not source-visible values. For example,
+  // testing.T owns timestamps and stack PCs that differ between processes.
+  owner := reflect.TypeOf(layoutTypePrefix{}).PkgPath()
+  count := len(words); words = append(words, 0)
+  for i := 0; i < v.NumField(); i++ {
+   field := v.Type().Field(i)
+   if field.PkgPath != "" && field.PkgPath != owner { continue }
+   words[count]++
+   words = layoutValue(words, v.Field(i))
+  }
   return words
  case reflect.Interface:
   if v.IsNil() { return append(words, 0) }; return layoutValue(words, v.Elem())
