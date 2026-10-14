@@ -38,16 +38,9 @@ The approved temporary overlay removes the `RuntimeGoroutineValues` call and imp
 
 The shared `.github/actions/check-layout` action receives the already-built `llgo` and `llgen` paths and a unique `artifact-name`. `source-root` defaults to the checkout; `runtime-root` defaults to that source root. Release checks pass the installed compiler and its installed runtime explicitly, while reading the fixtures from the checkout. The action prepares the native debug adapter, runs O0/O2 checks and uploads observations even on failure. It does not build or replace the selected compiler.
 
-The native CI callers are:
+The full check belongs to the external [LLGo compatibility workflows](https://github.com/llgo-compat/ci). Its existing `GOROOT` scheduled/manual entry runs an independent native-layout matrix once per platform/ABI, without multiplying the work across corpus shards. The selected `llgo_repository` and `llgo_ref` supply the compiler, fixture and shared action. Ordinary LLGo pull-request compiler jobs do not invoke this lengthy check.
 
-| Workflow | Compiler configurations |
-| --- | --- |
-| `llgo.yml` | Stage 1 and stage 2 self-hosting, the primary native matrix including all six Windows ABI/architecture combinations, Linux ARM64 and Intel macOS. |
-| `go.yml` | The ordinary compiler matrix and the macOS/Linux development compiler jobs. These checks use O0/O2; the existing LTO-specific tests remain separate. |
-| `build-cache.yml` | The development compiler built for each native cache-testing platform. |
-| `release-build.yml` | Installed Unix and Windows release artifacts, with their bundled runtime sources. Development LLVM dependencies are installed after the Unix release smoke tests. |
-
-Each caller retains the existing test sequence and checks layouts afterward when its compiler/tools build succeeded, including when another test failed. Windows debugger environment values are scoped to the checking process; the action does not export them into subsequent job steps. Layout failures retain a nonzero exit status. Wasm, embedded and cross-target layout execution and the external compatibility repository are not wired through this native action.
+The native matrix covers Linux amd64/arm64, macOS amd64/arm64, and Windows MSVC/MinGW on amd64/arm64/386. Windows debugger environment values are scoped to the checking process; the action does not export them into subsequent job steps. Layout failures retain a nonzero exit status. Wasm, embedded and cross-target layout execution remain outside this native action.
 
 Each optimization level retains the instrumented source, Go/LLGo executables, build logs, `baseline.json`, `expected.json`, `observed.json`, a DAP transcript, DWARF artifacts and pre-ABI LLVM IR. `report.json` lists mismatches with their category, checkpoint and field or variable. Missing symbols, failed debugger operations and missing DWARF/IR are errors rather than passes.
 
