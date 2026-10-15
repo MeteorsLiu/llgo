@@ -1,5 +1,5 @@
 name: Check layouts with layoutlint
-description: Prepare native LLDB, check the supplied Go inputs, and upload observations
+description: Prepare native LLDB, check the supplied Go inputs, and upload failed observations
 inputs:
   llgo:
     description: LLGo compiler executable
@@ -78,6 +78,7 @@ runs:
         "adapter=$adapter" >> $env:GITHUB_OUTPUT
 
     - name: Run layoutlint
+      id: check
       shell: bash
       env:
         LAYOUT_TOOL_ROOT: ${{ github.action_path }}/../../..
@@ -106,8 +107,40 @@ runs:
         "$tool" -root "$LAYOUT_SOURCE" -llgo "$LAYOUT_LLGO" -llgen "$LAYOUT_LLGEN" \
           -lldb-dap "$LAYOUT_ADAPTER" -output "$LAYOUT_OUTPUT" "${args[@]}"
 
-    - name: Upload observations and annotated source
-      if: always()
+    - name: Select failed observations
+      id: failures
+      if: always() && steps.check.outcome != 'success'
+      shell: python
+      env:
+        LAYOUT_OUTPUT: ${{ runner.temp }}/${{ inputs.artifact-name }}
+      run: |
+        import json, os, shutil
+        from pathlib import Path
+
+        output = Path(os.environ["LAYOUT_OUTPUT"])
+        report_path = output / "report.json"
+        if report_path.is_file():
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+            failures = [r for r in report["results"] if r["status"] not in ("pass", "warning")]
+            failed_cases = {r["case"] for r in failures}
+            for result in report["results"]:
+                if result["status"] not in ("pass", "warning"):
+                    continue
+                directory = Path(result["directory"])
+                shutil.rmtree(directory)
+                annotated = output / directory.name.rsplit("-O", 1)[0]
+                if result["case"] not in failed_cases and annotated.is_dir():
+                    shutil.rmtree(annotated)
+            report["results"] = failures
+            report_path.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+        # A failed run can stop before report.json is written. Keep its logs
+        # and any unfinished case directory so the failure stays diagnosable.
+        if output.is_dir():
+            with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8", newline="\n") as out:
+                print("upload=true", file=out)
+
+    - name: Upload failed observations and annotated source
+      if: always() && steps.failures.outputs.upload == 'true'
       uses: actions/upload-artifact@v7
       with:
         name: ${{ inputs.artifact-name }}

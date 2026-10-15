@@ -65,7 +65,7 @@ Comments name the mismatched property and show its observed and expected values.
 
 Capacity diagnostics carry `"warning": true` in `report.json` and appear as `// layoutlint: warning: app capacity = 2; Go reports 8 (O0, O2)` in annotated source. A result containing only warnings has status `warning` and does not make the command exit nonzero; any error still fails the run.
 
-The `.github/actions/check-layout` composite action prepares native LLDB, builds and runs layoutlint, and uploads observations even when a check fails. It uses the caller's configured Go/LLVM environment and, on Windows, the target-native LLDB runtime dependencies installed by the existing setup actions. Each nonempty `args` line is passed as one literal command argument without shell expansion:
+The `.github/actions/check-layout` composite action prepares native LLDB, builds and runs layoutlint, and uploads only failed observations. Its downloaded report omits `pass` and `warning` results and their observation directories; annotated source is retained for inputs with failures. Runs containing only passes or warnings upload no artifact. If a run stops before recording a result, its existing logs and unfinished case directory are retained. Standalone layoutlint output remains complete. The action uses the caller's configured Go/LLVM environment and, on Windows, the target-native LLDB runtime dependencies installed by the existing setup actions. Each nonempty `args` line is passed as one literal command argument without shell expansion:
 
 ```yaml
 - uses: ./.github/actions/check-layout
