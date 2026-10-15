@@ -1,0 +1,100 @@
+package main
+
+import (
+ "fmt"
+ "math"
+ "reflect"
+ "runtime"
+ "sync"
+ "unsafe"
+)
+
+var layoutRoots []unsafe.Pointer
+var layoutMu sync.Mutex
+
+type layoutTypePrefix struct {
+ size uintptr
+ ptrBytes uintptr
+ hash uint32
+ flags uint8
+ align uint8
+ fieldAlign uint8
+ kind uint8
+}
+
+// The wire buffer contains only uint64 elements, so reading an observation
+// does not depend on the struct offsets being checked.
+//go:noinline
+func layoutCheckpoint(data *[3]uint64) {
+ fmt.Println("LLGO_LAYOUT", unsafe.Slice((*uint64)(unsafe.Pointer(uintptr(data[1]))), data[2])) // LLDB_BREAK: layout_snapshot
+}
+
+func layoutSnapshot(words []uint64) {
+ header := [3]uint64{words[0], uint64(uintptr(unsafe.Pointer(&words[0]))), uint64(len(words))}
+ layoutCheckpoint(&header)
+ runtime.KeepAlive(words)
+ layoutRoots = nil
+}
+
+func layoutValue(words []uint64, v reflect.Value) []uint64 {
+ if !v.IsValid() { return append(words, 0) }
+ words = append(words, uint64(v.Kind()))
+ switch v.Kind() {
+ case reflect.Bool:
+  if v.Bool() { return append(words, 1) }; return append(words, 0)
+ case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+  return append(words, uint64(v.Int()))
+ case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
+  return append(words, v.Uint())
+ case reflect.Float32:
+  return append(words, uint64(math.Float32bits(float32(v.Float()))))
+ case reflect.Float64:
+  return append(words, math.Float64bits(v.Float()))
+ case reflect.Complex64, reflect.Complex128:
+  value := v.Complex()
+  if v.Kind() == reflect.Complex64 { return append(words, uint64(math.Float32bits(float32(real(value)))), uint64(math.Float32bits(float32(imag(value))))) }
+  return append(words, math.Float64bits(real(value)), math.Float64bits(imag(value)))
+ case reflect.String:
+  value := v.String(); words = append(words, uint64(len(value)))
+  for i := 0; i < len(value); i++ { words = append(words, uint64(value[i])) }
+  return words
+ case reflect.Array, reflect.Slice:
+  words = append(words, uint64(v.Len()))
+  if v.Kind() == reflect.Slice { words = append(words, uint64(v.Cap())) }
+  for i := 0; i < v.Len(); i++ { words = layoutValue(words, v.Index(i)) }
+  return words
+ case reflect.Struct:
+  // Foreign private fields are not source-visible values. For example,
+  // testing.T owns timestamps and stack PCs that differ between processes.
+  owner := reflect.TypeOf(layoutTypePrefix{}).PkgPath()
+  count := len(words); words = append(words, 0)
+  for i := 0; i < v.NumField(); i++ {
+   field := v.Type().Field(i)
+   if field.PkgPath != "" && field.PkgPath != owner { continue }
+   words[count]++
+   words = layoutValue(words, v.Field(i))
+  }
+  return words
+ case reflect.Interface:
+  if v.IsNil() { return append(words, 0) }; return layoutValue(words, v.Elem())
+ case reflect.Map:
+  // Existing map lookup results are captured separately. Addresses and
+  // iteration order are not cross-compiler identities.
+  return append(words, uint64(v.Len()))
+ case reflect.Chan:
+  return append(words, uint64(v.Len()), uint64(v.Cap()))
+ case reflect.Pointer, reflect.UnsafePointer, reflect.Func:
+  if v.IsNil() { return append(words, 0) }; return append(words, 1)
+ default:
+  panic("unhandled layout value kind: " + v.Kind().String())
+ }
+}
+
+func layoutAppend(words []uint64, v reflect.Value, address unsafe.Pointer) []uint64 {
+ layoutRoots = append(layoutRoots, address)
+ start := len(words)
+ words = append(words, uint64(uintptr(address)), uint64(v.Type().Size()), 0)
+ words = layoutValue(words, v)
+ words[start+2] = uint64(len(words)-start-3)
+ return words
+}
