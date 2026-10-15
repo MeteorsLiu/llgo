@@ -171,6 +171,16 @@ func (c *dapClient) event(name string, result any) error {
 				}
 				return nil
 			}
+			if name == "exited" && event.Event == "stopped" {
+				var stopped struct {
+					Reason      string `json:"reason"`
+					Description string `json:"description"`
+				}
+				if err := json.Unmarshal(event.Body, &stopped); err != nil {
+					return err
+				}
+				return fmt.Errorf("process stopped before exit: %s: %s", stopped.Reason, stopped.Description)
+			}
 			if event.Event == "terminated" || event.Event == "exited" {
 				return fmt.Errorf("process %s before %s: %s", event.Event, name, event.Body)
 			}
