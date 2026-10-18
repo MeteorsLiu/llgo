@@ -621,10 +621,15 @@ func checkOffsets(root, directory, source string, pkg *packages.Package, tests b
 		`settings set thread-format "layoutlint-thread ${thread.index}|{${frame.pc}}|{${thread.stop-reason}}\n"`,
 		`breakpoint set --func-regex '\.layoutlint(Checkpoint|PrivateCheckpoint[0-9]+)$' --skip-prologue false`,
 	}
+	continueCommand := "process continue --continue-to-bkpt 1"
 	if runtime.GOOS == "linux" {
 		// Boehm suspends/resumes threads with SIGPWR/SIGXCPU; LLGo uses
 		// SIGURG for thread snapshots. Deliver these runtime handshakes.
 		setup = append(setup, "process handle --pass true --stop false --notify false SIGPWR SIGXCPU SIGURG")
+		// Stop after libc's exit handlers, before _exit terminates the other
+		// threads. Resuming them all here can race exit_group and return ESRCH.
+		setup = append(setup, "breakpoint set --name _exit --skip-prologue false")
+		continueCommand += " --continue-to-bkpt 2"
 	}
 	// command source with stop-on-continue=false runs synchronously. Let
 	// LLDB consume the loader's initial stop (dyld SIGSTOP on macOS, for
@@ -637,15 +642,14 @@ func checkOffsets(root, directory, source string, pkg *packages.Package, tests b
 	}
 	fmt.Printf("  LLDB: %d field accesses\n", len(results))
 	register := regexp.MustCompile(`(?m)^\s*[a-zA-Z][a-zA-Z0-9]*\s*=\s*(0x[0-9a-fA-F]+)(?:\s|$)`)
-	stopReason := regexp.MustCompile(`^breakpoint (1\.[0-9]+)$`)
-	breakpointLocation := regexp.MustCompile(`(?m)^\s*(1\.[0-9]+):.* address = (0x[0-9a-fA-F]+), resolved, hit count = ([0-9]+)\b`)
-	readArguments := func() ([3]uint64, error) {
-		var arguments [3]uint64
+	stopReason := regexp.MustCompile(`^breakpoint ([0-9]+\.[0-9]+)$`)
+	breakpointLocation := regexp.MustCompile(`(?m)^\s*([0-9]+\.[0-9]+):.* address = (0x[0-9a-fA-F]+), resolved, hit count = ([0-9]+)\b`)
+	selectThread := func(breakpoint string) (string, error) {
 		// A synchronous continue can return on a signal or exception. In
 		// particular, libc's x2 at a GC handshake is not a checkpoint ID.
 		threads, err := session.run("thread list")
 		if err != nil {
-			return arguments, err
+			return "", err
 		}
 		var thread, location string
 		var pc uint64
@@ -660,33 +664,33 @@ func checkOffsets(root, directory, source string, pkg *packages.Package, tests b
 			}
 			parts := strings.SplitN(line, "|", 3)
 			if len(parts) != 3 {
-				return arguments, fmt.Errorf("invalid LLDB thread status %q", line)
+				return "", fmt.Errorf("invalid LLDB thread status %q", line)
 			}
 			if parts[2] == "" {
 				continue
 			}
 			reason := stopReason.FindStringSubmatch(parts[2])
-			if reason == nil {
-				return arguments, fmt.Errorf("unexpected LLDB stop: thread %s at %s: %s", parts[0], parts[1], parts[2])
+			if reason == nil || !strings.HasPrefix(reason[1], breakpoint+".") {
+				return "", fmt.Errorf("unexpected LLDB stop: thread %s at %s: %s", parts[0], parts[1], parts[2])
 			}
 			if thread != "" {
-				return arguments, fmt.Errorf("multiple threads stopped at layout checkpoints; see lldb.log")
+				return "", fmt.Errorf("multiple threads stopped at breakpoints; see lldb.log")
 			}
 			if _, err := strconv.ParseUint(parts[0], 10, 32); err != nil {
-				return arguments, fmt.Errorf("invalid LLDB thread index %q", parts[0])
+				return "", fmt.Errorf("invalid LLDB thread index %q", parts[0])
 			}
 			pc, err = strconv.ParseUint(parts[1], 0, 64)
 			if err != nil {
-				return arguments, fmt.Errorf("invalid LLDB checkpoint address %q", parts[1])
+				return "", fmt.Errorf("invalid LLDB breakpoint address %q", parts[1])
 			}
 			thread, location, selected = parts[0], reason[1], current
 		}
 		if thread == "" {
-			return arguments, fmt.Errorf("LLDB did not stop at a layout checkpoint: %s", strings.TrimSpace(threads))
+			return "", fmt.Errorf("LLDB did not stop at breakpoint %s: %s", breakpoint, strings.TrimSpace(threads))
 		}
-		locations, err := session.run("breakpoint list 1")
+		locations, err := session.run("breakpoint list " + breakpoint)
 		if err != nil {
-			return arguments, err
+			return "", err
 		}
 		matched := false
 		for _, entry := range breakpointLocation.FindAllStringSubmatch(locations, -1) {
@@ -695,18 +699,25 @@ func checkOffsets(root, directory, source string, pkg *packages.Package, tests b
 			}
 			address, err := strconv.ParseUint(entry[2], 0, 64)
 			if err != nil {
-				return arguments, err
+				return "", err
 			}
 			matched = address == pc && entry[3] != "0"
 			break
 		}
 		if !matched {
-			return arguments, fmt.Errorf("thread %s PC 0x%x does not match hit checkpoint %s; see lldb.log", thread, pc, location)
+			return "", fmt.Errorf("thread %s PC 0x%x does not match hit breakpoint %s; see lldb.log", thread, pc, location)
 		}
 		if !selected {
 			if _, err := session.run("thread select " + thread); err != nil {
-				return arguments, err
+				return "", err
 			}
+		}
+		return thread, nil
+	}
+	readArguments := func() ([3]uint64, error) {
+		var arguments [3]uint64
+		if _, err := selectThread("1"); err != nil {
+			return arguments, err
 		}
 		if runtime.GOOS == "windows" && runtime.GOARCH == "386" {
 			// Both MSVC and MinGW pass these three words on the stack. The
@@ -847,7 +858,7 @@ func checkOffsets(root, directory, source string, pkg *packages.Package, tests b
 		if readErr != nil {
 			return fmt.Errorf("metadata %s: %w", metadata[i].name, readErr)
 		}
-		if _, err := session.run("process continue --continue-to-bkpt 1"); err != nil {
+		if _, err := session.run(continueCommand); err != nil {
 			return err
 		}
 	}
@@ -875,7 +886,7 @@ func checkOffsets(root, directory, source string, pkg *packages.Package, tests b
 			failed = true
 			fmt.Printf("FAIL %s: LLGo metadata size %d disagrees with array stride %d\n", check.name, metadataResults[i].TypeHeader.Size, stride.Bytes)
 		}
-		if _, err := session.run("process continue --continue-to-bkpt 1"); err != nil {
+		if _, err := session.run(continueCommand); err != nil {
 			return err
 		}
 	}
@@ -896,7 +907,7 @@ func checkOffsets(root, directory, source string, pkg *packages.Package, tests b
 			failed = true
 			fmt.Printf("FAIL field size %s: LLGo %d, Go expects %d\n", check.typ, result.Actual, result.Expected)
 		}
-		if _, err := session.run("process continue --continue-to-bkpt 1"); err != nil {
+		if _, err := session.run(continueCommand); err != nil {
 			return err
 		}
 	}
@@ -933,7 +944,7 @@ func checkOffsets(root, directory, source string, pkg *packages.Package, tests b
 		if !result.Alignment.ObjectMatches || !result.Alignment.FieldMatches {
 			return fmt.Errorf("%s.%s: parent address %s requires alignment %d, selected address %s requires alignment %d", result.Type, result.Field, result.Alignment.ObjectAddress, check.baseAlign, result.Alignment.FieldAddress, check.alignment)
 		}
-		if _, err := session.run("process continue --continue-to-bkpt 1"); err != nil {
+		if _, err := session.run(continueCommand); err != nil {
 			return err
 		}
 	}
@@ -969,7 +980,7 @@ func checkOffsets(root, directory, source string, pkg *packages.Package, tests b
 			return fmt.Errorf("%s.%s %s address case %d: object %s requires alignment %d, field %s requires alignment %d; stopped before access", check.typeName, check.field, check.operation, result.AddressCase, result.Alignment.ObjectAddress, layout.objectAlign, result.Alignment.FieldAddress, layout.fieldAlign)
 		}
 		if check.kind == types.Invalid {
-			if _, err := session.run("process continue --continue-to-bkpt 1"); err != nil {
+			if _, err := session.run(continueCommand); err != nil {
 				return err
 			}
 			continue
@@ -1014,7 +1025,7 @@ func checkOffsets(root, directory, source string, pkg *packages.Package, tests b
 		if !bytes.Equal(seed, before) {
 			return fmt.Errorf("LLDB did not seed access %d with the requested bytes", i)
 		}
-		if _, err := session.run("process continue --continue-to-bkpt 1"); err != nil {
+		if _, err := session.run(continueCommand); err != nil {
 			return err
 		}
 		arguments, err = checkpoint(uint64(2*i + 1))
@@ -1061,7 +1072,20 @@ func checkOffsets(root, directory, source string, pkg *packages.Package, tests b
 			failed = true
 			fmt.Printf("FAIL %s.%s %s address case %d: value %x, want %x; memory matches: %t\n", check.typeName, check.field, check.operation, result.AddressCase, actual, expected, access.MemoryMatches)
 		}
-		if _, err := session.run("process continue --continue-to-bkpt 1"); err != nil {
+		if _, err := session.run(continueCommand); err != nil {
+			return err
+		}
+	}
+	if runtime.GOOS == "linux" {
+		thread, err := selectThread("2")
+		if err != nil {
+			return fmt.Errorf("process exit: %w", err)
+		}
+		exitPath := filepath.Join(directory, "exit.lldb")
+		if err := os.WriteFile(exitPath, []byte("thread continue "+thread+"\n"), 0644); err != nil {
+			return err
+		}
+		if _, err := session.run(fmt.Sprintf("command source --stop-on-continue false --stop-on-error true %q", exitPath)); err != nil {
 			return err
 		}
 	}
