@@ -1012,7 +1012,7 @@ func checkOffsets(root, directory, source string, pkg *packages.Package, tests b
 		if err := os.WriteFile(prefix+"-seed.bin", seed, 0644); err != nil {
 			return err
 		}
-		if _, err := session.run(fmt.Sprintf("memory write --infile %q 0x%x", prefix+"-seed.bin", base-accessGuard)); err != nil {
+		if _, err := session.run(fmt.Sprintf("memory write --infile %q --size %d 0x%x", prefix+"-seed.bin", len(seed), base-accessGuard)); err != nil {
 			return err
 		}
 		if _, err := session.run(fmt.Sprintf("memory read --binary --force --size 1 --count %d --outfile %q 0x%x", len(seed), prefix+"-before.bin", base-accessGuard)); err != nil {
