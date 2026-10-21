@@ -4,6 +4,8 @@ package main
 import (
 	"reflect"
 	"unsafe"
+
+	"github.com/xgo-dev/llgo/runtime/abi"
 )
 
 //llgo:cdecl
@@ -28,6 +30,30 @@ type goPair struct {
 	Large uint64
 }
 
+type pointerEnvelope struct {
+	Record record
+	P      *byte
+	Tail   uint64
+}
+
+//llgo:cdecl
+type pointerRecord struct {
+	P   *byte
+	End struct{}
+}
+
+type pointerRecords [2]pointerRecord
+type emptyPointerRecords [0]pointerRecord
+
+//llgo:cdecl
+type alignedPointerRecord struct {
+	Small int32
+	Large uint64
+	P     *byte
+}
+
+type alignedPointerRecords [2]alignedPointerRecord
+
 // Metadata keeps the native owner instead of reconstructing a Go struct.
 // AMD64-DAG: @_llgo_main.record = {{.*}}i64 8, i64 0,
 // ARM64-DAG: @_llgo_main.record = {{.*}}i64 8, i64 0,
@@ -36,6 +62,15 @@ type goPair struct {
 // WINDOWS-386-DAG: @_llgo_main.nativePair = {{.*}}i32 16, i32 0, i32 {{[^,]+}}, i8 5, i8 8, i8 8,
 // WINDOWS-386-DAG: @"_llgo_main.nativePair$fields" = {{.*}}ptr @_llgo_uint64, i32 8,
 // WINDOWS-386-DAG: @_llgo_main.goPair = {{.*}}i32 12, i32 0, i32 {{[^,]+}}, i8 13, i8 4, i8 4,
+// AMD64-DAG: @_llgo_main.pointerEnvelope = {{.*}}{ i64 24, i64 16,
+// ARM64-DAG: @_llgo_main.pointerEnvelope = {{.*}}{ i64 24, i64 16,
+// AMD64-DAG: @_llgo_main.pointerRecords = {{.*}}{ i64 16, i64 16,
+// ARM64-DAG: @_llgo_main.pointerRecords = {{.*}}{ i64 16, i64 16,
+// WINDOWS-386-DAG: @_llgo_main.pointerRecord = {{.*}}{ i32 4, i32 4,
+// WINDOWS-386-DAG: @_llgo_main.pointerRecords = {{.*}}{ i32 8, i32 8,
+// WINDOWS-386-DAG: @_llgo_main.alignedPointerRecord = {{.*}}{ i32 24, i32 20,
+// WINDOWS-386-DAG: @_llgo_main.alignedPointerRecords = {{.*}}{ i32 48, i32 44,
+// WINDOWS-386-DAG: @_llgo_main.emptyPointerRecords = {{.*}}{ i32 0, i32 0,
 // CHECK-LABEL: define void @main.main()
 func main() {
 	values := [3]record{{Number: 10}, {Number: 20}, {Number: 30}}
@@ -88,4 +123,28 @@ func main() {
 		*(*byte)(unsafe.Add(unsafe.Pointer(&right[0]), i)) = 0x22
 	}
 	println("array equality", left == right)
+
+	var pointers pointerRecords
+	var nested pointerEnvelope
+	var aligned alignedPointerRecords
+	pointerWidth := uintptr(unsafe.Pointer(&pointers[1])) - uintptr(unsafe.Pointer(&pointers[0]))
+	nestedPrefix := uintptr(unsafe.Pointer(&nested.P)) - uintptr(unsafe.Pointer(&nested)) + pointerWidth
+	alignedPrefix := uintptr(unsafe.Pointer(&aligned[0].P)) - uintptr(unsafe.Pointer(&aligned[0])) + pointerWidth
+	arrayPrefix := uintptr(unsafe.Pointer(&aligned[1].P)) - uintptr(unsafe.Pointer(&aligned)) + pointerWidth
+	prefixes := []struct {
+		value any
+		want  uintptr
+	}{
+		{pointerRecord{}, pointerWidth},
+		{pointers, 2 * pointerWidth},
+		{nested, nestedPrefix},
+		{alignedPointerRecord{}, alignedPrefix},
+		{aligned, arrayPrefix},
+		{emptyPointerRecords{}, 0},
+		{envelope{}, 0},
+	}
+	for _, check := range prefixes {
+		typ := (*abi.Type)((*[2]unsafe.Pointer)(unsafe.Pointer(&check.value))[0])
+		println("pointer prefix", typ.PtrBytes == check.want)
+	}
 }

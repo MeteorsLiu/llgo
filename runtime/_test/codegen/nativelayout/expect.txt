@@ -12,3 +12,10 @@ call true
 makefunc true
 separate offsets true
 array equality true
+pointer prefix true
+pointer prefix true
+pointer prefix true
+pointer prefix true
+pointer prefix true
+pointer prefix true
+pointer prefix true

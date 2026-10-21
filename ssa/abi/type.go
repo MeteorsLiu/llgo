@@ -457,6 +457,12 @@ func (b *Builder) Size(t types.Type) uintptr {
 	case *types.Chan:
 		return b.PtrSize
 	case *types.Named:
+		switch t.Underlying().(type) {
+		case *types.Struct, *types.Array:
+			// Keep the owner's identity for the size provider: a cdecl
+			// struct can have a different size from its Go underlying type.
+			return uintptr(b.Sizes.Sizeof(t))
+		}
 		return b.Size(t.Underlying())
 	}
 	panic("unsupported size: " + t.String())

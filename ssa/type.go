@@ -511,6 +511,14 @@ func (p Program) toLLVMNamedStruct(name string, raw *types.Named, st *types.Stru
 	p.named[name] = typ
 	p.typs.Set(raw, typ)
 	fields, layout := p.toLLVMStructBody(st, p.hasNativeStructLayout(raw))
+	if st.NumFields() == 0 && raw.Obj().Name() == "align64" && raw.Obj().Pkg() != nil &&
+		(raw.Obj().Pkg().Path() == "sync/atomic" || raw.Obj().Pkg().Path() == "internal/runtime/atomic") {
+		// Go's named atomic marker has size zero but alignment eight. Its
+		// empty underlying struct loses that requirement, including in native
+		// parents. A zero-length vector array preserves it on targets where
+		// i64 itself only aligns to four, such as Linux/386.
+		fields = append(fields, llvm.ArrayType(llvm.VectorType(p.tyInt32(), 2), 0))
+	}
 	t.StructSetBody(fields, false)
 	p.setStructLayout(raw, layout)
 	return typ

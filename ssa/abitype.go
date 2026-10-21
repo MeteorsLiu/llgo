@@ -23,6 +23,7 @@ import (
 	"go/token"
 	"go/types"
 	"sort"
+	"unsafe"
 
 	"github.com/xgo-dev/llgo/internal/genmethod"
 	runtimeabi "github.com/xgo-dev/llgo/runtime/abi"
@@ -31,6 +32,52 @@ import (
 )
 
 // -----------------------------------------------------------------------------
+
+// abiProgram separates late ABI layout queries from goProgram, which is also
+// passed to the Go checker before runtime types are available. Only abi.Sizes
+// uses this view; Program.TypeSizes must keep returning the plain goProgram.
+//
+// Native aggregates and their by-value containers use existing LLVM storage.
+// For example, native {float64; struct{}} occupies eight bytes on amd64, while
+// Go's trailing-zero-field rule reports sixteen. Other types retain Go sizing.
+type abiProgram struct {
+	*goProgram
+}
+
+func (p *abiProgram) Sizeof(t types.Type) int64 {
+	prog := Program(unsafe.Pointer(p.goProgram))
+	if storage := prog.nativeMetadataType(t); storage != nil {
+		return int64(prog.SizeOf(storage))
+	}
+	return p.goProgram.Sizeof(t)
+}
+
+func (p *abiProgram) Alignof(t types.Type) int64 {
+	prog := Program(unsafe.Pointer(p.goProgram))
+	if storage := prog.nativeMetadataType(t); storage != nil {
+		return int64(prog.AlignOf(storage))
+	}
+	return p.goProgram.Alignof(t)
+}
+
+func (p *abiProgram) Offsetsof(fields []*types.Var) []int64 {
+	prog := Program(unsafe.Pointer(p.goProgram))
+	// Scope: the anonymous type models a Go container and retains each field's
+	// named cdecl type. It does not recover an original owner's cdecl directive;
+	// Windows/386 scalar alignment still requires that original named owner.
+	if storage := prog.nativeMetadataType(types.NewStruct(fields, nil)); storage != nil {
+		// Field layout: use actual storage offsets for native aggregate fields.
+		// Example (amd64/arm64): cdecl Native { X uint64; Z struct{} } occupies
+		// 8 bytes, whereas gc sizing reports 16. Thus { N Native; Next uint64 }
+		// puts Next at 8, and { N [2]Native; Next uint64 } puts it at 16.
+		offsets := make([]int64, len(fields))
+		for i := range fields {
+			offsets[i] = int64(prog.OffsetOf(storage, i))
+		}
+		return offsets
+	}
+	return p.goProgram.Offsetsof(fields)
+}
 
 /*
 type Type struct {
@@ -107,7 +154,13 @@ func (b Builder) abiCommonFields(t types.Type, name string, hasUncommon bool, gl
 	// Size uintptr
 	fields = append(fields, prog.IntVal(uint64(size), prog.Uintptr()).impl)
 	// PtrBytes uintptr
-	fields = append(fields, prog.IntVal(uint64(ab.PtrBytes(t)), prog.Uintptr()).impl)
+	var ptrBytes uintptr
+	if storage != nil && ((prog.target.GOOS == "windows" && prog.target.effectiveGOARCH() == "386") || prog.usesWideGoStorage()) {
+		ptrBytes = uintptr(prog.aggregatePtrBytes(storage))
+	} else {
+		ptrBytes = ab.PtrBytes(t)
+	}
+	fields = append(fields, prog.IntVal(uint64(ptrBytes), prog.Uintptr()).impl)
 	// Hash uint32
 	h := sha256.Sum256([]byte(name))
 	hash := binary.LittleEndian.Uint32(h[:4])
@@ -725,6 +778,39 @@ func (p Program) nativeMetadataType(t types.Type) Type {
 		}
 	}
 	return nil
+}
+
+func (p Program) aggregatePtrBytes(storage Type) uint64 {
+	// Keep the physical owner for aggregate offsets, strides and pointer slots.
+	// Windows/386 native {int32; uint64; *byte} has PtrBytes=20, not Go's 16.
+	// On wasm32, native {*byte} has PtrBytes=4, while a Go pointer slot is eight.
+	// Unchanged leaf representations continue using abi.Builder.
+	switch t := storage.raw.Type.Underlying().(type) {
+	case *types.Struct:
+		for i := t.NumFields() - 1; i >= 0; i-- {
+			if bytes := p.aggregatePtrBytes(p.Field(storage, i)); bytes != 0 {
+				return p.OffsetOf(storage, i) + bytes
+			}
+		}
+	case *types.Array:
+		if t.Len() != 0 {
+			elem := p.Index(storage)
+			if bytes := p.aggregatePtrBytes(elem); bytes != 0 {
+				return uint64(t.Len()-1)*p.SizeOf(elem) + bytes
+			}
+		}
+	default:
+		if p.isNativeStorage(storage) && p.usesWideGoStorage() {
+			switch storage.kind {
+			case vkPtr, vkFuncPtr, vkMap, vkChan, vkEface, vkIface:
+				return p.SizeOf(storage)
+			case vkString, vkSlice:
+				return p.td.TypeAllocSize(p.storageType(storage).StructElementTypes()[0])
+			}
+		}
+		return uint64(p.abi.PtrBytes(storage.raw.Type))
+	}
+	return 0
 }
 
 func (b Builder) abiType(t types.Type) Expr {
