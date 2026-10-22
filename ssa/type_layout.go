@@ -81,8 +81,15 @@ func (p Program) toLLVMStructBody(raw *types.Struct, native bool) ([]llvm.Type, 
 	goAlign := int64(1)
 	goSize := int64(0)
 	for i, field := range fields {
-		fieldAlign := sizes.Alignof(raw.Field(i).Type())
-		if p.hasNativeTypeLayout(raw.Field(i).Type()) {
+		fieldType := raw.Field(i).Type()
+		fieldAlign := sizes.Alignof(fieldType)
+		_, structField := arrayBaseType(fieldType).Underlying().(*types.Struct)
+		if structField || p.hasNativeTypeLayout(fieldType) {
+			// A nested struct keeps its already selected storage alignment.
+			// On Windows/386, Middle{N Native} aligns to eight even without
+			// its own cdecl marker, so Outer{byte; M Middle} puts M at 8.
+			// Arrays of structs inherit that alignment. Scalar arrays such as
+			// [2]uint64 retain Go's rule: four-byte alignment on Windows/386.
 			fieldAlign = int64(p.td.ABITypeAlignment(field))
 		}
 		alignments[i] = fieldAlign
@@ -174,6 +181,17 @@ func (p Program) padZeroSizedStructTail(fields []llvm.Type) []llvm.Type {
 		}
 	}
 	return fields
+}
+
+// arrayBaseType removes array layers: [2][3]S yields S, while *[2]S is unchanged.
+func arrayBaseType(t types.Type) types.Type {
+	for {
+		array, ok := t.Underlying().(*types.Array)
+		if !ok {
+			return t
+		}
+		t = array.Elem()
+	}
 }
 
 func (p Program) hasNativeTypeLayout(raw types.Type) bool {

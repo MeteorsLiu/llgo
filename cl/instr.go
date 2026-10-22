@@ -786,7 +786,7 @@ func (p *context) offsetOfBuiltinArg(arg ssa.Value) (llssa.Expr, bool) {
 			return llssa.Expr{}, false
 		}
 		typ := p.type_(field.X.Type(), llssa.GoDecl)
-		return p.prog.Val(int(p.prog.OffsetOf(typ, field.Field))), true
+		return p.prog.IntVal(p.prog.OffsetOf(typ, field.Field), p.prog.Uintptr()), true
 	}
 	load, ok := arg.(*ssa.UnOp)
 	if !ok || load.Op != token.MUL {
@@ -800,7 +800,7 @@ func (p *context) offsetOfBuiltinArg(arg ssa.Value) (llssa.Expr, bool) {
 	if !ok {
 		return llssa.Expr{}, false
 	}
-	return p.prog.Val(offset), true
+	return p.prog.IntVal(uint64(offset), p.prog.Uintptr()), true
 }
 
 func (p *context) offsetOfFieldChain(field *ssa.FieldAddr) (int, bool) {
@@ -1352,8 +1352,6 @@ func analyzeCallerTrackingPackage(pkg *ssa.Package, methods []*ssa.Function) cal
 		funcs:     funcs,
 		trackable: trackable,
 		callsites: collectRuntimeCallerCallsites(funcs),
-		memo:      make(map[*ssa.Function]bool),
-		visiting:  make(map[*ssa.Function]bool),
 	}
 	return callerTrackingPackageAnalysis{
 		funcs:     funcs,
@@ -1465,15 +1463,9 @@ func computeRuntimeCallerBaseSetFromAnalysis(analysis *runtimeCallerAnalysis) ma
 		return nil
 	}
 	out := make(map[*ssa.Function]bool)
-	for {
-		ntrack := len(analysis.trackable)
-		for fn := range analysis.trackable {
-			if analysis.fnMayReachRuntimeCaller(fn) {
-				out[fn] = true
-			}
-		}
-		if len(analysis.trackable) == ntrack {
-			break
+	for fn := range analysis.trackable {
+		if analysis.fnMayReachRuntimeCaller(fn) {
+			out[fn] = true
 		}
 	}
 	if len(out) == 0 {
@@ -1487,8 +1479,8 @@ type runtimeCallerAnalysis struct {
 	funcs     map[*ssa.Function]bool
 	trackable map[*ssa.Function]bool
 	callsites map[*ssa.Function][]*ssa.CallCommon
-	memo      map[*ssa.Function]bool
-	visiting  map[*ssa.Function]bool
+	// nil until reachability has been solved for the whole package.
+	memo map[*ssa.Function]bool
 }
 
 func collectRuntimeCallerFunctions(pkg *ssa.Package) (funcs, trackable map[*ssa.Function]bool) {
@@ -1696,57 +1688,65 @@ func (a *runtimeCallerAnalysis) fnMayReachRuntimeCaller(fn *ssa.Function) bool {
 	if !a.funcs[fn] {
 		return false
 	}
-	if ok, done := a.memo[fn]; done {
-		return ok
+	if a.memo == nil {
+		a.computeReachability()
 	}
-	if a.visiting[fn] {
-		return false
-	}
-	a.visiting[fn] = true
-	defer delete(a.visiting, fn)
-	reaches := false
-	forEachCall(fn, func(call *ssa.CallCommon) {
-		if reaches {
-			return
-		}
-		callee := call.StaticCallee()
-		switch {
-		case isRuntimeCallerFrameFunc(callee):
-			reaches = true
-		case callee != nil:
-			reaches = a.fnMayReachRuntimeCaller(callee)
-		case call.Method != nil:
-			reaches = a.interfaceInvokeMayReachRuntimeCaller(fn, call)
-		default:
-			reaches = a.functionValueCallMayReachRuntimeCaller(fn, call.Value)
-		}
-	})
-	if !reaches {
-		for _, anon := range fn.AnonFuncs {
-			if a.fnMayReachRuntimeCaller(anon) {
-				if a.trackable[fn] {
-					a.trackable[anon] = true
-				}
-				reaches = true
-				break
-			}
-		}
-	}
-	a.memo[fn] = reaches
-	return reaches
+	return a.memo[fn]
 }
 
-func (a *runtimeCallerAnalysis) functionValueCallMayReachRuntimeCaller(fn *ssa.Function, value ssa.Value) bool {
-	targets, ok := a.functionValueTargets(fn, value)
-	if !ok {
-		return true
-	}
-	for target := range targets {
-		if a.fnMayReachRuntimeCaller(target) {
-			return true
+// computeReachability propagates positives through the reverse call graph.
+// Recursive DFS cannot cache a negative on a back-edge: another member of the
+// cycle may reach a runtime caller consumer later in the traversal.
+func (a *runtimeCallerAnalysis) computeReachability() {
+	a.memo = make(map[*ssa.Function]bool)
+	callers := make(map[*ssa.Function][]*ssa.Function)
+	var pending []*ssa.Function
+	mark := func(fn *ssa.Function) {
+		if !a.memo[fn] {
+			a.memo[fn] = true
+			pending = append(pending, fn)
 		}
 	}
-	return false
+	addTarget := func(fn, callee *ssa.Function) {
+		if isRuntimeCallerFrameFunc(callee) {
+			mark(fn)
+		} else if a.funcs[callee] {
+			callers[callee] = append(callers[callee], fn)
+		}
+	}
+	for fn := range a.funcs {
+		if isRuntimeCallerFrameFunc(fn) {
+			mark(fn)
+		}
+		forEachCall(fn, func(call *ssa.CallCommon) {
+			if callee := call.StaticCallee(); callee != nil {
+				addTarget(fn, callee)
+				return
+			}
+			var targets map[*ssa.Function]bool
+			var ok bool
+			if call.Method != nil {
+				targets, ok = a.interfaceMethodTargets(fn, call.Value, call.Method)
+			} else {
+				targets, ok = a.functionValueTargets(fn, call.Value)
+			}
+			if !ok {
+				// Preserve conservative tracking for unresolved dispatch.
+				mark(fn)
+			}
+			for callee := range targets {
+				addTarget(fn, callee)
+			}
+		})
+		for _, anon := range fn.AnonFuncs {
+			addTarget(fn, anon)
+		}
+	}
+	for i := 0; i < len(pending); i++ {
+		for _, caller := range callers[pending[i]] {
+			mark(caller)
+		}
+	}
 }
 
 func (a *runtimeCallerAnalysis) functionValueTargets(fn *ssa.Function, value ssa.Value) (map[*ssa.Function]bool, bool) {
@@ -1796,19 +1796,6 @@ func staticFunctionTargets(value ssa.Value) (map[*ssa.Function]bool, bool) {
 		}
 	}
 	return nil, false
-}
-
-func (a *runtimeCallerAnalysis) interfaceInvokeMayReachRuntimeCaller(fn *ssa.Function, call *ssa.CallCommon) bool {
-	targets, ok := a.interfaceMethodTargets(fn, call.Value, call.Method)
-	if !ok {
-		return true
-	}
-	for target := range targets {
-		if a.fnMayReachRuntimeCaller(target) {
-			return true
-		}
-	}
-	return false
 }
 
 func (a *runtimeCallerAnalysis) interfaceMethodTargets(fn *ssa.Function, value ssa.Value, method *types.Func) (map[*ssa.Function]bool, bool) {
@@ -2076,6 +2063,14 @@ func (p *context) recordCallerLocationForCall(b llssa.Builder, call *ssa.CallCom
 	p.recordPanicLocation(b, call.Pos())
 }
 
+// pcLinePosition is the runtime-visible identity of a source location. Columns
+// do not participate: the runtime line table does not expose them.
+type pcLinePosition struct {
+	symbol string
+	file   string
+	line   int
+}
+
 func (p *context) emitPCLineLabel(b llssa.Builder, pos token.Pos) {
 	if p == nil || p.pkg == nil || p.fn == nil || !p.prog.FuncInfoSitesEnabled() || !p.shouldTrackCallerFrames() {
 		return
@@ -2103,8 +2098,20 @@ func (p *context) emitPCLineLabel(b llssa.Builder, pos token.Pos) {
 	}
 	p.lastPCLineFile = position.Filename
 	p.lastPCLineLine = position.Line
-	p.pcLineSeq++
-	id := pcLineID(p.fn.Name(), p.pcLineSeq)
+	// Distinct machine-code ranges can describe the same source line (branch
+	// arms, cold nil checks, and repeated stores). They still need independent
+	// DCE-associated anchors, but can share one address-free line-table row.
+	positionKey := pcLinePosition{p.fn.Name(), position.Filename, position.Line}
+	id, recorded := p.pcLineIDs[positionKey]
+	if !recorded {
+		if p.pcLineIDs == nil {
+			p.pcLineIDs = make(map[pcLinePosition]uint64)
+		}
+		p.pcLineSeq++
+		id = pcLineID(p.fn.Name(), p.pcLineSeq)
+		p.pcLineIDs[positionKey] = id
+		p.pkg.EmitPCLineInfo(id, p.fn.Name(), position.Filename, position.Line, position.Column)
+	}
 	label := pcLineLabelName(id)
 	if target.GOOS == "darwin" {
 		// Mach-O subsections-via-symbols treats every non-local symbol as an
@@ -2156,7 +2163,6 @@ func (p *context) emitPCLineLabel(b llssa.Builder, pos token.Pos) {
 			".quad " + uint64Hex(id) + "\n" +
 			".popsection",
 	)
-	p.pkg.EmitPCLineInfo(id, p.fn.Name(), position.Filename, position.Line, position.Column)
 }
 
 func canEmitPCLineLabelsForTarget(target *llssa.Target) bool {
@@ -2665,7 +2671,13 @@ func (p *context) callEx(b llssa.Builder, act llssa.DoAction, call *ssa.CallComm
 			p.inCFunc = true
 			args := p.compileValues(b, args, kind)
 			p.inCFunc = false
-			ret = p.emitDo(b, act, ds, mayRecover, aFn.Expr, llssa.Builder.Call, args...)
+			if act == llssa.Call && p.forwardCVariadicWrapper(call) && b.CanForwardVarargs(aFn.Expr) {
+				// A tail transfer removes the synthetic frame itself, so no
+				// recover-frame alias may surround it (or run after the call).
+				ret = b.CallForwardVarargs(aFn.Expr, args...)
+			} else {
+				ret = p.emitDo(b, act, ds, mayRecover, aFn.Expr, llssa.Builder.Call, args...)
+			}
 		case goFunc:
 			args := p.compileValues(b, args, kind)
 			ret = p.emitDo(b, act, ds, mayRecover, aFn.Expr, llssa.Builder.Call, args...)
@@ -2818,6 +2830,61 @@ func (p *context) callEx(b llssa.Builder, act llssa.DoAction, call *ssa.CallComm
 		ret = p.emitDo(b, act, ds, mayRecover, fn, llssa.Builder.Call, args...)
 	}
 	return
+}
+
+func (p *context) forwardCVariadicWrapper(call *ssa.CallCommon) bool {
+	fn := p.goFn
+	callee := call.Signature()
+	// Promoted pointer methods adjust the receiver and return the C call's
+	// result. compileValues omits the incoming ellipsis marker: the wrapper
+	// must forward the unknown register/stack arguments with a mandatory tail
+	// call. Wasm does not support variadic tail calls. Explicit -target
+	// profiles (including custom native profiles) remain excluded because
+	// their backend and storage ABI may not support this forwarding path.
+	// Excluded variadic wrappers keep their existing lowering, which can
+	// silently drop the incoming ellipsis. Correct forwarding or diagnostics
+	// for these forms is tracked in #2855.
+	target := p.prog.Target()
+	if target.GOARCH == "wasm" || target.Target != "" {
+		return false
+	}
+	if fn == nil || fn.Synthetic == "" {
+		return false
+	}
+	// Value receivers do not have LLVM's required matching fixed prototype.
+	if fn.Signature.Recv() == nil || !isPointerGoType(fn.Signature.Recv().Type()) ||
+		callee.Recv() == nil || !isPointerGoType(callee.Recv().Type()) {
+		return false
+	}
+	if !llssa.HasNameValist(fn.Signature) || !llssa.HasNameValist(callee) ||
+		len(call.Args) == 0 || len(fn.Params) == 0 {
+		return false
+	}
+	// Tuple returns need extract/insert instructions after the call, while
+	// aggregate ABI lowering can replace the call and lose its tail marker.
+	// Neither path can preserve the immediate return required by musttail.
+	results := callee.Results()
+	if results.Len() > 1 || results.Len() == 1 && !isCVariadicForwardScalar(results.At(0).Type()) {
+		return false
+	}
+	params := callee.Params()
+	for i := 0; i < params.Len()-1; i++ {
+		if !isCVariadicForwardScalar(params.At(i).Type()) {
+			return false
+		}
+	}
+	param, ok := call.Args[len(call.Args)-1].(*ssa.Parameter)
+	return ok && param == fn.Params[len(fn.Params)-1]
+}
+
+func isCVariadicForwardScalar(t types.Type) bool {
+	switch t := t.Underlying().(type) {
+	case *types.Pointer:
+		return true
+	case *types.Basic:
+		return t.Info()&(types.IsBoolean|types.IsInteger|types.IsFloat) != 0 || t.Kind() == types.UnsafePointer
+	}
+	return false
 }
 
 func (p *context) compileDynamicCallValues(b llssa.Builder, call *ssa.CallCommon, hasVArg int) []llssa.Expr {

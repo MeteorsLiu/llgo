@@ -2,6 +2,7 @@ package ssa
 
 import (
 	"go/ast"
+	"go/constant"
 	"go/parser"
 	"go/token"
 	"go/types"
@@ -169,6 +170,7 @@ type T19 T18
 
 func TestGoProgramSizesUnaliasFunctionFieldStruct(t *testing.T) {
 	prog := NewProgram(nil)
+	defer prog.Dispose()
 	sizes := prog.TypeSizes(types.SizesFor("gc", runtime.GOARCH))
 
 	sig := types.NewSignatureType(nil, nil, nil, nil, nil, false)
@@ -187,6 +189,130 @@ func TestGoProgramSizesUnaliasFunctionFieldStruct(t *testing.T) {
 	}
 	if got := sizes.Offsetsof(fields)[1]; got != want {
 		t.Fatalf("Offsetsof(field after alias to func-field struct) = %d, want %d", got, want)
+	}
+
+	Initialize(InitAllTargets | InitAllTargetInfos | InitAllTargetMCs)
+	for _, target := range []*Target{
+		{GOOS: "linux", GOARCH: "amd64"}, {GOOS: "linux", GOARCH: "arm64"},
+		{GOOS: "darwin", GOARCH: "amd64"}, {GOOS: "darwin", GOARCH: "arm64"},
+		{GOOS: "windows", GOARCH: "amd64"}, {GOOS: "windows", GOARCH: "arm64"},
+	} {
+		t.Run(target.GOOS+"/"+target.GOARCH, func(t *testing.T) {
+			p := NewProgram(target)
+			defer p.Dispose()
+			sizes := p.TypeSizes(types.SizesFor("gc", target.GOARCH))
+			for _, name := range []string{"Tiny", "NativeString", "DoubleTail", "SpaceTail", "NativeHeader", "NativeOuter"} {
+				p.SetTypeCallConv("example.com/sizing."+name, CDecl)
+			}
+			fset := token.NewFileSet()
+			file, err := parser.ParseFile(fset, "sizing.go", `package sizing
+import "unsafe"
+type Tiny struct { B byte; Z struct{} }
+type NativeString struct { S string; Z struct{} }
+type DoubleTail struct { X float64; Z struct{} }
+type SpaceTail struct { X float64; Y float32; Z struct{} }
+type GoHeader struct { S string; B []byte; I any; M map[int]int; C chan int; F func() }
+type NativeHeader struct { S string; B []byte; I any; M map[int]int; C chan int; F func() }
+type Outer struct { T Tiny; X uint64 }
+type NativeOuter struct { G GoHeader; N NativeString; End byte }
+type Mixed struct { F func(); N DoubleTail }
+type Alias = NativeString
+type GoTail struct { X float64; Z struct{} }
+type EarlyA struct { Data [unsafe.Sizeof(EarlyB{})]byte; F func() }
+type EarlyB struct { P *EarlyA; N DoubleTail; F func() }
+type Buffer [unsafe.Sizeof(Alias{})]byte
+const TinySize = unsafe.Sizeof(Tiny{})
+const StringSize = unsafe.Sizeof(NativeString{})
+const DoubleSize = unsafe.Sizeof(DoubleTail{})
+const SpaceSize = unsafe.Sizeof(SpaceTail{})
+const HeaderSize = unsafe.Sizeof(GoHeader{})
+const NativeHeaderSize = unsafe.Sizeof(NativeHeader{})
+const OuterSize = unsafe.Sizeof(Outer{})
+const OuterOffset = unsafe.Offsetof(Outer{}.X)
+const OuterArraySize = unsafe.Sizeof([8]Outer{})
+const NativeOuterSize = unsafe.Sizeof(NativeOuter{})
+const MixedSize = unsafe.Sizeof(Mixed{})
+const AliasSize = unsafe.Sizeof(Alias{})
+const EmptyArraySize = unsafe.Sizeof([0]NativeString{})
+const GoTailSize = unsafe.Sizeof(GoTail{})
+const EarlyASize = unsafe.Sizeof(EarlyA{})
+const EarlyBSize = unsafe.Sizeof(EarlyB{})
+const LargeGoSize = unsafe.Sizeof([1<<32]byte{})
+const LargeNativeSize = unsafe.Sizeof([1<<32]Tiny{})
+const NestedLargeSize = unsafe.Sizeof([2][1<<32]Tiny{})
+`, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			config := types.Config{Sizes: sizes, Importer: packages.NewImporter(fset)}
+			pkg, err := config.Check("example.com/sizing", fset, []*ast.File{file}, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for name, want := range map[string]int64{
+				"TinySize": 1, "StringSize": 16, "DoubleSize": 8, "SpaceSize": 16,
+				"HeaderSize": 88, "NativeHeaderSize": 80, "OuterSize": 16, "OuterOffset": 8,
+				"OuterArraySize": 128, "NativeOuterSize": 112, "MixedSize": 24,
+				"AliasSize": 16, "EmptyArraySize": 0, "GoTailSize": 16,
+				"EarlyASize": 48, "EarlyBSize": 32,
+				"LargeGoSize": 1 << 32, "LargeNativeSize": 1 << 32, "NestedLargeSize": 1 << 33,
+			} {
+				got, exact := constant.Int64Val(pkg.Scope().Lookup(name).(*types.Const).Val())
+				if !exact || got != want {
+					t.Errorf("%s = %d, want %d", name, got, want)
+				}
+			}
+			if got := pkg.Scope().Lookup("Buffer").Type().Underlying().(*types.Array).Len(); got != 16 {
+				t.Errorf("array length from unsafe.Sizeof = %d, want 16", got)
+			}
+			markerPackage := types.NewPackage("sync/atomic", "atomic")
+			marker := types.NewNamed(types.NewTypeName(token.NoPos, markerPackage, "align64", nil), types.NewStruct(nil, nil), nil)
+			if sizes.Sizeof(marker) != 0 || sizes.Alignof(marker) != 8 || sizes.Alignof(types.NewArray(marker, 0)) != 8 {
+				t.Error("early layout lost the zero-sized atomic marker's alignment")
+			}
+			if p.rt != nil || p.rtget != nil || p.typs.Len() != 0 || len(p.named) != 0 || len(p.gocvt.typs) != 0 {
+				t.Fatal("early sizing accessed runtime or populated source type caches")
+			}
+
+			// Compare early sizing with actual LLVM storage after runtime is
+			// available, including both native and Go zero-sized tails.
+			setTestRuntime(t, p)
+			for _, name := range []string{"Tiny", "NativeString", "DoubleTail", "SpaceTail", "GoHeader", "NativeHeader", "Outer", "NativeOuter", "Mixed", "Alias", "GoTail", "EarlyA", "EarlyB"} {
+				typ := pkg.Scope().Lookup(name).Type()
+				storage := p.Type(typ, GoDecl)
+				if uint64(sizes.Sizeof(typ)) != p.SizeOf(storage) || uint64(sizes.Alignof(typ)) != p.AlignOf(storage) {
+					t.Errorf("%s size/alignment = %d/%d, LLVM = %d/%d", name, sizes.Sizeof(typ), sizes.Alignof(typ), p.SizeOf(storage), p.AlignOf(storage))
+				}
+				if !p.hasNativeTypeLayout(typ) {
+					structure := typ.Underlying().(*types.Struct)
+					fields := make([]*types.Var, structure.NumFields())
+					for i := range fields {
+						fields[i] = structure.Field(i)
+					}
+					for i, offset := range sizes.Offsetsof(fields) {
+						if uint64(offset) != p.OffsetOf(storage, i) {
+							t.Errorf("%s field %d offset = %d, LLVM = %d", name, i, offset, p.OffsetOf(storage, i))
+						}
+					}
+				}
+			}
+		})
+	}
+	for _, target := range []*Target{
+		{GOOS: "windows", GOARCH: "386"}, {GOOS: "linux", GOARCH: "arm"},
+		{GOOS: "js", GOARCH: "wasm", WasmProfile: "j32", LLVMTarget: "wasm32-unknown-emscripten"},
+	} {
+		p := NewProgram(target)
+		sizes := p.TypeSizes(types.SizesFor("gc", target.GOARCH)).(*goProgram)
+		native := types.NewNamed(types.NewTypeName(token.NoPos, nil, "Native", nil), types.NewStruct([]*types.Var{
+			types.NewField(token.NoPos, nil, "X", types.Typ[types.Float64], false),
+			types.NewField(token.NoPos, nil, "Z", types.NewStruct(nil, nil), false),
+		}, nil), nil)
+		p.SetTypeCallConv("Native", CDecl)
+		if sizes.layoutType(native, false) != nil || sizes.Sizeof(native) != p.sizes.Sizeof(native) {
+			t.Errorf("%s/%s changed its existing frontend sizing path", target.GOOS, target.GOARCH)
+		}
+		p.Dispose()
 	}
 }
 

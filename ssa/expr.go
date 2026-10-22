@@ -812,7 +812,7 @@ func (b Builder) StructBinOp(op token.Token, x, y, xaddr, yaddr Expr) Expr {
 	tret := prog.Bool()
 	typ := x.raw.Type.Underlying().(*types.Struct)
 	size := uint64(prog.abi.Size(typ))
-	regular := prog.abi.IsRegularMemory(typ)
+	regular := prog.IsRegularMemory(x.raw.Type)
 	if !regular || CanInlineStructEqual(typ, size, prog.GoWordSize()) {
 		ret := prog.BoolVal(true)
 		for i, n := 0, typ.NumFields(); i < n; i++ {
@@ -941,7 +941,7 @@ func (b Builder) callArrayEqual(x, y, xaddr, yaddr Expr, t *types.Array) Expr {
 		yaddr = b.PtrCast(prog.VoidPtr(), yaddr)
 	}
 	var ret Expr
-	if prog.abi.IsRegularMemory(t) {
+	if prog.IsRegularMemory(x.raw.Type) {
 		ret = b.Call(b.Pkg.rtFunc("memequal"), xaddr, yaddr, prog.IntVal(prog.SizeOf(x.Type), prog.Uintptr()))
 	} else {
 		equal := b.Pkg.rtEnvFunc("arrayequal")
@@ -1483,6 +1483,35 @@ func (b Builder) MakeClosure(fn Expr, bindings []Expr) Expr {
 // TODO(xsw): make inline call
 func (b Builder) InlineCall(fn Expr, args ...Expr) (ret Expr) {
 	return b.Call(fn, args...)
+}
+
+// CanForwardVarargs checks the unlowered ABI of a direct variadic forwarding
+// call. The physical result must equal the logical Go result so Call cannot
+// insert a result conversion between the tail call and its return.
+func (b Builder) CanForwardVarargs(fn Expr) bool {
+	if fn.kind != vkFuncDecl || !b.Func.hasVArg || fn.ll != b.Func.ll ||
+		fn.impl.FunctionCallConv() != b.Func.impl.FunctionCallConv() {
+		return false
+	}
+	sig := fn.raw.Type.(*types.Signature)
+	return fn.ll.ReturnType() == b.Prog.retType(sig).ll
+}
+
+// CallForwardVarargs forwards a variadic thunk's incoming ellipsis unchanged.
+// CanForwardVarargs must hold, the caller must return the result immediately,
+// and later ABI lowering must preserve the call and return without rewrites.
+func (b Builder) CallForwardVarargs(fn Expr, args ...Expr) Expr {
+	if !b.CanForwardVarargs(fn) {
+		panic(fmt.Sprintf("cannot forward C variadic arguments from %s to %s: incompatible ABI",
+			b.Func.Name(), fn.impl.Name()))
+	}
+	ret := b.Call(fn, args...)
+	// The preflight result check guarantees Call returns its raw instruction.
+	// LLVM's thunk attribute makes musttail forward the incoming ellipsis,
+	// including arguments that have no explicit operands in the call IR.
+	b.Func.impl.AddFunctionAttr(b.Prog.ctx.CreateStringAttribute("thunk", ""))
+	ret.impl.SetTailCallKind(llvm.TailCallKindMustTail)
+	return ret
 }
 
 // The Call instruction represents a function call.

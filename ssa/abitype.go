@@ -23,13 +23,61 @@ import (
 	"go/token"
 	"go/types"
 	"sort"
+	"unsafe"
 
 	"github.com/xgo-dev/llgo/internal/genmethod"
+	runtimeabi "github.com/xgo-dev/llgo/runtime/abi"
 	"github.com/xgo-dev/llgo/ssa/abi"
 	"github.com/xgo-dev/llvm"
 )
 
 // -----------------------------------------------------------------------------
+
+// abiProgram separates late ABI layout queries from goProgram, which is also
+// passed to the Go checker before runtime types are available. Only abi.Sizes
+// uses this view; Program.TypeSizes must keep returning the plain goProgram.
+//
+// Native aggregates and their by-value containers use existing LLVM storage.
+// For example, native {float64; struct{}} occupies eight bytes on amd64, while
+// Go's trailing-zero-field rule reports sixteen. Other types retain Go sizing.
+type abiProgram struct {
+	*goProgram
+}
+
+func (p *abiProgram) Sizeof(t types.Type) int64 {
+	prog := Program(unsafe.Pointer(p.goProgram))
+	if storage := prog.nativeMetadataType(t); storage != nil {
+		return int64(prog.SizeOf(storage))
+	}
+	return p.goProgram.Sizeof(t)
+}
+
+func (p *abiProgram) Alignof(t types.Type) int64 {
+	prog := Program(unsafe.Pointer(p.goProgram))
+	if storage := prog.nativeMetadataType(t); storage != nil {
+		return int64(prog.AlignOf(storage))
+	}
+	return p.goProgram.Alignof(t)
+}
+
+func (p *abiProgram) Offsetsof(fields []*types.Var) []int64 {
+	prog := Program(unsafe.Pointer(p.goProgram))
+	// Scope: the anonymous type models a Go container and retains each field's
+	// named cdecl type. It does not recover an original owner's cdecl directive;
+	// Windows/386 scalar alignment still requires that original named owner.
+	if storage := prog.nativeMetadataType(types.NewStruct(fields, nil)); storage != nil {
+		// Field layout: use actual storage offsets for native aggregate fields.
+		// Example (amd64/arm64): cdecl Native { X uint64; Z struct{} } occupies
+		// 8 bytes, whereas gc sizing reports 16. Thus { N Native; Next uint64 }
+		// puts Next at 8, and { N [2]Native; Next uint64 } puts it at 16.
+		offsets := make([]int64, len(fields))
+		for i := range fields {
+			offsets[i] = int64(prog.OffsetOf(storage, i))
+		}
+		return offsets
+	}
+	return p.goProgram.Offsetsof(fields)
+}
 
 /*
 type Type struct {
@@ -92,33 +140,45 @@ func staticPtrToThis(t types.Type) (types.Type, bool) {
 	return ptr, types.NewMethodSet(ptr).Len() != 0
 }
 
-func (b Builder) abiCommonFields(t types.Type, name string, hasUncommon bool, global llvm.Value) (fields []llvm.Value) {
+func (b Builder) abiCommonFields(t types.Type, name string, hasUncommon bool, global llvm.Value, storage Type) (fields []llvm.Value) {
 	prog := b.Prog
 	ab := prog.abi
-	// Size uintptr
-	size := ab.Size(t)
-	if prog.hasNativeTypeLayout(t) {
-		// C structs do not acquire Go's extra storage for trailing zero-sized fields.
-		size = uintptr(prog.SizeOf(prog.rawType(t)))
+	var size, alignment, fieldAlignment uintptr
+	if storage != nil {
+		size = uintptr(prog.SizeOf(storage))
+		alignment = uintptr(prog.AlignOf(storage))
+		fieldAlignment = alignment
+	} else {
+		size, alignment, fieldAlignment = ab.Size(t), ab.Align(t), ab.FieldAlign(t)
 	}
+	// Size uintptr
 	fields = append(fields, prog.IntVal(uint64(size), prog.Uintptr()).impl)
 	// PtrBytes uintptr
-	fields = append(fields, prog.IntVal(uint64(ab.PtrBytes(t)), prog.Uintptr()).impl)
+	var ptrBytes uintptr
+	if storage != nil && ((prog.target.GOOS == "windows" && prog.target.effectiveGOARCH() == "386") || prog.usesWideGoStorage()) {
+		ptrBytes = uintptr(prog.aggregatePtrBytes(storage))
+	} else {
+		ptrBytes = ab.PtrBytes(t)
+	}
+	fields = append(fields, prog.IntVal(uint64(ptrBytes), prog.Uintptr()).impl)
 	// Hash uint32
 	h := sha256.Sum256([]byte(name))
 	hash := binary.LittleEndian.Uint32(h[:4])
 	fields = append(fields, prog.IntVal(uint64(hash), prog.Uint32()).impl)
 	// TFlag uint8
 	tflag := ab.TFlag(t)
+	if storage != nil && !prog.IsRegularMemory(t) {
+		tflag &^= runtimeabi.TFlagRegularMemory
+	}
 	if hasUncommon {
 		tflag |= abi.TFlagUncommon
 	}
 	fields = append(fields, prog.IntVal(uint64(tflag), prog.Byte()).impl)
 	// Align uint8
-	align := prog.IntVal(uint64(ab.Align(t)), prog.Byte()).impl
+	align := prog.IntVal(uint64(alignment), prog.Byte()).impl
 	fields = append(fields, align)
 	// FieldAlign uint8
-	fieldAlign := prog.IntVal(uint64(ab.FieldAlign(t)), prog.Byte()).impl
+	fieldAlign := prog.IntVal(uint64(fieldAlignment), prog.Byte()).impl
 	fields = append(fields, fieldAlign)
 	// Kind uint8
 	kind := uint8(ab.Kind(t))
@@ -168,7 +228,7 @@ type StructField struct {
 }
 */
 
-func (b Builder) abiStructFields(t *types.Struct, name string) llvm.Value {
+func (b Builder) abiStructFields(t *types.Struct, name string, offsets []int64) llvm.Value {
 	prog := b.Prog
 	n := t.NumFields()
 	if n == 0 {
@@ -177,7 +237,6 @@ func (b Builder) abiStructFields(t *types.Struct, name string) llvm.Value {
 	g := b.Pkg.VarOf(name)
 	if g == nil {
 		ft := prog.rtType("structfield")
-		offsets := b.abiStructFieldOffsets(t)
 		fields := make([]llvm.Value, n)
 		for i := 0; i < n; i++ {
 			f := t.Field(i)
@@ -293,7 +352,7 @@ func (b Builder) abiTuples(t *types.Tuple, name string) llvm.Value {
 	})
 }
 
-func (b Builder) abiExtendedFields(t types.Type, name string, global llvm.Value) (fields []llvm.Value) {
+func (b Builder) abiExtendedFields(t types.Type, name string, global llvm.Value, storage Type) (fields []llvm.Value) {
 	prog := b.Prog
 	pkg := b.Pkg
 	switch t := types.Unalias(t).(type) {
@@ -358,7 +417,18 @@ func (b Builder) abiExtendedFields(t types.Type, name string, global llvm.Value)
 			fields = append(fields, bridges.call.impl, bridges.make.impl)
 		}
 	case *types.Struct:
-		name, _ = prog.abi.TypeName(t)
+		var offsets []int64
+		if storage == nil {
+			name, _ = prog.abi.TypeName(t)
+			offsets = b.abiStructFieldOffsets(t)
+		} else {
+			// Keep the owner's name: on Windows/386, native {int32; uint64}
+			// and the Go type have the same fields but different offsets.
+			offsets = make([]int64, t.NumFields())
+			for i := range offsets {
+				offsets[i] = int64(prog.OffsetOf(storage, i))
+			}
+		}
 		var pkgPath string
 		n := t.NumFields()
 		for i := 0; i < n; i++ {
@@ -371,7 +441,7 @@ func (b Builder) abiExtendedFields(t types.Type, name string, global llvm.Value)
 		}
 		fields = []llvm.Value{
 			b.Str(pkgPath).impl,
-			b.abiStructFields(t, name+"$fields"),
+			b.abiStructFields(t, name+"$fields", offsets),
 		}
 	case *types.Interface:
 		name, _ = prog.abi.TypeName(t)
@@ -380,7 +450,7 @@ func (b Builder) abiExtendedFields(t types.Type, name string, global llvm.Value)
 			b.abiInterfaceImethods(t, name+"$imethods"),
 		}
 	case *types.Named:
-		return b.abiExtendedFields(t.Underlying(), name, global)
+		return b.abiExtendedFields(t.Underlying(), name, global, storage)
 	}
 	return
 }
@@ -688,6 +758,58 @@ func (b Builder) abiMethodFunc(anonymous bool, mPkg *types.Package, mName string
 		[N]Method
 	}
 */
+// nativeMetadataType selects the storage used by a native aggregate and its
+// by-value containers. References end the traversal: *Native does not embed
+// Native's size, while struct{ N Native; Y float64 } does.
+func (p Program) nativeMetadataType(t types.Type) Type {
+	switch value := t.Underlying().(type) {
+	case *types.Array:
+		if p.hasNativeTypeLayout(t) || p.nativeMetadataType(value.Elem()) != nil {
+			return p.rawType(t)
+		}
+	case *types.Struct:
+		if p.hasNativeTypeLayout(t) {
+			return p.rawType(t)
+		}
+		for i := 0; i < value.NumFields(); i++ {
+			if p.nativeMetadataType(value.Field(i).Type()) != nil {
+				return p.rawType(t)
+			}
+		}
+	}
+	return nil
+}
+
+// aggregatePtrBytes retains storage offsets and strides on Windows/386 and
+// J32/W32. Native {int32; uint64; *byte} has prefix 20 on Windows/386; native
+// {*byte} has prefix 4 on wasm32, where Go pointer slots occupy eight bytes.
+func (p Program) aggregatePtrBytes(storage Type) uint64 {
+	switch t := storage.raw.Type.Underlying().(type) {
+	case *types.Struct:
+		// A native parent does not rebuild a nested Go struct's body. Thus
+		// cdecl Outer{G GoBox} retains GoBox's eight-byte pointer slot on wasm32.
+		storage = p.rawType(storage.raw.Type)
+		for i := t.NumFields() - 1; i >= 0; i-- {
+			if bytes := p.aggregatePtrBytes(p.Field(storage, i)); bytes != 0 {
+				return p.OffsetOf(storage, i) + bytes
+			}
+		}
+	case *types.Array:
+		if t.Len() != 0 {
+			elem := p.Index(storage)
+			if bytes := p.aggregatePtrBytes(elem); bytes != 0 {
+				return uint64(t.Len()-1)*p.SizeOf(elem) + bytes
+			}
+		}
+	default:
+		if p.storageType(storage).TypeKind() == llvm.PointerTypeKind {
+			return uint64(p.PointerSize())
+		}
+		return uint64(p.abi.PtrBytes(storage.raw.Type))
+	}
+	return 0
+}
+
 func (b Builder) abiType(t types.Type) Expr {
 	prog := b.Prog
 	pkg := b.Pkg
@@ -717,8 +839,9 @@ func (b Builder) abiType(t types.Type) Expr {
 			typ = types.NewStruct(structFields, nil)
 		}
 		g = pkg.doNewVar(name, prog.Type(types.NewPointer(typ), GoDecl))
-		commonFields := b.abiCommonFields(t, name, hasUncommon, g.impl)
-		extendedFields := b.abiExtendedFields(t, name, g.impl)
+		storage := prog.nativeMetadataType(t)
+		commonFields := b.abiCommonFields(t, name, hasUncommon, g.impl, storage)
+		extendedFields := b.abiExtendedFields(t, name, g.impl, storage)
 		fields := commonFields
 		if len(extendedFields) != 0 {
 			fields = append([]llvm.Value{

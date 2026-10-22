@@ -396,7 +396,13 @@ func TestWasm32UnsafeBoundsUsePhysicalAddressWidth(t *testing.T) {
 
 func TestWasm32NativeStructAndGCRootStorage(t *testing.T) {
 	prog := newJ32Program(t)
-	setTestRuntime(t, prog)
+	prog.SetRuntime(func() *types.Package {
+		pkg, err := importer.For("source", nil).Import(PkgRuntime)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return pkg
+	})
 	typesPkg := types.NewPackage("example.com/p", "p")
 	name := types.NewTypeName(token.NoPos, typesPkg, "CIovec", nil)
 	fields := []*types.Var{
@@ -437,6 +443,28 @@ func TestWasm32NativeStructAndGCRootStorage(t *testing.T) {
 	b.Load(size).SetVolatile(true)
 	roots := fn.NewGCRoots(2)
 	b.SetGCRoot(roots[0], prog.Nil(prog.VoidPtr()))
+	for _, native := range []bool{false, true} {
+		name, want := "GoPointer", uint64(8)
+		if native {
+			name, want = "NativePointer", 4
+			prog.SetTypeCallConv("example.com/p."+name, CDecl)
+		}
+		pointerBox := types.NewNamed(types.NewTypeName(token.NoPos, typesPkg, name, nil), types.NewStruct([]*types.Var{
+			types.NewField(token.NoPos, typesPkg, "P", types.NewPointer(types.Typ[types.Byte]), false),
+		}, nil), nil)
+		b.abiType(pointerBox)
+		metadataName, _ := prog.abi.TypeName(pointerBox)
+		common := pkg.VarOf(metadataName).impl.Initializer()
+		for common.Type() != prog.AbiType().ll {
+			common = common.Operand(0)
+		}
+		if got := common.Operand(0).ZExtValue(); got != want {
+			t.Errorf("%s Size_ = %d, want %d", name, got, want)
+		}
+		if got := common.Operand(1).ZExtValue(); got != want {
+			t.Errorf("%s PtrBytes = %d, want %d", name, got, want)
+		}
+	}
 	b.Return()
 	b.EndBuild()
 

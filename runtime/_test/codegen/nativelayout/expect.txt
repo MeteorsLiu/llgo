@@ -1,0 +1,22 @@
+record size true
+record array true
+record read true
+record write true
+record copy true
+envelope size true
+stamp offset true
+envelope array true
+unsafe layout true
+stamp read true
+stamp write true
+call true
+makefunc true
+separate offsets true
+array equality true
+pointer prefix true
+pointer prefix true
+pointer prefix true
+pointer prefix true
+pointer prefix true
+pointer prefix true
+pointer prefix true
