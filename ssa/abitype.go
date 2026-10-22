@@ -23,7 +23,6 @@ import (
 	"go/token"
 	"go/types"
 	"sort"
-	"unsafe"
 
 	"github.com/xgo-dev/llgo/internal/genmethod"
 	runtimeabi "github.com/xgo-dev/llgo/runtime/abi"
@@ -32,52 +31,6 @@ import (
 )
 
 // -----------------------------------------------------------------------------
-
-// abiProgram separates late ABI layout queries from goProgram, which is also
-// passed to the Go checker before runtime types are available. Only abi.Sizes
-// uses this view; Program.TypeSizes must keep returning the plain goProgram.
-//
-// Native aggregates and their by-value containers use existing LLVM storage.
-// For example, native {float64; struct{}} occupies eight bytes on amd64, while
-// Go's trailing-zero-field rule reports sixteen. Other types retain Go sizing.
-type abiProgram struct {
-	*goProgram
-}
-
-func (p *abiProgram) Sizeof(t types.Type) int64 {
-	prog := Program(unsafe.Pointer(p.goProgram))
-	if storage := prog.nativeMetadataType(t); storage != nil {
-		return int64(prog.SizeOf(storage))
-	}
-	return p.goProgram.Sizeof(t)
-}
-
-func (p *abiProgram) Alignof(t types.Type) int64 {
-	prog := Program(unsafe.Pointer(p.goProgram))
-	if storage := prog.nativeMetadataType(t); storage != nil {
-		return int64(prog.AlignOf(storage))
-	}
-	return p.goProgram.Alignof(t)
-}
-
-func (p *abiProgram) Offsetsof(fields []*types.Var) []int64 {
-	prog := Program(unsafe.Pointer(p.goProgram))
-	// Scope: the anonymous type models a Go container and retains each field's
-	// named cdecl type. It does not recover an original owner's cdecl directive;
-	// Windows/386 scalar alignment still requires that original named owner.
-	if storage := prog.nativeMetadataType(types.NewStruct(fields, nil)); storage != nil {
-		// Field layout: use actual storage offsets for native aggregate fields.
-		// Example (amd64/arm64): cdecl Native { X uint64; Z struct{} } occupies
-		// 8 bytes, whereas gc sizing reports 16. Thus { N Native; Next uint64 }
-		// puts Next at 8, and { N [2]Native; Next uint64 } puts it at 16.
-		offsets := make([]int64, len(fields))
-		for i := range fields {
-			offsets[i] = int64(prog.OffsetOf(storage, i))
-		}
-		return offsets
-	}
-	return p.goProgram.Offsetsof(fields)
-}
 
 /*
 type Type struct {

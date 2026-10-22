@@ -1,7 +1,13 @@
 // LITTEST darwin/arm64 linux/amd64
 package main
 
+import "unsafe"
+
 var my = demo2{}.encode
+
+// TODO(#2907): defer cdecl function conversion; retain Go method layouts.
+// //llgo:cdecl
+// type nativeBound func() int
 
 type demo1 struct {
 }
@@ -23,6 +29,40 @@ func main() {
 	if f() != 1 {
 		panic("error")
 	}
+	// Empty receivers still require a Go method environment. Layout must not
+	// shrink because the receiver occupies no bytes or the value is global.
+	promoted := struct{ demo1 }{se}
+	var dynamic interface{ encode() int } = se
+	layoutOK := true
+	// rejectionOK := true
+	// reject := func(fn func() int) (rejected bool) {
+	// defer func() {
+	// err, ok := recover().(error)
+	// rejected = ok && err.Error() == "runtime error: C callback must not capture variables"
+	// }()
+	// converted := nativeBound(fn)
+	// if converted == nil {
+	// panic("unexpected nil callback")
+	// }
+	// return false
+	// }
+	for _, fn := range []func() int{f, my, promoted.encode, dynamic.encode} {
+		values := [2]func() int{fn, fn}
+		probe := struct {
+			B byte
+			F func() int
+		}{F: fn}
+		stride := uintptr(unsafe.Pointer(&values[1])) - uintptr(unsafe.Pointer(&values[0]))
+		field := uintptr(unsafe.Pointer(&probe.F)) - uintptr(unsafe.Pointer(&probe))
+		layoutOK = layoutOK && unsafe.Sizeof(fn) == stride && unsafe.Alignof(fn) == field && unsafe.Offsetof(probe.F) == field
+		// rejectionOK = reject(fn) && rejectionOK
+	}
+	methods := [2]func(demo1) int{demo1.encode, demo1.encode}
+	pointerMethods := [2]func(*demo1) int{(*demo1).encode, (*demo1).encode}
+	layoutOK = layoutOK && unsafe.Sizeof(demo1.encode) == uintptr(unsafe.Pointer(&methods[1]))-uintptr(unsafe.Pointer(&methods[0]))
+	layoutOK = layoutOK && unsafe.Sizeof((*demo1).encode) == uintptr(unsafe.Pointer(&pointerMethods[1]))-uintptr(unsafe.Pointer(&pointerMethods[0]))
+	println("zero-sized receiver layout", layoutOK)
+	// println("zero-sized receiver callback rejection", rejectionOK)
 }
 
 // Pointer receiver wrappers must guard nil before calling the value receiver.

@@ -93,10 +93,8 @@ type goProgram aProgram
 // Alignof must implement the alignment guarantees required by the spec.
 // The result must be >= 1.
 func (p *goProgram) Alignof(T types.Type) int64 {
-	if layout := p.layoutType(T, false); layout != nil {
-		return p.sizes.Alignof(layout)
-	}
-	return p.sizes.Alignof(T)
+	_, layout := p.layoutType(T, false, false)
+	return layout.alignment
 }
 
 // Offsetsof returns the offsets of the given struct fields, in bytes.
@@ -108,40 +106,18 @@ func (p *goProgram) Offsetsof(fields []*types.Var) (ret []int64) {
 	if abi.IsClosureFields(fields) {
 		return []int64{0, ptrSize}
 	}
-	// Sizes receives fields without their owner. This models a Go container;
-	// owner-aware native offsets remain in the ABI metadata generation path.
-	if layout := p.layoutType(types.NewStruct(fields, nil), false); layout != nil {
-		st := layout.Underlying().(*types.Struct)
-		fields = make([]*types.Var, st.NumFields())
-		for i := range fields {
-			fields[i] = st.Field(i)
-		}
-		return p.sizes.Offsetsof(fields)
-	}
-	extra := int64(0)
-	ret = p.sizes.Offsetsof(fields)
-	for i, f := range fields {
-		ret[i] += extra
-		extra += p.extraSize(f.Type(), ptrSize)
-	}
-	return
+	// Sizes supplies no owner. This query lays out a Go container while keeping
+	// each field's named type: {N Native; B byte} uses Native's actual size.
+	_, layout := p.layoutType(types.NewStruct(fields, nil), false, false)
+	return layout.offsets
 }
 
 // Sizeof returns the size of a variable of type T.
 // Sizeof must implement the size guarantees required by the spec.
 // A negative result indicates that T is too large.
 func (p *goProgram) Sizeof(T types.Type) int64 {
-	if layout := p.layoutType(T, false); layout != nil {
-		return p.sizes.Sizeof(layout)
-	}
-	prog := Program(unsafe.Pointer(p))
-	ptrSize := int64(prog.GoWordSize())
-	baseSize := prog.sizes.Sizeof(T) + p.extraSize(T, ptrSize)
-	switch T.Underlying().(type) {
-	case *types.Struct, *types.Array:
-		return align(baseSize, prog.sizes.Alignof(T))
-	}
-	return baseSize
+	_, layout := p.layoutType(T, false, false)
+	return layout.size
 }
 
 func (p *goProgram) extraSize(typ types.Type, ptrSize int64) (ret int64) {
@@ -179,24 +155,21 @@ retry:
 	return 0
 }
 
-// layoutType adapts field representations for the existing sizing engines.
-// Go structs and arrays are measured by p.sizes; native structs by TargetData.
-// For example, native {float64; struct{}} becomes an eight-byte aligned carrier,
-// so p.sizes can lay out {Native; byte} without applying Go's tail rule to Native.
+// layoutType measures storage before runtime or complete pointee types exist.
+// Structs share structFieldLayout with real lowering; leaf headers use Sizes
+// without looking up runtime.String, runtime.Slice, or the map implementation.
+// The LLVM result is only a layout carrier, never a value or a cached Go type.
 //
-// Scope: amd64/arm64 scalar carriers preserve both Go and C alignment. Other
-// targets retain the existing path (nil). Only by-value fields are visited:
-// *A and func(A) need no completed A, unlike full Go type conversion.
-func (p *goProgram) layoutType(t types.Type, raw bool) types.Type {
-	arch := p.target.effectiveGOARCH()
-	if arch != "amd64" && arch != "arm64" {
-		return nil
-	}
-	if p.sizes.Sizeof(t) < 0 {
-		return t
-	}
+// native selects physical pointer slots (four bytes on wasm32); raw suppresses
+// closure expansion. They differ for a closure's $f: it is one function pointer,
+// but still occupies an eight-byte Go slot on profiled wasm32.
+func (p *goProgram) layoutType(t types.Type, native, raw bool) (llvm.Type, *fieldLayout) {
 	prog := Program(unsafe.Pointer(p))
-	native, ownRaw := false, false
+	layout := &fieldLayout{size: p.sizes.Sizeof(t), alignment: p.sizes.Alignof(t)}
+	if layout.size < 0 {
+		return llvm.Type{}, layout
+	}
+	ownerNative, ownRaw := false, false
 	for declaration := t; ; {
 		switch value := declaration.(type) {
 		case *types.Alias:
@@ -204,94 +177,112 @@ func (p *goProgram) layoutType(t types.Type, raw bool) types.Type {
 			ownRaw = ownRaw || (ok && isNativeCallConv(background))
 			declaration = value.Rhs()
 		case *types.Named:
-			native = prog.hasNativeStructLayout(value)
-			ownRaw = ownRaw || native
+			ownerNative = prog.hasNativeStructLayout(value)
+			ownRaw = ownRaw || ownerNative
 			goto body
 		default:
 			goto body
 		}
 	}
 body:
-	var size, alignment int64
+	var storage llvm.Type
 	switch value := t.Underlying().(type) {
 	case *types.Struct:
-		fields := make([]*types.Var, value.NumFields())
-		changed := false
+		fields := make([]llvm.Type, value.NumFields())
 		for i := range fields {
-			// A nested Go struct keeps its own function-value representation.
-			// Native{G GoStruct} must not shrink G.F from two words to one.
-			field := value.Field(i)
-			fieldType := p.layoutType(field.Type(), ownRaw || IsClosure(value))
-			if fieldType != field.Type() {
-				field = types.NewField(field.Pos(), field.Pkg(), field.Name(), fieldType, field.Embedded())
-				changed = true
+			// Each struct selects its own pointer storage and alignment:
+			// Native{G GoPointer} retains G's eight-byte Go pointer on wasm32.
+			// Closure conversion is separate: a native type bypasses it for
+			// the whole subtree, so Native{G struct{F func()}} keeps F raw.
+			field, child := p.layoutType(value.Field(i).Type(), ownerNative, raw || ownRaw || IsClosure(value))
+			if child.size < 0 {
+				layout.size = -1
+				layout.offsets = make([]int64, value.NumFields())
+				for j := range layout.offsets {
+					layout.offsets[j] = -1
+				}
+				return llvm.Type{}, layout
 			}
 			fields[i] = field
 		}
-		if !native {
-			if !changed {
-				// Retain named zero-sized types such as sync/atomic.align64.
-				return t
-			}
-			return types.NewStruct(fields, nil)
-		}
-		llvmFields := make([]llvm.Type, len(fields))
-		for i, field := range fields {
-			size, alignment = p.sizes.Sizeof(field.Type()), p.sizes.Alignof(field.Type())
-			if size < 0 {
-				// Preserve the sizing error after closure expansion, without
-				// passing an unrepresentable field size to LLVM.
-				return types.NewStruct(fields, nil)
-			}
-			llvmFields[i] = p.llvmArrayType(p.ctx.IntType(int(alignment*8)), size/alignment)
-		}
-		layout := p.ctx.StructType(llvmFields, false)
-		size, alignment = int64(p.td.TypeAllocSize(layout)), int64(p.td.ABITypeAlignment(layout))
-		if size < 0 {
-			return types.NewStruct(fields, nil)
+		alignment := layout.alignment
+		layout = prog.structFieldLayout(value, fields, ownerNative)
+		if value.NumFields() == 0 {
+			// Keep the named atomic.align64 requirement, which its empty
+			// underlying struct cannot convey to LLVM.
+			layout.alignment = alignment
 		}
 	case *types.Array:
-		elem := p.layoutType(value.Elem(), raw || ownRaw)
-		if elem == value.Elem() {
-			return t
+		elem, child := p.layoutType(value.Elem(), native, raw || ownRaw)
+		layout.alignment = child.alignment
+		if value.Len() == 0 {
+			// Empty arrays still carry their element's storage alignment.
+			// On ARM32, [0]uint64 occupies no bytes but LLVM aligns it to
+			// eight; rebuilding it from Go's alignment of four loses that.
+			if !elem.IsNil() {
+				return llvm.ArrayType(elem, 0), layout
+			}
+			break
 		}
-		return types.NewArray(elem, value.Len())
-	case *types.Signature:
-		if raw || ownRaw {
-			return t
+		if child.size < 0 || child.size > (1<<63-1)/value.Len() {
+			layout.size = -1
+			return llvm.Type{}, layout
 		}
-		size = p.sizes.Sizeof(t) + p.extraSize(t, int64(prog.GoWordSize()))
-		alignment = p.sizes.Alignof(t)
+		layout.size = child.size * value.Len()
+		return p.layoutArray(elem, value.Len()), layout
 	case *types.Basic:
-		if raw || ownRaw {
-			if value.Kind() != types.String {
-				leaf := prog.toType(value).ll
-				size, alignment = int64(p.td.TypeAllocSize(leaf)), int64(p.td.ABITypeAlignment(leaf))
-				break
+		if value.Kind() != types.String {
+			storage = prog.toType(value).ll
+			if native {
+				storage = prog.nativeStorageLLVMType(value, storage)
+			} else if value.Kind() == types.UnsafePointer && prog.usesWideGoStorage() {
+				storage = prog.widePointerStorageType()
 			}
 		}
-		return t
-	default:
-		return t
+	case *types.Pointer, *types.Map, *types.Chan:
+		storage = prog.tyVoidPtr()
+		if !native && prog.usesWideGoStorage() {
+			storage = prog.widePointerStorageType()
+		}
+	case *types.Signature:
+		if native || raw || ownRaw {
+			storage = prog.tyVoidPtr()
+			if !native && prog.usesWideGoStorage() {
+				storage = prog.widePointerStorageType()
+			}
+		} else {
+			layout.size += p.extraSize(t, int64(prog.GoWordSize()))
+		}
 	}
-	// These carriers preserve the measured size and alignment on amd64/arm64.
-	// They contain no zero-sized tail; all container rounding stays in p.sizes.
-	carrier := [...]types.Type{
-		1: types.Typ[types.Uint8], 2: types.Typ[types.Uint16],
-		4: types.Typ[types.Uint32], 8: types.Typ[types.Uint64],
-	}[alignment]
-	return types.NewArray(carrier, size/alignment)
+	if !storage.IsNil() {
+		layout.size = int64(p.td.TypeAllocSize(storage))
+		if native {
+			layout.alignment = int64(p.td.ABITypeAlignment(storage))
+		}
+		return storage, layout
+	}
+	if layout.size < 0 {
+		return llvm.Type{}, layout
+	}
+	// A vector carrier preserves alignment even on Linux/386, where i64 has
+	// alignment four but atomic.align64 requires eight. No vector is emitted.
+	carrier := llvm.VectorType(prog.tyInt8(), int(layout.alignment))
+	if got := p.td.ABITypeAlignment(carrier); int64(got) != layout.alignment ||
+		int64(p.td.TypeAllocSize(carrier)) != layout.alignment {
+		panic(fmt.Sprintf("invalid layout carrier for %s: alignment %d", t, layout.alignment))
+	}
+	return p.layoutArray(carrier, layout.size/layout.alignment), layout
 }
 
-// llvmArrayType keeps large native fields compact despite LLVMArrayType's
-// 32-bit count. A [1<<32]byte field uses four 1<<30-byte blocks, not elements.
-func (p *goProgram) llvmArrayType(elem llvm.Type, count int64) llvm.Type {
+// layoutArray keeps layout-only arrays compact beyond LLVMArrayType's 32-bit
+// count: [1<<32]byte is represented by four blocks rather than truncated to zero.
+func (p *goProgram) layoutArray(elem llvm.Type, count int64) llvm.Type {
 	if count <= 1<<31-1 {
 		return llvm.ArrayType(elem, int(count))
 	}
 	const blockBits = 30
 	return p.ctx.StructType([]llvm.Type{
-		p.llvmArrayType(llvm.ArrayType(elem, 1<<blockBits), count>>blockBits),
+		p.layoutArray(llvm.ArrayType(elem, 1<<blockBits), count>>blockBits),
 		llvm.ArrayType(elem, int(count&((1<<blockBits)-1))),
 	}, false)
 }

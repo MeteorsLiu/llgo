@@ -27,6 +27,14 @@ type structLayout struct {
 	wrapped []bool
 }
 
+// fieldLayout records source-field placement. Non-nil alignments require field
+// wrappers; padTail requires one extra byte after the existing LLVM fields.
+type fieldLayout struct {
+	offsets, alignments []int64
+	size, alignment     int64
+	padTail             bool
+}
+
 func (p Program) hasNativeStructLayout(raw *types.Named) bool {
 	background, ok := p.packageTypeCallConv(namedLinkname(raw))
 	return ok && isNativeCallConv(background)
@@ -56,57 +64,15 @@ func (p Program) structLayout(typ Type) (structLayout, bool) {
 // tails. The latter path does not provide general Go alignment corrections.
 func (p Program) toLLVMStructBody(raw *types.Struct, native bool) ([]llvm.Type, *structLayout) {
 	fields := p.toLLVMFields(raw, native)
-	goarch := p.target.effectiveGOARCH()
-	switch {
-	case native || len(fields) == 0:
+	layout := p.structFieldLayout(raw, fields, native)
+	if layout.alignments == nil {
+		if layout.padTail {
+			fields = append(fields, p.tyInt8())
+		}
 		return fields, nil
-	case goarch == "386":
-		// Go requires four-byte int64/float64 field alignment, including on
-		// Windows/386 where the native LLVM layout requires eight bytes.
-	case goarch == "wasm" && p.target.WasmProfile != "":
-		// Profiles use Go's 64-bit word layout even on Memory32 targets.
-	default:
-		return p.padZeroSizedStructTail(fields), nil
 	}
-
-	// Both cases above continue through the existing field-layout conversion.
-	// Wrapping fields preserves their source indices for field access code.
-	sizes := p.sizes
-	if sizes == nil {
-		sizes = &types.StdSizes{WordSize: int64(p.GoWordSize()), MaxAlign: int64(p.GoWordSize())}
-		p.sizes = sizes
-	}
-	offsets := make([]int64, len(fields))
-	alignments := make([]int64, len(fields))
-	goAlign := int64(1)
-	goSize := int64(0)
-	for i, field := range fields {
-		fieldType := raw.Field(i).Type()
-		fieldAlign := sizes.Alignof(fieldType)
-		_, structField := arrayBaseType(fieldType).Underlying().(*types.Struct)
-		if structField || p.hasNativeTypeLayout(fieldType) {
-			// A nested struct keeps its already selected storage alignment.
-			// On Windows/386, Middle{N Native} aligns to eight even without
-			// its own cdecl marker, so Outer{byte; M Middle} puts M at 8.
-			// Arrays of structs inherit that alignment. Scalar arrays such as
-			// [2]uint64 retain Go's rule: four-byte alignment on Windows/386.
-			fieldAlign = int64(p.td.ABITypeAlignment(field))
-		}
-		alignments[i] = fieldAlign
-		if fieldAlign > goAlign {
-			goAlign = fieldAlign
-		}
-		goSize = align(goSize, fieldAlign)
-		offsets[i] = goSize
-		fieldSize := int64(p.td.TypeAllocSize(field))
-		if i == len(fields)-1 && goSize > 0 && fieldSize == 0 {
-			// Match cmd/compile: a final zero-sized field must have an
-			// address inside the enclosing non-zero-sized object.
-			fieldSize = 1
-		}
-		goSize += fieldSize
-	}
-	goSize = align(goSize, goAlign)
+	offsets, alignments := layout.offsets, layout.alignments
+	goSize, goAlign := layout.size, layout.alignment
 
 	nativeType := p.ctx.StructType(fields, false)
 	if int64(p.td.TypeAllocSize(nativeType)) == goSize &&
@@ -167,20 +133,82 @@ func (p Program) toLLVMStructBody(raw *types.Struct, native bool) ([]llvm.Type, 
 	return body, &structLayout{wrapped: wrapped}
 }
 
-// padZeroSizedStructTail takes a nonempty Go struct body and preserves its
-// existing fields and alignment. For { int64; struct{} } on a 64-bit target,
-// one extra byte lets LLVM round the size from 8 to 16, keeping the tail inside
-// the object. Existing tail padding, as in { float64; float32; struct{} },
-// already provides that space; adding a field there could change call ABI
-// classification even though the size remains 16.
-func (p Program) padZeroSizedStructTail(fields []llvm.Type) []llvm.Type {
-	if p.td.TypeAllocSize(fields[len(fields)-1]) == 0 {
-		typ := p.ctx.StructType(fields, false)
-		if size := p.td.TypeAllocSize(typ); size > 0 && p.td.ElementOffset(typ, len(fields)-1) == size {
-			return append(fields, p.tyInt8())
-		}
+// structFieldLayout owns platform selection and alignment without changing the
+// LLVM fields. Native structs keep LLVM layout; Go/386 and profiled Wasm need
+// field wrappers. Other Go targets only correct a zero-sized tail: {int64;
+// struct{}} needs one extra byte before rounding to 16, while {float64; float32;
+// struct{}} already has tail space and must not gain another ABI field.
+func (p Program) structFieldLayout(raw *types.Struct, fields []llvm.Type, native bool) *fieldLayout {
+	goarch := p.target.effectiveGOARCH()
+	goLayout := false
+	switch {
+	case native || len(fields) == 0:
+	case goarch == "386":
+		// Go requires four-byte int64/float64 field alignment, including on
+		// Windows/386 where the native LLVM layout requires eight bytes.
+		goLayout = true
+	case goarch == "wasm" && p.target.WasmProfile != "":
+		// Profiles use Go's 64-bit word layout even on Memory32 targets.
+		goLayout = true
 	}
-	return fields
+	if !goLayout {
+		typ := p.ctx.StructType(fields, false)
+		layout := &fieldLayout{
+			offsets:   make([]int64, len(fields)),
+			size:      int64(p.td.TypeAllocSize(typ)),
+			alignment: int64(p.td.ABITypeAlignment(typ)),
+		}
+		for i := range fields {
+			layout.offsets[i] = int64(p.td.ElementOffset(typ, i))
+		}
+		if !native && len(fields) != 0 && p.td.TypeAllocSize(fields[len(fields)-1]) == 0 &&
+			layout.size > 0 && layout.offsets[len(fields)-1] == layout.size {
+			layout.padTail = true
+			layout.size = align(layout.size+1, layout.alignment)
+		}
+		return layout
+	}
+
+	sizes := p.sizes
+	if sizes == nil {
+		sizes = &types.StdSizes{WordSize: int64(p.GoWordSize()), MaxAlign: int64(p.GoWordSize())}
+		p.sizes = sizes
+	}
+	offsets := make([]int64, len(fields))
+	alignments := make([]int64, len(fields))
+	goAlign := int64(1)
+	goSize := int64(0)
+	for i, field := range fields {
+		fieldType := raw.Field(i).Type()
+		fieldAlign := sizes.Alignof(fieldType)
+		_, structField := arrayBaseType(fieldType).Underlying().(*types.Struct)
+		if structField || p.hasNativeTypeLayout(fieldType) {
+			// A nested struct keeps its already selected storage alignment.
+			// On Windows/386, Middle{N Native} aligns to eight even without
+			// its own cdecl marker, so Outer{byte; M Middle} puts M at 8.
+			// Arrays of structs inherit that alignment. Scalar arrays such as
+			// [2]uint64 retain Go's rule: four-byte alignment on Windows/386.
+			fieldAlign = int64(p.td.ABITypeAlignment(field))
+		}
+		alignments[i] = fieldAlign
+		if fieldAlign > goAlign {
+			goAlign = fieldAlign
+		}
+		goSize = align(goSize, fieldAlign)
+		offsets[i] = goSize
+		fieldSize := int64(p.td.TypeAllocSize(field))
+		if i == len(fields)-1 && goSize > 0 && fieldSize == 0 {
+			// Match cmd/compile: a final zero-sized field must have an
+			// address inside the enclosing non-zero-sized object.
+			fieldSize = 1
+		}
+		goSize += fieldSize
+	}
+	goSize = align(goSize, goAlign)
+	return &fieldLayout{
+		offsets: offsets, alignments: alignments,
+		size: goSize, alignment: goAlign,
+	}
 }
 
 // arrayBaseType removes array layers: [2][3]S yields S, while *[2]S is unchanged.

@@ -353,9 +353,7 @@ func NewProgram(target *Target) Program {
 		prog.nativeStorage = make(map[Type]Type)
 	}
 	prog.is32Bits = prog.GoWordSize() == 4
-	prog.abi.Init(uintptr(prog.GoWordSize()), &abiProgram{
-		goProgram: (*goProgram)(unsafe.Pointer(prog)),
-	})
+	prog.abi.Init(uintptr(prog.GoWordSize()), (*goProgram)(unsafe.Pointer(prog)))
 	return prog
 }
 

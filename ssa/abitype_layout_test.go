@@ -107,7 +107,7 @@ func TestGo386StructPhysicalLayoutDiffersFromC(t *testing.T) {
 			p := NewProgram(target)
 			defer p.Dispose()
 			sizes := types.SizesFor("gc", target.GOARCH)
-			p.TypeSizes(sizes)
+			earlySizes := p.TypeSizes(sizes)
 			p.SetRuntime(runtimePackage)
 			owner := types.NewPackage("example.com/nested", "nested")
 			module := p.NewPackage(owner.Path(), owner.Name())
@@ -152,6 +152,15 @@ func TestGo386StructPhysicalLayoutDiffersFromC(t *testing.T) {
 			}
 			verify := func(raw types.Type, want layout) {
 				t.Helper()
+				if size, alignment := earlySizes.Sizeof(raw), earlySizes.Alignof(raw); size != int64(want.size) || alignment != int64(want.alignment) {
+					t.Errorf("%s early size/alignment=%d/%d, want %d/%d", raw, size, alignment, want.size, want.alignment)
+				}
+				_, earlyLayout := earlySizes.(*goProgram).layoutType(raw, false, false)
+				for i, offset := range want.offsets {
+					if got := earlyLayout.offsets[i]; got != int64(offset) {
+						t.Errorf("%s early field %d offset=%d, want %d", raw, i, got, offset)
+					}
+				}
 				storage := p.rawType(raw)
 				if p.SizeOf(storage) != want.size || p.AlignOf(storage) != want.alignment {
 					t.Errorf("%s storage size/alignment=%d/%d, want %d/%d", raw, p.SizeOf(storage), p.AlignOf(storage), want.size, want.alignment)

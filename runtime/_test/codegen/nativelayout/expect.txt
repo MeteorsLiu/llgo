@@ -3,10 +3,10 @@ record array true
 record read true
 record write true
 record copy true
+unsafe layout true
 envelope size true
 stamp offset true
 envelope array true
-unsafe layout true
 stamp read true
 stamp write true
 call true
@@ -20,3 +20,7 @@ pointer prefix true
 pointer prefix true
 pointer prefix true
 pointer prefix true
+unsafe Go fields true
+unsafe native fields true
+unsafe nested owners true
+unsafe callable values true
