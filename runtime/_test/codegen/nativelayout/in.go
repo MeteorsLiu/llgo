@@ -63,6 +63,20 @@ type unsafeWordAlias = unsafeWord
 type unsafeFunction func(int) int
 type unsafeFunctionAlias = unsafeFunction
 
+// These types deliberately share their underlying struct. Offsetof must use
+// the selected owner: anonymous function fields occupy two Go words in the Go
+// owner and one native pointer in the cdecl owner. No function conversion runs.
+type unsafeOffsetCallbacks struct {
+	Head   byte
+	F      func()
+	Middle byte
+	G      func()
+	Tail   uintptr
+}
+
+//llgo:cdecl
+type unsafeNativeOffsetCallbacks unsafeOffsetCallbacks
+
 // TODO(#2907): cdecl function representation is outside this layout fix.
 // //llgo:cdecl
 // type unsafeCallback func(int) int
@@ -905,4 +919,27 @@ func main() {
 	println("unsafe callable values", callableOK)
 	// println("unsafe callback rejection", rejectionOK)
 
+	var goOffsets unsafeOffsetCallbacks
+	var nativeOffsets unsafeNativeOffsetCallbacks
+	goBase := uintptr(unsafe.Pointer(&goOffsets))
+	nativeBase := uintptr(unsafe.Pointer(&nativeOffsets))
+	offsetOK := true
+	for _, field := range []struct {
+		name         string
+		offset, addr uintptr
+	}{
+		{"Go.Head", unsafe.Offsetof(goOffsets.Head), uintptr(unsafe.Pointer(&goOffsets.Head)) - goBase},
+		{"Go.F", unsafe.Offsetof(goOffsets.F), uintptr(unsafe.Pointer(&goOffsets.F)) - goBase},
+		{"Go.Middle", unsafe.Offsetof(goOffsets.Middle), uintptr(unsafe.Pointer(&goOffsets.Middle)) - goBase},
+		{"Go.G", unsafe.Offsetof(goOffsets.G), uintptr(unsafe.Pointer(&goOffsets.G)) - goBase},
+		{"Go.Tail", unsafe.Offsetof(goOffsets.Tail), uintptr(unsafe.Pointer(&goOffsets.Tail)) - goBase},
+		{"Native.Head", unsafe.Offsetof(nativeOffsets.Head), uintptr(unsafe.Pointer(&nativeOffsets.Head)) - nativeBase},
+		{"Native.F", unsafe.Offsetof(nativeOffsets.F), uintptr(unsafe.Pointer(&nativeOffsets.F)) - nativeBase},
+		{"Native.Middle", unsafe.Offsetof(nativeOffsets.Middle), uintptr(unsafe.Pointer(&nativeOffsets.Middle)) - nativeBase},
+		{"Native.G", unsafe.Offsetof(nativeOffsets.G), uintptr(unsafe.Pointer(&nativeOffsets.G)) - nativeBase},
+		{"Native.Tail", unsafe.Offsetof(nativeOffsets.Tail), uintptr(unsafe.Pointer(&nativeOffsets.Tail)) - nativeBase},
+	} {
+		offsetOK = checkUnsafe(field.name, field.offset, field.addr) && offsetOK
+	}
+	println("unsafe callback field owners", offsetOK)
 }

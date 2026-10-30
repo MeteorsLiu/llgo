@@ -459,9 +459,34 @@ type Generic[T any] struct { V T; End [0]T }
 				if err != nil {
 					t.Fatal(err)
 				}
+				pkg := types.NewPackage(path, "p")
+				// This generated matrix gives each measured struct its own B
+				// declaration. Supply that known owner here; build tests exercise
+				// recovery from the current unsafe expression, including shared fields.
+				owners := make(map[token.Pos]string)
+				for _, decl := range file.Decls {
+					group, ok := decl.(*ast.GenDecl)
+					if !ok || group.Tok != token.TYPE {
+						continue
+					}
+					for _, spec := range group.Specs {
+						typ := spec.(*ast.TypeSpec)
+						st, ok := typ.Type.(*ast.StructType)
+						if ok && len(st.Fields.List) != 0 && len(st.Fields.List[0].Names) != 0 {
+							owners[st.Fields.List[0].Names[0].Pos()] = typ.Name.Name
+						}
+					}
+				}
+				early = p.TypeSizes(early, func(fields []*types.Var) types.Type {
+					if len(fields) != 0 {
+						if name := owners[fields[0].Pos()]; name != "" {
+							return pkg.Scope().Lookup(name).Type()
+						}
+					}
+					return nil
+				})
 				config := &types.Config{Sizes: early, Importer: importer.Default()}
-				pkg, err := config.Check(path, fset, []*ast.File{file}, nil)
-				if err != nil {
+				if err := types.NewChecker(config, fset, pkg, nil).Files([]*ast.File{file}); err != nil {
 					t.Fatal(err)
 				}
 				if p.rt != nil || len(p.named) != 0 {

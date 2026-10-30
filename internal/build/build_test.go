@@ -1165,6 +1165,7 @@ func TestEffectiveWasmTypeSizes(t *testing.T) {
 }
 
 func TestWasmNestedStructTypeSizes(t *testing.T) {
+	t.Run("unsafe-offset-owner", checkUnsafeOffsetOwners)
 	common := types.NewStruct([]*types.Var{
 		types.NewField(token.NoPos, nil, "Name", types.Typ[types.String], false),
 		types.NewField(token.NoPos, nil, "ID", types.Typ[types.Int32], false),

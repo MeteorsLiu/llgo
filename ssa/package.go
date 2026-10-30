@@ -23,7 +23,6 @@ import (
 	"log"
 	"runtime"
 	"strconv"
-	"unsafe"
 
 	"github.com/xgo-dev/llgo/internal/env"
 	"github.com/xgo-dev/llgo/internal/meta"
@@ -353,7 +352,9 @@ func NewProgram(target *Target) Program {
 		prog.nativeStorage = make(map[Type]Type)
 	}
 	prog.is32Bits = prog.GoWordSize() == 4
-	prog.abi.Init(uintptr(prog.GoWordSize()), (*goProgram)(unsafe.Pointer(prog)))
+	// ABI queries have no active source expression. Keep their Sizes separate
+	// from the per-checker unsafe.Offsetof owner callback installed by TypeSizes.
+	prog.abi.Init(uintptr(prog.GoWordSize()), &goProgram{aProgram: prog})
 	return prog
 }
 

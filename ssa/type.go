@@ -20,7 +20,6 @@ import (
 	"fmt"
 	"go/token"
 	"go/types"
-	"unsafe"
 
 	"github.com/xgo-dev/llgo/ssa/abi"
 	"github.com/xgo-dev/llvm"
@@ -87,7 +86,10 @@ retry:
 
 // -----------------------------------------------------------------------------
 
-type goProgram aProgram
+type goProgram struct {
+	*aProgram
+	offsetOwner func([]*types.Var) types.Type
+}
 
 // Alignof returns the alignment of a variable of type T.
 // Alignof must implement the alignment guarantees required by the spec.
@@ -101,14 +103,21 @@ func (p *goProgram) Alignof(T types.Type) int64 {
 // Offsetsof must implement the offset guarantees required by the spec.
 // A negative entry in the result indicates that the struct is too large.
 func (p *goProgram) Offsetsof(fields []*types.Var) (ret []int64) {
-	prog := Program(unsafe.Pointer(p))
+	prog := p.aProgram
 	ptrSize := int64(prog.GoWordSize())
 	if abi.IsClosureFields(fields) {
 		return []int64{0, ptrSize}
 	}
-	// Sizes supplies no owner. This query lays out a Go container while keeping
-	// each field's named type: {N Native; B byte} uses Native's actual size.
-	_, layout := p.layoutType(types.NewStruct(fields, nil), false, false)
+	var owner types.Type
+	if p.offsetOwner != nil {
+		owner = p.offsetOwner(fields)
+	}
+	if owner == nil {
+		// Non-expression callers supply only fields. Keep their Go container
+		// while preserving each field's named type, e.g. {N Native; B byte}.
+		owner = types.NewStruct(fields, nil)
+	}
+	_, layout := p.layoutType(owner, false, false)
 	return layout.offsets
 }
 
@@ -124,14 +133,14 @@ func (p *goProgram) extraSize(typ types.Type, ptrSize int64) (ret int64) {
 retry:
 	switch t := typ.(type) {
 	case *types.Named:
-		prog := Program(unsafe.Pointer(p))
+		prog := p.aProgram
 		if background, ok := prog.packageTypeCallConv(namedLinkname(t)); ok && isNativeCallConv(background) {
 			return 0
 		}
 		typ = t.Underlying()
 		goto retry
 	case *types.Alias:
-		prog := Program(unsafe.Pointer(p))
+		prog := p.aProgram
 		if background, ok := prog.packageTypeCallConv(typeNameLinkname(t.Obj())); ok && isNativeCallConv(background) {
 			return 0
 		}
@@ -164,7 +173,7 @@ retry:
 // closure expansion. They differ for a closure's $f: it is one function pointer,
 // but still occupies an eight-byte Go slot on profiled wasm32.
 func (p *goProgram) layoutType(t types.Type, native, raw bool) (llvm.Type, *fieldLayout) {
-	prog := Program(unsafe.Pointer(p))
+	prog := p.aProgram
 	layout := &fieldLayout{size: p.sizes.Sizeof(t), alignment: p.sizes.Alignof(t)}
 	if layout.size < 0 {
 		return llvm.Type{}, layout
@@ -310,10 +319,24 @@ func (t Type) RawType() types.Type {
 	return t.raw.Type
 }
 
-// TypeSizes returns the sizes of the types.
-func (p Program) TypeSizes(sizes types.Sizes) types.Sizes {
+// TypeSizes returns the sizes of the types. The optional owner callback belongs
+// to one type checker: unsafe.Offsetof(C{}.F) must keep C's native layout even
+// when C and a Go type share the same underlying struct and field objects.
+func (p Program) TypeSizes(sizes types.Sizes, owner ...func([]*types.Var) types.Type) types.Sizes {
+	if current, ok := sizes.(*goProgram); ok && current.aProgram == p {
+		// Typed source rewriting reuses types.Config.Sizes. Refresh its query
+		// context in place when preload installs the new types.Info.
+		if len(owner) != 0 {
+			current.offsetOwner = owner[0]
+		}
+		return current
+	}
 	p.sizes = sizes
-	return (*goProgram)(unsafe.Pointer(p))
+	result := &goProgram{aProgram: p}
+	if len(owner) != 0 {
+		result.offsetOwner = owner[0]
+	}
+	return result
 }
 
 // TODO(xsw):

@@ -24,3 +24,4 @@ unsafe Go fields true
 unsafe native fields true
 unsafe nested owners true
 unsafe callable values true
+unsafe callback field owners true
