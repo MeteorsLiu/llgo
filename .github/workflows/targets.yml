@@ -81,7 +81,7 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-24.04, macos-15, windows-2022]
-    runs-on: ${{ matrix.os == 'ubuntu-24.04' && fromJSON(needs.prepare.outputs.linux_large_runner) || matrix.os }}
+    runs-on: ${{ matrix.os == 'ubuntu-24.04' && fromJSON(needs.prepare.outputs.linux_large_runner) || matrix.os == 'windows-2022' && fromJSON('["qiniu", "windows-11"]') || matrix.os }}
     env:
       GOMAXPROCS: '4'
       GOFLAGS: '-p=2'

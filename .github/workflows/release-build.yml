@@ -209,7 +209,7 @@ jobs:
             os: windows-2022
           - goarch: arm64
             os: windows-11-arm
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ matrix.os == 'windows-2022' && fromJSON('["qiniu", "windows-11"]') || matrix.os }}
     steps: &windows-compiler-steps
       - uses: actions/checkout@v7
       - name: Install build dependencies
@@ -277,7 +277,7 @@ jobs:
       matrix:
         goarch: ['386']
         os: [windows-2022]
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ matrix.os == 'windows-2022' && fromJSON('["qiniu", "windows-11"]') || matrix.os }}
     steps: *windows-compiler-steps
 
   build-windows:
@@ -294,7 +294,7 @@ jobs:
             os: windows-2022
           - goarch: arm64
             os: windows-11-arm
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ matrix.os == 'windows-2022' && fromJSON('["qiniu", "windows-11"]') || matrix.os }}
     steps: &windows-package-steps
       - uses: actions/checkout@v7
       - name: Cache ESP release archive
@@ -344,7 +344,7 @@ jobs:
         abi: [msvc, mingw]
         goarch: ['386']
         os: [windows-2022]
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ matrix.os == 'windows-2022' && fromJSON('["qiniu", "windows-11"]') || matrix.os }}
     steps: *windows-package-steps
 
   test-windows-artifacts:
@@ -361,7 +361,7 @@ jobs:
             os: windows-2022
           - goarch: arm64
             os: windows-11-arm
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ matrix.os == 'windows-2022' && fromJSON('["qiniu", "windows-11"]') || matrix.os }}
     steps: &windows-test-steps
       - uses: actions/checkout@v7
       - name: Set up Go
@@ -442,7 +442,7 @@ jobs:
         abi: [msvc, mingw]
         goarch: ['386']
         os: [windows-2022]
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ matrix.os == 'windows-2022' && fromJSON('["qiniu", "windows-11"]') || matrix.os }}
     steps: *windows-test-steps
 
   prepare-winget:

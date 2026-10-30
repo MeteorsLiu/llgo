@@ -137,7 +137,7 @@ jobs:
             windows_abi: mingw
             windows_arch: "386"
             host_go_arch: x64
-    runs-on: ${{ startsWith(matrix.os, 'ubuntu') && fromJSON(needs.prepare.outputs.linux_large_runner) || matrix.os }}
+    runs-on: ${{ startsWith(matrix.os, 'ubuntu') && fromJSON(needs.prepare.outputs.linux_large_runner) || matrix.os == 'windows-2022' && fromJSON('["qiniu", "windows-11"]') || matrix.os }}
     steps:
       - uses: actions/checkout@v7
       - name: Install dependencies
