@@ -43,6 +43,21 @@ jobs:
           & $vswhere -latest -products '*' -version '[17.0,18.0)' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
           if ($LASTEXITCODE -ne 0) { throw "vswhere failed: $LASTEXITCODE" }
           if (-not (& $vswhere -latest -products '*' -version '[17.0,18.0)' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath)) { throw 'Visual Studio C++ tools not found' }
+      - uses: actions/checkout@v7
+        with:
+          path: llgo dev
+      - uses: prefix-dev/setup-pixi@9dabb60412d3d2d967a8d682f7ce01317af40514 # v0.11.0
+        with:
+          pixi-version: v0.81.0
+          working-directory: llgo dev/dev
+          locked: true
+      - name: Record disk space after Pixi setup
+        shell: pwsh
+        run: Get-PSDrive -PSProvider FileSystem | Format-Table -AutoSize
+      - name: Check the development environment (Windows)
+        shell: pwsh
+        working-directory: llgo dev
+        run: pixi run --manifest-path dev/pixi.toml --locked pwsh -File dev/check_devenv.ps1
       - name: Record final disk space
         if: always()
         shell: pwsh
