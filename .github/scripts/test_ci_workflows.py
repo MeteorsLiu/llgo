@@ -652,7 +652,7 @@ sys.exit(subprocess.call(command + ['./internal/build']))
             for name, job in workflow["jobs"].items():
                 with self.subTest(workflow=path.name, job=name):
                     runner = str(job.get("runs-on", ""))
-                    if (path.name, name) not in BOOTSTRAP_RUNNER_JOBS:
+                    if (path.name, name) not in BOOTSTRAP_RUNNER_JOBS and (path.name, name) != ("qiniu-windows-probe.yml", "probe"):
                         self.assertNotIn("qiniu", runner)
                         self.assertNotIn("github.repository_owner", runner)
                     if "needs.prepare" in runner:

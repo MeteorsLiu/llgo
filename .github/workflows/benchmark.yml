@@ -86,7 +86,7 @@ jobs:
             windows_arch: "386"
             host_go_arch: x64
             timeout: 90
-    runs-on: ${{ startsWith(matrix.os, 'ubuntu') && fromJSON(needs.prepare.outputs.linux_large_runner) || matrix.os == 'windows-2022' && fromJSON('["qiniu", "windows-11"]') || matrix.os }}
+    runs-on: ${{ startsWith(matrix.os, 'ubuntu') && fromJSON(needs.prepare.outputs.linux_large_runner) || matrix.os }}
     timeout-minutes: ${{ matrix.timeout }}
     env:
       GOMAXPROCS: "2"
