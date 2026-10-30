@@ -140,6 +140,12 @@ jobs:
           path: .benchmark/head-source
           persist-credentials: false
 
+      - name: Set up Python for Windows MinGW 386 dependencies
+        if: github.repository_owner == 'xgo-dev' && matrix.os == 'windows-2022' && matrix.windows_abi == 'mingw' && matrix.windows_arch == '386'
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+          architecture: x64
       - name: Install dependencies
         uses: ./.github/actions/setup-deps
         with:
