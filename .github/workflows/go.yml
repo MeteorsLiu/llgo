@@ -120,6 +120,12 @@ jobs:
         with:
           windows-abi: ${{ matrix.windows_abi || 'msvc' }}
 
+      - name: Set up Node.js on Qiniu Windows
+        if: github.repository_owner == 'xgo-dev' && matrix.os == 'windows-2022'
+        uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+
       - name: Set LLGO_ROOT
         shell: bash
         run: echo "LLGO_ROOT=$GITHUB_WORKSPACE" >> "$GITHUB_ENV"

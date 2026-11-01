@@ -401,6 +401,9 @@ jobs:
       - name: Test C header generation
         shell: bash
         run: |
+          if [[ "${{ github.repository_owner }}" == 'xgo-dev' && "${{ matrix.os }}" == 'windows-2022' && "${{ matrix.windows_abi }}" == 'mingw' ]]; then
+            export PATH="$PATH:$(cygpath -u "$LLGO_MINGW_HOST_ROOT")/../usr/bin"
+          fi
           echo "Testing C header generation in different build modes..."
           cd _demo/go/export
           chmod +x test.sh
