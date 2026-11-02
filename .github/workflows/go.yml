@@ -59,10 +59,10 @@ jobs:
           - os: windows-2022
             llvm: 22
             windows_abi: mingw
-    runs-on: ${{ startsWith(matrix.os, 'ubuntu') && fromJSON(needs.prepare.outputs.linux_large_runner) || matrix.os == 'windows-2022' && fromJSON(needs.prepare.outputs.windows_2022_runner) || matrix.os }}
+    runs-on: ${{ startsWith(matrix.os, 'ubuntu') && fromJSON(needs.prepare.outputs.linux_large_runner) || matrix.os == 'windows-2022' && matrix.windows_abi == 'mingw' && fromJSON(needs.prepare.outputs.windows_2022_runner) || matrix.os }}
     steps:
       - name: Install Windows build tools on Qiniu
-        if: github.repository_owner == 'xgo-dev' && matrix.os == 'windows-2022'
+        if: github.repository_owner == 'xgo-dev' && matrix.os == 'windows-2022' && matrix.windows_abi == 'mingw'
         shell: pwsh
         working-directory: ${{ github.workspace }}
         run: |
@@ -121,7 +121,7 @@ jobs:
           windows-abi: ${{ matrix.windows_abi || 'msvc' }}
 
       - name: Set up Node.js on Qiniu Windows
-        if: github.repository_owner == 'xgo-dev' && matrix.os == 'windows-2022'
+        if: github.repository_owner == 'xgo-dev' && matrix.os == 'windows-2022' && matrix.windows_abi == 'mingw'
         uses: actions/setup-node@v7
         with:
           node-version: '24'

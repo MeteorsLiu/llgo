@@ -86,7 +86,7 @@ jobs:
             windows_arch: "386"
             host_go_arch: x64
             timeout: 90
-    runs-on: ${{ startsWith(matrix.os, 'ubuntu') && fromJSON(needs.prepare.outputs.linux_large_runner) || matrix.os == 'windows-2022' && fromJSON(needs.prepare.outputs.windows_2022_runner) || matrix.os }}
+    runs-on: ${{ startsWith(matrix.os, 'ubuntu') && fromJSON(needs.prepare.outputs.linux_large_runner) || matrix.os == 'windows-2022' && matrix.id != 'windows-msvc-386' && fromJSON(needs.prepare.outputs.windows_2022_runner) || matrix.os }}
     timeout-minutes: ${{ matrix.timeout }}
     env:
       GOMAXPROCS: "2"
@@ -94,7 +94,7 @@ jobs:
       GOFLAGS: -tags=llvm22
     steps:
       - name: Install Windows build tools on Qiniu
-        if: github.repository_owner == 'xgo-dev' && matrix.os == 'windows-2022'
+        if: github.repository_owner == 'xgo-dev' && matrix.os == 'windows-2022' && matrix.id != 'windows-msvc-386'
         shell: pwsh
         working-directory: ${{ github.workspace }}
         run: |

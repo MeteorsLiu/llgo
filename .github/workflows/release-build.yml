@@ -375,10 +375,10 @@ jobs:
             os: windows-2022
           - goarch: arm64
             os: windows-11-arm
-    runs-on: ${{ matrix.os == 'windows-2022' && fromJSON(needs.prepare.outputs.windows_2022_runner) || matrix.os }}
+    runs-on: ${{ matrix.os == 'windows-2022' && matrix.abi == 'mingw' && fromJSON(needs.prepare.outputs.windows_2022_runner) || matrix.os }}
     steps: &windows-test-steps
       - name: Install Windows build tools on Qiniu
-        if: github.repository_owner == 'xgo-dev' && matrix.os == 'windows-2022'
+        if: github.repository_owner == 'xgo-dev' && matrix.os == 'windows-2022' && matrix.abi == 'mingw' && matrix.goarch != '386'
         shell: pwsh
         working-directory: ${{ github.workspace }}
         run: |
@@ -470,7 +470,7 @@ jobs:
         abi: [msvc, mingw]
         goarch: ['386']
         os: [windows-2022]
-    runs-on: ${{ matrix.os == 'windows-2022' && fromJSON(needs.prepare.outputs.windows_2022_runner) || matrix.os }}
+    runs-on: ${{ matrix.os }}
     steps: *windows-test-steps
 
   prepare-winget:
